@@ -1,0 +1,15 @@
+{
+  // The tests are excluded from tsconfig.json so `npm run build` never tries to emit them,
+  // and they run under ts-node --transpile-only, which does not typecheck either. Between the
+  // two, nothing checked a test file: changing an interface a test constructs — adding a
+  // required field to ReplayDeps, say — compiled clean, passed `tsc --noEmit`, and surfaced
+  // only as a runtime TypeError from whichever test happened to reach that line first.
+  //
+  // This config exists purely to typecheck them. `npm run typecheck` runs both.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}

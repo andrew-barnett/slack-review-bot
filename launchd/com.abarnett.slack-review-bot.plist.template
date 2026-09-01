@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TEMPLATE — scripts/install-service.sh substitutes __LABEL__, __NODE__, __APP__,
+  __DIR__, __LOG_DIR__, __ENV_FILE__ and __PATH_PREFIX__ and installs the result
+  into ~/Library/LaunchAgents.
+
+  A LaunchAgent, not a LaunchDaemon: it must run inside the user's GUI login session.
+  `gh` reads its token from the login keychain and Codex reads its credentials from
+  ~/.codex, neither of which a system-context daemon can reach.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-lc</string>
+        <!--
+          PATH is set explicitly rather than left to the shell. launchd starts this job
+          with a bare PATH (/usr/bin:/bin:/usr/sbin:/sbin), and `zsh -lc` is a
+          NON-interactive login shell: it reads ~/.zprofile but never ~/.zshrc, which is
+          where `brew shellenv` and nvm put /opt/homebrew/bin and the node bin dir. So a
+          login shell alone leaves codex, gh, git, npm and pnpm unresolvable here even
+          though all of them work in a terminal — the failure is `spawn codex ENOENT`,
+          and it surfaces only on the first real review, not at startup.
+
+          __PATH_PREFIX__ is the Homebrew bin/sbin pair plus the directory holding the
+          node that install-service.sh found; the installer verifies codex and gh
+          actually resolve under it before writing this file. It is prepended, so the
+          login shell's own entries still apply.
+        -->
+        <string>export PATH="__PATH_PREFIX__:$PATH"; set -a; . "__ENV_FILE__"; set +a; exec "__NODE__" "__APP__"</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__DIR__</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Socket Mode holds a websocket open; if it drops, restart and reconnect. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Do not hot-loop if the bot dies at startup (bad token, missing profile). -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/slack-review-bot.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/slack-review-bot.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

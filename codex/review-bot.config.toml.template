@@ -1,0 +1,60 @@
+# Codex config profile for the Slack review bot.  TEMPLATE — do not install directly.
+#
+# `scripts/install-codex-profile.sh` substitutes __HOME__ and writes the result to
+# $CODEX_HOME/review-bot.config.toml (default ~/.codex/review-bot.config.toml).
+# Codex has no variable expansion in config.toml, so the absolute paths have to be
+# baked in at install time rather than written by hand.
+#
+# Select the profile with `codex exec -p review-bot`. Codex layers it ON TOP of the base
+# ~/.codex/config.toml, so your interactive defaults (approval_policy = "on-request",
+# no network in the sandbox) are unchanged — this profile only applies to bot runs.
+#
+# Why each setting is here: the $review-pr skill has to run unattended, and the base
+# config stops it in three separate places.
+
+# 1. Approvals. The base config is "on-request", so Codex pauses and waits for a human
+#    the first time a command needs escalation. There is no human on a bot run, so the
+#    process would hang until the job timeout. "never" means Codex never prompts.
+#
+#    Note this is NOT the same as removing the sandbox: with approval_policy = "never"
+#    Codex still runs commands inside the seatbelt sandbox below, it just declines to
+#    ask for an escalation instead of blocking on one. That is why the sandbox has to
+#    be widened to cover everything the skill legitimately needs.
+approval_policy = "never"
+
+# 2. Sandbox. Deliberately NOT danger-full-access: the bot reviews other people's
+#    branches, so the blast radius of a bad command should stay bounded to the repos and
+#    scratch space the review actually needs.
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+# The skill's mandated worktree root plus the package-manager caches that `npm install`
+# and friends write to during the test step. The primary workspace (~/src, passed as
+# `codex exec -C`) and the per-PR worktree (passed as `--add-dir`) are added by the
+# daemon at spawn time, so those two stay in sync with the daemon's own config.
+writable_roots = [
+    "__HOME__/.cache",
+    "__HOME__/.npm",
+    "__HOME__/Library/Caches",
+]
+
+# 3. Network. This is the setting that actually blocks the skill: under workspace-write
+#    the sandbox denies network by default, so `gh pr view`, `git fetch`, `git push`, and
+#    `npm install` all fail with DNS resolution errors rather than a clear permission
+#    message. Verified on codex-cli 0.147.0:
+#      codex sandbox -c sandbox_mode='"workspace-write"' -- curl https://api.github.com
+#        -> curl: (6) Could not resolve host: api.github.com
+network_access = true
+
+# 4. Environment. The skill shells out to gh, git, node, npm and pnpm, which need the
+#    real PATH and the Homebrew prefix; the default "core" inherit strips too much.
+#    The daemon scrubs its own Slack credentials out of the child environment before
+#    spawning Codex (see stripSecretsFromEnv in src/codex.ts), so "all" does not hand
+#    the bot's tokens to model-generated shell commands.
+[shell_environment_policy]
+inherit = "all"
+
+# Model settings for review work. Left explicit rather than inherited so a change to the
+# interactive default does not silently change what the bot reviews with.
+model = "gpt-5.5"
+model_reasoning_effort = "high"

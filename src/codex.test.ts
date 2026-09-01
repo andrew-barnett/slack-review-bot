@@ -1,0 +1,248 @@
+import { EventEmitter } from 'events'
+import * as fs from 'fs'
+import * as os from 'os'
+import * as path from 'path'
+import { PassThrough } from 'stream'
+import test from 'tape'
+import {
+  buildCodexArgs,
+  describeTimeout,
+  runCodexReview,
+  stripSecretsFromEnv,
+  withGitSigningDisabled,
+  type Spawner,
+} from './codex'
+
+function argValue(args: string[], flag: string): string | undefined {
+  const index = args.indexOf(flag)
+  return index === -1 ? undefined : args[index + 1]
+}
+
+// Every one of these flags is load-bearing. Losing --profile silently reverts the run
+// to the interactive config, where approval_policy is "on-request" and the sandbox has
+// no network — the run then hangs on the first approval prompt or fails on DNS.
+test('buildCodexArgs selects the bot profile, workspace, and worktree root', t => {
+  const args = buildCodexArgs({
+    profile: 'review-bot',
+    workspaceRoot: '/home/u/src',
+    worktreeRoot: '/private/tmp/codex-pr-review',
+    schemaPath: '/tmp/s.json',
+    outputPath: '/tmp/o.json',
+    prompt: 'do the thing',
+  })
+  t.equal(args[0], 'exec')
+  t.equal(argValue(args, '--profile'), 'review-bot')
+  t.equal(argValue(args, '--cd'), '/home/u/src')
+  t.equal(argValue(args, '--add-dir'), '/private/tmp/codex-pr-review')
+  t.equal(argValue(args, '--output-schema'), '/tmp/s.json')
+  t.equal(argValue(args, '--output-last-message'), '/tmp/o.json')
+  t.equal(args[args.length - 1], 'do the thing', 'prompt is the trailing positional')
+  t.end()
+})
+
+// The workspace root is a directory of checkouts, not a repository. Without this flag
+// codex exec refuses to start at all.
+test('buildCodexArgs skips the git repo check', t => {
+  const args = buildCodexArgs({
+    profile: 'p', workspaceRoot: '/w', worktreeRoot: '/t',
+    schemaPath: '/s', outputPath: '/o', prompt: 'x',
+  })
+  t.ok(args.includes('--skip-git-repo-check'))
+  t.end()
+})
+
+// The Codex profile sets shell_environment_policy.inherit = "all", so anything left in
+// the daemon's environment is visible to model-generated shell commands. The bot's
+// Slack tokens must not be among them.
+test('stripSecretsFromEnv removes the Slack credentials and keeps everything else', t => {
+  const env = stripSecretsFromEnv({
+    SLACK_BOT_TOKEN: 'xoxb-secret',
+    SLACK_APP_TOKEN: 'xapp-secret',
+    PATH: '/usr/bin',
+    HOME: '/home/u',
+  })
+  t.equal(env.SLACK_BOT_TOKEN, undefined)
+  t.equal(env.SLACK_APP_TOKEN, undefined)
+  t.equal(env.PATH, '/usr/bin', 'PATH survives — gh, git and npm need it')
+  t.equal(env.HOME, '/home/u')
+  t.end()
+})
+
+// commit.gpgsign is true globally and the GPG agent caches for ten minutes behind
+// pinentry-mac. An unattended test commit with a cold cache pops a GUI dialog and hangs
+// the run for its whole timeout, so signing is disabled for Codex's children only.
+test('withGitSigningDisabled sets commit.gpgsign=false via the git env protocol', t => {
+  const env = withGitSigningDisabled({ PATH: '/usr/bin' })
+  t.equal(env.GIT_CONFIG_COUNT, '1')
+  t.equal(env.GIT_CONFIG_KEY_0, 'commit.gpgsign')
+  t.equal(env.GIT_CONFIG_VALUE_0, 'false')
+  t.end()
+})
+
+// Appending at index 0 would silently drop a pre-existing GIT_CONFIG_KEY_0 from the
+// caller's environment — git reads pairs 0..COUNT-1, so the overwritten setting just
+// disappears.
+test('withGitSigningDisabled appends after existing GIT_CONFIG pairs', t => {
+  const env = withGitSigningDisabled({
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'user.name',
+    GIT_CONFIG_VALUE_0: 'Bot',
+  })
+  t.equal(env.GIT_CONFIG_COUNT, '2')
+  t.equal(env.GIT_CONFIG_KEY_0, 'user.name', 'existing pair untouched')
+  t.equal(env.GIT_CONFIG_KEY_1, 'commit.gpgsign')
+  t.equal(env.GIT_CONFIG_VALUE_1, 'false')
+  t.end()
+})
+
+// A malformed GIT_CONFIG_COUNT must not produce GIT_CONFIG_KEY_NaN, which git ignores —
+// leaving signing on and re-introducing the pinentry hang.
+test('withGitSigningDisabled recovers from a non-numeric GIT_CONFIG_COUNT', t => {
+  const env = withGitSigningDisabled({ GIT_CONFIG_COUNT: 'oops' })
+  t.equal(env.GIT_CONFIG_COUNT, '1')
+  t.equal(env.GIT_CONFIG_KEY_0, 'commit.gpgsign')
+  t.end()
+})
+
+/**
+ * A stand-in for the `codex exec` child: never exits on its own, records the signal it was
+ * sent, and can be made to finish with a final message on demand. `pid` is deliberately
+ * undefined so the kill path signals this handle instead of a real process group.
+ */
+class FakeChild extends EventEmitter {
+  pid: number | undefined = undefined
+  stdout = new PassThrough()
+  stderr = new PassThrough()
+  signals: string[] = []
+  kill(signal?: NodeJS.Signals | number): boolean {
+    this.signals.push(String(signal))
+    // As a real SIGTERM would, end the process — `close` is what the run awaits.
+    this.emit('close', null)
+    return true
+  }
+}
+
+/** A clock the test advances by hand, standing in for both Date.now and the heartbeat. */
+function fakeClock() {
+  let now = 1_000_000
+  let heartbeat: (() => void) | undefined
+  return {
+    deps: {
+      now: () => now,
+      setInterval: (cb: () => void) => {
+        heartbeat = cb
+        return 1 as unknown as ReturnType<typeof setInterval>
+      },
+      clearInterval: () => {},
+      checkMs: 10_000,
+      toleranceMs: 5_000,
+    },
+    tick(ms: number) {
+      now += ms
+      heartbeat?.()
+    },
+  }
+}
+
+function runOptions(log?: (event: string, fields: Record<string, unknown>) => void) {
+  return {
+    prompt: 'review',
+    codexBin: 'codex',
+    profile: 'review-bot',
+    workspaceRoot: os.tmpdir(),
+    worktreeRoot: fs.mkdtempSync(path.join(os.tmpdir(), 'codex-test-worktrees-')),
+    timeoutMs: 60_000,
+    disableGitSigning: false,
+    runId: 'test',
+    log,
+  }
+}
+
+const settle = () => new Promise(resolve => setImmediate(resolve))
+
+// The regression that motivated the deadline: a run in flight across a closed lid was killed
+// for "exceeding" a budget it had barely touched. Four hours of wall clock in one gap must
+// leave the budget almost untouched, and the kill must come only after that much *active*
+// time — with the log and the error both saying how much was discounted.
+test('runCodexReview does not charge a machine-asleep gap against the run timeout', async t => {
+  const child = new FakeChild()
+  const spawner = (() => child) as unknown as Spawner
+  const clock = fakeClock()
+  const frozen: Record<string, unknown>[] = []
+  const log = (event: string, fields: Record<string, unknown>) => {
+    if (event === 'codex.frozen') frozen.push(fields)
+  }
+
+  // The rejection lands on the tick that kills, before this test gets back to await it; a
+  // handler attached up front keeps it from surfacing as an unhandled rejection meanwhile.
+  const run = runCodexReview(runOptions(log), spawner, clock.deps).then(
+    () => 'resolved',
+    (error: unknown) => String(error)
+  )
+  await settle()
+
+  clock.tick(10_000)
+  clock.tick(4 * 60 * 60 * 1000) // asleep for four hours
+  await settle()
+  t.deepEqual(child.signals, [], 'a one-minute budget survives a four-hour sleep')
+  t.equal(frozen.length, 1, 'the suspension is logged once')
+  t.equal(frozen[0].runId, 'test')
+  t.equal(frozen[0].remainingMs, 40_000, 'the sleep cost one heartbeat, not four hours')
+
+  for (let i = 0; i < 4; i += 1) clock.tick(10_000)
+  await settle()
+  t.deepEqual(child.signals, ['SIGTERM'], 'killed once sixty seconds of active time are spent')
+
+  const message = await run
+  t.notEqual(message, 'resolved', 'a killed run must reject')
+  t.ok(message.includes('exceeded the 1 minute timeout'), message)
+  t.ok(message.includes('asleep were not counted'), 'the error accounts for the discounted time')
+  t.end()
+})
+
+// The ordinary path must be unaffected: a run that finishes releases its deadline and its
+// final message is parsed. A deadline left ticking after `close` would fire later against a
+// handle that no longer maps to anything.
+test('runCodexReview returns the parsed final message and stops the deadline on exit', async t => {
+  const child = new FakeChild()
+  let outputPath = ''
+  const spawner = ((_bin: string, args: string[]) => {
+    outputPath = args[args.indexOf('--output-last-message') + 1]
+    return child
+  }) as unknown as Spawner
+  const clock = fakeClock()
+
+  const run = runCodexReview(runOptions(), spawner, clock.deps)
+  await settle()
+  clock.tick(10_000)
+  fs.writeFileSync(
+    outputPath,
+    JSON.stringify({
+      results: [{ url: 'https://github.com/o/r/pull/1', status: 'passed', summary: '', pushedTestCommits: false, reviewUrl: '' }],
+    })
+  )
+  child.emit('close', 0)
+  const outcome = await run
+  t.equal(outcome.result.results[0].status, 'passed')
+
+  // Enough ticks to have expired the budget had the deadline still been running.
+  for (let i = 0; i < 10; i += 1) clock.tick(10_000)
+  t.deepEqual(child.signals, [], 'no signal after the run has already finished')
+  t.end()
+})
+
+// The thread's error line is the only place a requester learns why the review died. Next to
+// a message posted four hours ago, "exceeded three hours" needs the discount spelled out; a
+// run that never slept should not carry the clause at all.
+test('describeTimeout spells out the discounted sleep only when there was one', t => {
+  const H = 60 * 60 * 1000
+  t.equal(
+    describeTimeout(3 * H, { activeMs: 3 * H, wallMs: 3 * H, frozenMs: 0 }),
+    'Codex run exceeded the 180 minute timeout and was killed'
+  )
+  t.equal(
+    describeTimeout(3 * H, { activeMs: 3 * H, wallMs: 5 * H, frozenMs: 2 * H }),
+    'Codex run exceeded the 180 minute timeout and was killed (300 minutes by the wall clock, of which 120 minutes with the machine asleep were not counted)'
+  )
+  t.end()
+})

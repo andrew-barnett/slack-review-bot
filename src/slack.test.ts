@@ -1,0 +1,149 @@
+import test from 'tape'
+import { decideTrigger, isStatusRequest, type SlackMessageEvent } from './slack'
+
+const base: SlackMessageEvent = {
+  type: 'message',
+  channel: 'C123',
+  ts: '1700000000.000100',
+  user: 'U1',
+  text: 'review https://github.com/o/r/pull/1',
+}
+
+test('decideTrigger starts a review for a top-level message with a PR URL', t => {
+  const decision = decideTrigger(base, { channelIds: [] })
+  t.equal(decision.review, true)
+  if (decision.review) {
+    t.equal(decision.request.prs.length, 1)
+    t.equal(decision.request.message.ts, '1700000000.000100')
+    t.equal(decision.request.requestedBy, 'U1')
+  }
+  t.end()
+})
+
+// The bot's own findings thread repeats every PR URL it just reviewed. If bot messages
+// were not filtered out the bot would review its own reply, forever.
+test('decideTrigger ignores messages from bots', t => {
+  const decision = decideTrigger({ ...base, bot_id: 'B1' }, { channelIds: [] })
+  t.equal(decision.review, false)
+  if (!decision.review) t.equal(decision.reason, 'from-a-bot')
+  t.end()
+})
+
+// The daemon runs on one person's machine with their gh and Codex credentials, so
+// reviewing that person's own PR spends 10-30 minutes to reach a verdict GitHub will not
+// accept as an approval. Checks the ignore list short-circuits before anything is queued.
+test('decideTrigger ignores messages from a listed user', t => {
+  const decision = decideTrigger(base, { channelIds: [], ignoreUserIds: ['U1'] })
+  t.equal(decision.review, false)
+  if (!decision.review) t.equal(decision.reason, 'ignored-user')
+  t.end()
+})
+
+// Regression guard: the ignore list must not invert into an allowlist. Everyone absent
+// from it still gets reviewed, and an empty or omitted list ignores nobody.
+test('decideTrigger reviews users who are not on the ignore list', t => {
+  t.equal(decideTrigger(base, { channelIds: [], ignoreUserIds: ['U2', 'U3'] }).review, true)
+  t.equal(decideTrigger(base, { channelIds: [], ignoreUserIds: [] }).review, true)
+  t.equal(decideTrigger(base, { channelIds: [] }).review, true)
+  t.end()
+})
+
+// The IDs are typed into the credentials file by hand. A casing mismatch would fail the
+// only way this daemon can fail — silently, by carrying on reviewing.
+test('decideTrigger matches ignored user IDs case-insensitively', t => {
+  t.equal(decideTrigger({ ...base, user: 'u1' }, { channelIds: [], ignoreUserIds: ['U1'] }).review, false)
+  t.equal(decideTrigger(base, { channelIds: [], ignoreUserIds: ['u1'] }).review, false)
+  t.end()
+})
+
+// Configured trigger rule: only top-level messages start reviews, so discussion inside
+// the bot's own thread does not re-queue the same PRs.
+test('decideTrigger ignores replies inside a thread', t => {
+  const decision = decideTrigger(
+    { ...base, thread_ts: '1699999999.000000' },
+    { channelIds: [] }
+  )
+  t.equal(decision.review, false)
+  if (!decision.review) t.equal(decision.reason, 'thread-reply')
+  t.end()
+})
+
+// A thread parent carries thread_ts === ts once someone replies to it. Treating that as
+// a reply would make the bot stop responding to any message that had been replied to.
+test('decideTrigger still reviews a thread parent whose thread_ts equals its ts', t => {
+  const decision = decideTrigger({ ...base, thread_ts: base.ts }, { channelIds: [] })
+  t.equal(decision.review, true)
+  t.end()
+})
+
+// Slack delivers an edit as a `message` event with subtype message_changed and the new
+// text nested. Without the subtype filter, editing an old message would re-review it.
+test('decideTrigger ignores edits and deletions', t => {
+  for (const subtype of ['message_changed', 'message_deleted', 'channel_join']) {
+    const decision = decideTrigger({ ...base, subtype }, { channelIds: [] })
+    t.equal(decision.review, false, subtype)
+    if (!decision.review) t.equal(decision.reason, 'edited-or-deleted', subtype)
+  }
+  t.end()
+})
+
+// The allowlist is what keeps the bot from reviewing PR links in every channel it has
+// been invited to.
+test('decideTrigger honours the channel allowlist', t => {
+  t.equal(decideTrigger(base, { channelIds: ['C999'] }).review, false)
+  t.equal(decideTrigger(base, { channelIds: ['C123', 'C999'] }).review, true)
+  t.end()
+})
+
+// Most channel traffic has no PR links; those messages must be dropped silently rather
+// than starting an empty review.
+test('decideTrigger ignores a message with no PR URLs', t => {
+  const decision = decideTrigger({ ...base, text: 'morning all' }, { channelIds: [] })
+  t.equal(decision.review, false)
+  if (!decision.review) t.equal(decision.reason, 'no-pull-requests')
+  t.end()
+})
+
+const statusOptions = { botUserId: 'U0BOT', channelIds: [] as string[] }
+const statusBase: SlackMessageEvent = { ...base, text: '<@U0BOT> status' }
+
+// Silence is this bot's only failure signal, and a status reply is the one way to tell a
+// healthy idle daemon from a dead one from inside Slack.
+test('isStatusRequest answers a mention asking for status', t => {
+  t.equal(isStatusRequest(statusBase, statusOptions), true)
+  t.equal(isStatusRequest({ ...statusBase, text: 'hey <@U0BOT> health?' }, statusOptions), true)
+  t.equal(isStatusRequest({ ...statusBase, text: '<@U0BOT> ping' }, statusOptions), true)
+  t.end()
+})
+
+// The bot is in a channel with other traffic. Answering every mention, or every message
+// containing the word "status", would make it a nuisance.
+test('isStatusRequest needs both the mention and the keyword', t => {
+  t.equal(isStatusRequest({ ...statusBase, text: '<@U0BOT> thanks!' }, statusOptions), false)
+  t.equal(isStatusRequest({ ...statusBase, text: 'what is the status of the deploy' }, statusOptions), false)
+  t.equal(isStatusRequest({ ...statusBase, text: '<@U0OTHER> status' }, statusOptions), false)
+  t.end()
+})
+
+// Its own replies mention no one, but other integrations do; a bot-to-bot status loop
+// would be the same failure the review trigger already guards against.
+test('isStatusRequest ignores bots, edits, and other channels', t => {
+  t.equal(isStatusRequest({ ...statusBase, bot_id: 'B1' }, statusOptions), false)
+  t.equal(isStatusRequest({ ...statusBase, subtype: 'message_changed' }, statusOptions), false)
+  t.equal(isStatusRequest(statusBase, { ...statusOptions, channelIds: ['C999'] }), false)
+  t.end()
+})
+
+// Deliberate: the ignore list stops the bot wasting half an hour on a review it cannot
+// turn into an approval. Refusing to say whether it is alive would be a different thing.
+test('isStatusRequest answers users on the ignore list', t => {
+  t.equal(isStatusRequest({ ...statusBase, user: 'U1' }, statusOptions), true)
+  t.end()
+})
+
+// Asking inside a thread is natural — often the thread of the review you are asking about
+// — and unlike a review request it cannot re-queue any work.
+test('isStatusRequest answers inside a thread', t => {
+  t.equal(isStatusRequest({ ...statusBase, thread_ts: '1699999999.000000' }, statusOptions), true)
+  t.end()
+})

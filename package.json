@@ -1,0 +1,37 @@
+{
+  "name": "slack-review-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Slack bot that watches a channel for GitHub PR URLs and runs the Codex $review-pr skill on them, reporting the outcome back as reactions and a thread.",
+  "scripts": {
+    "build": "esbuild src/app.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/app.js --sourcemap",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
+    "start": "node dist/app.js",
+    "dev": "ts-node --compiler-options '{\"module\":\"commonjs\"}' --transpile-only src/app.ts",
+    "review": "ts-node --compiler-options '{\"module\":\"commonjs\"}' --transpile-only src/cli.ts",
+    "test": "ts-node --compiler-options '{\"module\":\"commonjs\"}' --transpile-only -e \"const fs=require('fs');const path=require('path');for(const f of fs.readdirSync('src').filter(n=>n.endsWith('.test.ts')).sort()){require(path.resolve('src',f));}\"",
+    "test:parse": "ts-node --compiler-options '{\"module\":\"commonjs\"}' --transpile-only src/parse-message.test.ts",
+    "test:prompt": "ts-node --compiler-options '{\"module\":\"commonjs\"}' --transpile-only src/prompt.test.ts",
+    "test:codex": "ts-node --compiler-options '{\"module\":\"commonjs\"}' --transpile-only src/codex.test.ts",
+    "test:deadline": "ts-node --compiler-options '{\"module\":\"commonjs\"}' --transpile-only src/deadline.test.ts",
+    "test:render": "ts-node --compiler-options '{\"module\":\"commonjs\"}' --transpile-only src/render.test.ts",
+    "test:queue": "ts-node --compiler-options '{\"module\":\"commonjs\"}' --transpile-only src/queue.test.ts",
+    "test:job": "ts-node --compiler-options '{\"module\":\"commonjs\"}' --transpile-only src/job.test.ts",
+    "test:cursor": "ts-node --compiler-options '{\"module\":\"commonjs\"}' --transpile-only src/cursor.test.ts",
+    "test:replay": "ts-node --compiler-options '{\"module\":\"commonjs\"}' --transpile-only src/replay.test.ts",
+    "test:catchup": "ts-node --compiler-options '{\"module\":\"commonjs\"}' --transpile-only src/catchup.test.ts",
+    "doctor": "ts-node --compiler-options '{\"module\":\"commonjs\"}' --transpile-only src/doctor.ts"
+  },
+  "dependencies": {
+    "@slack/bolt": "4.2.1",
+    "@slack/web-api": "7.19.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.10",
+    "@types/tape": "5.8.1",
+    "esbuild": "0.25.10",
+    "tape": "5.9.0",
+    "ts-node": "10.9.2",
+    "typescript": "5.9.3"
+  }
+}
