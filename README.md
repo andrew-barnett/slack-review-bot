@@ -41,8 +41,9 @@ startup to make that a delay rather than a loss, but a closed laptop still revie
 | `src/parse-message.ts` | Slack markup -> PR list + leftover instructions. |
 | `src/prompt.ts` | Builds the Codex prompt, including the unattended policy. |
 | `src/schema.ts` | The JSON output contract and its validator. |
-| `src/codex.ts` | Spawns `codex exec`, scrubs secrets, enforces the timeout. |
-| `src/deadline.ts` | The run timeout as a budget of *active* time — sleep is not charged. |
+| `src/codex.ts` | Spawns `codex exec`, scrubs secrets, enforces the timeout and the stall grace. |
+| `src/deadline.ts` | The run timeout and the stall grace as budgets of *active* time — sleep is not charged. |
+| `src/review.ts` | Ties a request to a Codex run and retries a stalled one with a longer grace. |
 | `src/job.ts` | The react -> review -> react -> thread sequence, as a pure function. |
 | `src/render.ts` | Slack mrkdwn for the thread. |
 | `src/queue.ts` | FIFO with a concurrency limit (default 1). |
@@ -285,6 +286,32 @@ report on becomes `blocked` rather than disappearing — otherwise a dropped PR 
 in no thread section at all, and if the entries that did come back all passed, the
 message would earn `:approved_stamp:` for a review that never happened.
 
+### Stalls and retries
+
+The run timeout catches a run that takes *too long*; it does nothing for one that has
+silently wedged with hours of budget left. So a second, shorter clock watches for
+**silence**: every chunk of Codex output resets it, and a run that produces nothing for its
+current grace is killed and retried as a fresh run. Like the budget, the grace is measured
+in *active* time — a closed lid is discounted — so a sleeping laptop is never mistaken for a
+hang.
+
+The grace lengthens with each retry, from `STALL_BACKOFF_MS`: 2 minutes for the first
+attempt, then 5, 7 and 12 for the re-runs, and a run silent through all four is killed for
+good and reported as an error. No single grace ever exceeds `STALL_MAX_MS` (15m), so the bot
+never waits longer than that for a sign of life. A stall logs `codex.stalled`; a retry logs
+`review.retry`; giving up logs `review.gave-up`.
+
+### Skipping a deleted request
+
+A request can wait in the queue for hours behind other reviews. The moment a slot frees, the
+job re-checks that the triggering Slack message still exists (`conversations.history` at that
+exact `ts`, using the scope the catch-up already needs) — someone may have deleted it in the
+meantime. A message that is gone is recorded as `skipped` (`review.aborted`) and never
+reviewed: no 20-minute run, and no findings thread posted onto a message nobody can see. A
+check that itself errors fails open — a transient Slack hiccup is no reason to drop a real
+request — so the worst case is one review of an already-deleted message, not a dropped live
+one.
+
 ## Codex permissions
 
 This is the part that needed solving. `$review-pr` cannot run unattended under the
@@ -481,6 +508,8 @@ All optional except the two tokens.
 | `REMOVE_ACK_ON_COMPLETE` | `false` | Remove `:eyes:` once a verdict is posted. |
 | `CONCURRENCY` | `1` | Reviews running at once. |
 | `RUN_TIMEOUT_MS` | `10800000` | Hard kill for one Codex run (3h of *active* time — see [Operating notes](#operating-notes)). |
+| `STALL_BACKOFF_MS` | `120000,300000,420000,720000` | Per-attempt grace a run may go without output before it is killed as stalled and retried: 2m, then 5m, 7m, 12m, then given up. Empty disables stall detection and retries. |
+| `STALL_MAX_MS` | `900000` | Ceiling on any single stall grace (15m). Every `STALL_BACKOFF_MS` entry is clamped to it. |
 | `CODEX_PROFILE` | `review-bot` | Codex config profile name. |
 | `WORKSPACE_ROOT` | `~/src` | Directory holding the local checkouts. |
 | `WORKTREE_ROOT` | `/private/tmp/codex-pr-review` | Where PR worktrees go. Must match the profile. |

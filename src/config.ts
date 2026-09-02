@@ -34,6 +34,15 @@ export interface ReviewConfig {
   worktreeRoot: string
   /** Hard timeout for one Codex run, in milliseconds. */
   runTimeoutMs: number
+  /**
+   * Escalating stall grace, in milliseconds, one entry per attempt. A run that produces no
+   * output for the current entry's worth of *active* time is killed and retried with the next,
+   * longer entry; a run that goes silent on the last entry is killed for good. Empty disables
+   * stall detection and retries entirely. Each entry is clamped to `stallMaxMs`.
+   */
+  stallBackoffMs: number[]
+  /** Ceiling on any single stall grace, so no attempt waits longer than this for output. */
+  stallMaxMs: number
   /** How many reviews may run at once. */
   concurrency: number
   /** Disable git commit signing in the Codex child process. */
@@ -124,6 +133,20 @@ export function parseList(raw: string | undefined): string[] {
 }
 
 /**
+ * Parse a list of positive integers (milliseconds), keeping only the well-formed ones and
+ * capping each at `max`. Empty or all-invalid input falls back to `fallback`, so a mistyped
+ * override degrades to the built-in schedule rather than silently disabling stall handling.
+ */
+export function parseMsList(raw: string | undefined, fallback: number[], max: number): number[] {
+  if (raw === undefined) return fallback.map(ms => Math.min(ms, max))
+  const parsed = parseList(raw)
+    .map(Number)
+    .filter(n => Number.isFinite(n) && n > 0)
+    .map(ms => Math.min(ms, max))
+  return parsed.length ? parsed : fallback.map(ms => Math.min(ms, max))
+}
+
+/**
  * Parse a configured list of Slack user IDs.
  *
  * Message events identify the sender only by ID, so IDs are what the ignore list has to
@@ -167,6 +190,18 @@ export function loadReviewConfig(env: NodeJS.ProcessEnv = process.env): ReviewCo
     // timeout exists to stop a wedged run holding the queue forever, not to bound
     // normal work, so it is deliberately generous.
     runTimeoutMs: parsePositiveInt(env.RUN_TIMEOUT_MS, 3 * 60 * 60 * 1000),
+    // No single wait for output ever exceeds this — the operator's "don't go more than 15
+    // minutes between status updates" rule, enforced by clamping every grace to it.
+    stallMaxMs: parsePositiveInt(env.STALL_MAX_MS, 15 * 60 * 1000),
+    // Increasing patience across retries: give a fresh run two minutes to say something, then
+    // a re-run five, then seven, then twelve; a run silent through all four is killed for good.
+    // The queue behind it is why the early graces are short — a genuinely wedged run should not
+    // hold a slot for its full budget four times over.
+    stallBackoffMs: parseMsList(
+      env.STALL_BACKOFF_MS,
+      [2, 5, 7, 12].map(m => m * 60 * 1000),
+      parsePositiveInt(env.STALL_MAX_MS, 15 * 60 * 1000)
+    ),
     concurrency: parsePositiveInt(env.CONCURRENCY, 1),
     disableGitSigning: parseBool(env.DISABLE_GIT_SIGNING, true),
     runLogDir: env.RUN_LOG_DIR ?? path.join(home, 'src', 'slack-review-bot', 'runs'),

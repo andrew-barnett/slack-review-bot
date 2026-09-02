@@ -127,8 +127,23 @@ export function isStatusRequest(event: SlackMessageEvent, options: StatusOptions
 }
 
 /** Web API implementations of the reaction and thread effects the job needs. */
-export function makeSlackEffects(client: WebClient): Pick<JobDeps, 'addReaction' | 'removeReaction' | 'postThreadReply'> {
+export function makeSlackEffects(
+  client: WebClient
+): Pick<JobDeps, 'addReaction' | 'removeReaction' | 'postThreadReply' | 'messageExists'> {
   return {
+    async messageExists(message: MessageRef): Promise<boolean> {
+      // A single-message window at exactly this ts: inclusive bounds set to the same value
+      // return that one message if it is still there, and nothing once it has been deleted.
+      // Uses the channels:history scope the catch-up already relies on — no new permission.
+      const result = await client.conversations.history({
+        channel: message.channel,
+        latest: message.ts,
+        oldest: message.ts,
+        inclusive: true,
+        limit: 1,
+      })
+      return Boolean(result.messages?.some(m => m.ts === message.ts))
+    },
     async addReaction(message: MessageRef, name: string): Promise<void> {
       try {
         await client.reactions.add({ channel: message.channel, timestamp: message.ts, name })

@@ -22,6 +22,13 @@ export interface CodexRunOptions {
    * is not charged against it; see `deadline.ts` for why and how.
    */
   timeoutMs: number
+  /**
+   * Active time the run may go without printing anything before it is judged stalled and
+   * killed. Measured in the same discounted units as `timeoutMs`, so a sleeping laptop is
+   * never mistaken for a wedged run. 0 or undefined disables stall detection. A stalled run
+   * throws {@link CodexStalledError}, which the caller may retry with a longer grace.
+   */
+  stallTimeoutMs?: number
   disableGitSigning: boolean
   /** Directory to write the raw stdout/stderr transcript to. Empty disables it. */
   logDir?: string
@@ -158,7 +165,11 @@ export async function runCodexReview(
   const appendLog = makeLogAppender(options.logDir, options.runId)
 
   try {
-    const exit = await new Promise<{ code: number | null; timedOut?: DeadlineSnapshot }>((resolve, reject) => {
+    const exit = await new Promise<{
+      code: number | null
+      timedOut?: DeadlineSnapshot
+      stalled?: DeadlineSnapshot
+    }>((resolve, reject) => {
       const child = spawner(options.codexBin, args, {
         cwd: options.workspaceRoot,
         env,
@@ -167,21 +178,28 @@ export async function runCodexReview(
         stdio: ['ignore', 'pipe', 'pipe'],
       })
 
+      // SIGTERM the whole tree, then escalate to SIGKILL if it clings on — a wedged npm or
+      // git can ignore the first signal. Shared by the timeout and the stall path.
+      const killTree = (): void => {
+        killProcessTree(child, 'SIGTERM')
+        setTimeout(() => killProcessTree(child, 'SIGKILL'), 10_000).unref()
+      }
+
       // Not a plain setTimeout: that counts wall-clock time, and a run in flight when the lid
       // closes is charged for the whole nap. One review was killed for "exceeding" three hours
       // of which it had used four minutes; the next one inherited the same fate because it
       // started during a two-second maintenance wake. The deadline charges active time only.
       let timedOut: DeadlineSnapshot | undefined
+      let stalled: DeadlineSnapshot | undefined
       const deadline = startActiveDeadline(
         options.timeoutMs,
         snapshot => {
           timedOut = snapshot
-          killProcessTree(child, 'SIGTERM')
-          // Escalate if it ignores SIGTERM — a wedged npm or git can.
-          setTimeout(() => killProcessTree(child, 'SIGKILL'), 10_000).unref()
+          killTree()
         },
         {
           ...clock,
+          stallMs: options.stallTimeoutMs,
           onFreeze: (frozenForMs, snapshot) => {
             options.log?.('codex.frozen', {
               runId: options.runId,
@@ -192,6 +210,20 @@ export async function runCodexReview(
             })
             clock.onFreeze?.(frozenForMs, snapshot)
           },
+          // A run that has gone silent for its whole grace is wedged, not slow: kill it so the
+          // caller can retry it (with a longer grace) rather than hold the queue for hours.
+          onStall: (idleMs, snapshot) => {
+            stalled = snapshot
+            options.log?.('codex.stalled', {
+              runId: options.runId,
+              idleMs,
+              stallMs: options.stallTimeoutMs,
+              activeMs: snapshot.activeMs,
+              hint: 'no output for the whole grace; killing so the review can be retried',
+            })
+            killTree()
+            clock.onStall?.(idleMs, snapshot)
+          },
         }
       )
 
@@ -199,6 +231,8 @@ export async function runCodexReview(
         const text = chunk.toString('utf8')
         transcript.push(text)
         appendLog(text)
+        // Any output is progress: reset the stall clock so only genuine silence trips it.
+        deadline.markActivity()
       }
       child.stdout?.on('data', capture)
       child.stderr?.on('data', capture)
@@ -209,12 +243,19 @@ export async function runCodexReview(
       })
       child.on('close', code => {
         deadline.stop()
-        resolve({ code, timedOut })
+        resolve({ code, timedOut, stalled })
       })
     })
 
     if (exit.timedOut) {
       throw new Error(describeTimeout(options.timeoutMs, exit.timedOut))
+    }
+    if (exit.stalled) {
+      throw new CodexStalledError(
+        describeStall(options.stallTimeoutMs ?? 0, exit.stalled),
+        options.stallTimeoutMs ?? 0,
+        exit.stalled
+      )
     }
 
     // A non-zero exit with a well-formed final message still tells us what happened to
@@ -233,6 +274,38 @@ export async function runCodexReview(
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true })
   }
+}
+
+/**
+ * Thrown when a run is killed for going silent, as opposed to for exhausting its budget.
+ *
+ * A distinct type so the caller can tell the one condition worth retrying (a wedged run that
+ * may just need another attempt) from a timeout or a crash (which will not fix themselves).
+ * Carries the snapshot so a giving-up caller can report how much active time was spent.
+ */
+export class CodexStalledError extends Error {
+  constructor(
+    message: string,
+    readonly stallMs: number,
+    readonly snapshot: DeadlineSnapshot
+  ) {
+    super(message)
+    this.name = 'CodexStalledError'
+  }
+}
+
+/**
+ * The error a stalled run reports. Exported for unit testing.
+ *
+ * Phrased in active time, since that is what the grace is measured in: a run silent for its
+ * whole grace across a closed lid has not actually been silent for that long by the clock.
+ */
+export function describeStall(stallMs: number, snapshot: DeadlineSnapshot): string {
+  const minutes = (ms: number) => `${Math.round(ms / 60_000)} minute${Math.round(ms / 60_000) === 1 ? '' : 's'}`
+  return (
+    `Codex produced no output for ${minutes(stallMs)} of active time and was killed as stalled` +
+    ` (${minutes(snapshot.activeMs)} of active time into the run)`
+  )
 }
 
 /**

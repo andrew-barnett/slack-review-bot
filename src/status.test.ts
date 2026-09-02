@@ -182,3 +182,25 @@ test('renderStatus reports the socket state', t => {
   t.notOk(fresh.includes('reconnect'), 'and does not claim churn it has not had')
   t.end()
 })
+
+// A skipped request (a deleted message the bot declined to review) is reported alongside the
+// verdicts, not folded into them, so "errored" still means a review that actually failed.
+test('renderStatus reports skipped requests separately from verdicts', t => {
+  const stats = createStats(0)
+  stats.record('pass', 1, 10 * MINUTE)
+  stats.record('skipped', 1, 20 * MINUTE)
+  const text = renderStatus(stats.snapshot(30 * MINUTE, 0, 0, config))
+  t.ok(text.includes('1 passed, 0 with findings, 0 errored, 1 skipped'), 'skipped appended to the counts')
+  t.end()
+})
+
+// Skips alone must not read as "none since start": the bot has been doing something, and the
+// distinction is exactly what this line exists to show.
+test('renderStatus shows counts when only skips have happened', t => {
+  const stats = createStats(0)
+  stats.record('skipped', 1, 10 * MINUTE)
+  const text = renderStatus(stats.snapshot(30 * MINUTE, 0, 0, config))
+  t.notOk(text.includes('none since start'), 'a skip is activity, not silence')
+  t.ok(text.includes('1 skipped'), 'and it is counted')
+  t.end()
+})

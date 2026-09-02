@@ -1,5 +1,6 @@
+import type { WebClient } from '@slack/web-api'
 import test from 'tape'
-import { decideTrigger, isStatusRequest, type SlackMessageEvent } from './slack'
+import { decideTrigger, isStatusRequest, makeSlackEffects, type SlackMessageEvent } from './slack'
 
 const base: SlackMessageEvent = {
   type: 'message',
@@ -145,5 +146,50 @@ test('isStatusRequest answers users on the ignore list', t => {
 // — and unlike a review request it cannot re-queue any work.
 test('isStatusRequest answers inside a thread', t => {
   t.equal(isStatusRequest({ ...statusBase, thread_ts: '1699999999.000000' }, statusOptions), true)
+  t.end()
+})
+
+// --- messageExists: the deleted-message check the job runs the moment a slot frees. ---
+
+/** A WebClient with just the one method messageExists calls, recording the args it passed. */
+function clientReturning(messages: Array<{ ts?: string }> | undefined): {
+  client: WebClient
+  calls: Array<Record<string, unknown>>
+} {
+  const calls: Array<Record<string, unknown>> = []
+  const client = {
+    conversations: {
+      async history(args: Record<string, unknown>) {
+        calls.push(args)
+        return { messages }
+      },
+    },
+  } as unknown as WebClient
+  return { client, calls }
+}
+
+// A message still in history returns true, and the query is a single-message window pinned to
+// exactly that ts — so it cannot be fooled by a neighbouring message.
+test('messageExists returns true for a message that is still there', async t => {
+  const { client, calls } = clientReturning([{ ts: '1.1' }])
+  const effects = makeSlackEffects(client)
+  t.equal(await effects.messageExists!({ channel: 'C1', ts: '1.1' }), true)
+  t.deepEqual(calls[0], { channel: 'C1', latest: '1.1', oldest: '1.1', inclusive: true, limit: 1 })
+  t.end()
+})
+
+// A deleted message drops out of history, so the window comes back empty and the check is false.
+test('messageExists returns false when the message has been deleted', async t => {
+  const { client } = clientReturning([])
+  const effects = makeSlackEffects(client)
+  t.equal(await effects.messageExists!({ channel: 'C1', ts: '1.1' }), false)
+  t.end()
+})
+
+// A window that returns only an adjacent message (never the asked-for ts) still reads as gone.
+test('messageExists returns false when the ts is not among the returned messages', async t => {
+  const { client } = clientReturning([{ ts: '2.2' }])
+  const effects = makeSlackEffects(client)
+  t.equal(await effects.messageExists!({ channel: 'C1', ts: '1.1' }), false)
   t.end()
 })

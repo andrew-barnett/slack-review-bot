@@ -35,11 +35,25 @@ export interface DeadlineDeps {
   toleranceMs: number
   /** Told about each suspension, with the deadline's state after discounting it. */
   onFreeze?(frozenForMs: number, snapshot: DeadlineSnapshot): void
+  /**
+   * Active time the run may go without producing output before it is judged stalled. Measured
+   * in the same discounted units as the budget, so a closed lid is never mistaken for a wedged
+   * run: only time the process was actually awake and silent counts. 0 or undefined disables
+   * stall detection, leaving the budget the only way a run ends early.
+   */
+  stallMs?: number
+  /** Called once, when the run has been silent for `stallMs` of active time. */
+  onStall?(idleMs: number, snapshot: DeadlineSnapshot): void
 }
 
 export interface ActiveDeadline {
-  /** Cancel the deadline; `onExpire` will not be called after this. Idempotent. */
+  /** Cancel the deadline; neither callback fires after this. Idempotent. */
   stop(): void
+  /**
+   * Record that the run just made progress, resetting the stall clock to the current active
+   * time. Called on every chunk of Codex output; a run that keeps talking is never stalled.
+   */
+  markActivity(): void
   snapshot(): DeadlineSnapshot
 }
 
@@ -74,6 +88,9 @@ export function startActiveDeadline(
   let last = startedAt
   let activeMs = 0
   let frozenMs = 0
+  // Active time at the last sign of progress. Starts at zero so a run that produces no output
+  // at all — wedged before it prints its first line — is caught by the same clock.
+  let lastActivityMs = 0
   let handle: ReturnType<typeof setInterval> | undefined
 
   const snapshot = (): DeadlineSnapshot => ({ activeMs, wallMs: deps.now() - startedAt, frozenMs })
@@ -82,6 +99,10 @@ export function startActiveDeadline(
     if (handle === undefined) return
     deps.clearInterval(handle)
     handle = undefined
+  }
+
+  const markActivity = (): void => {
+    lastActivityMs = activeMs
   }
 
   const tick = (): void => {
@@ -98,12 +119,22 @@ export function startActiveDeadline(
     } else {
       activeMs += elapsed
     }
+    // The budget is the hard cap and takes precedence: a run that both stalled and ran out in
+    // the same tick has, either way, ended — and a timeout is the more accurate description of
+    // a run that used all its time.
     if (activeMs >= budgetMs) {
       stop()
       onExpire(snapshot())
+      return
+    }
+    // Progress is charged against active time only, so the idle span excludes any suspension
+    // folded into this tick — a laptop asleep for hours adds at most one interval of idle.
+    if (deps.stallMs && deps.stallMs > 0 && activeMs - lastActivityMs >= deps.stallMs) {
+      stop()
+      deps.onStall?.(activeMs - lastActivityMs, snapshot())
     }
   }
 
   handle = deps.setInterval(tick, deps.checkMs)
-  return { stop, snapshot }
+  return { stop, markActivity, snapshot }
 }

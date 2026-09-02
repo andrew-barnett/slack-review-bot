@@ -70,7 +70,7 @@ export interface Stats {
 /** Counters for the life of one daemon process. Deliberately not persisted: the question
  *  a status request answers is "is this process working", and a restart resets that. */
 export function createStats(startedAt: number): Stats {
-  const counts: Record<JobOutcome, number> = { pass: 0, findings: 0, error: 0 }
+  const counts: Record<JobOutcome, number> = { pass: 0, findings: 0, error: 0, skipped: 0 }
   let lastReview: StatusSnapshot['lastReview']
   return {
     record(outcome, prs, finishedAt) {
@@ -98,6 +98,7 @@ const OUTCOME_WORD: Record<JobOutcome, string> = {
   pass: 'all passed',
   findings: 'findings',
   error: 'errored',
+  skipped: 'skipped (message gone)',
 }
 
 function plural(n: number, one: string, many = `${one}s`): string {
@@ -178,11 +179,14 @@ export function renderStatus(
 ): string {
   const { counts, config, lastReview } = snapshot
   const total = counts.pass + counts.findings + counts.error
+  // Skipped is not a verdict — it is a request the bot declined to review (a deleted message) —
+  // so it is reported alongside the counts rather than folded into them.
+  const skipped = counts.skipped ? `, ${counts.skipped} skipped` : ''
   const lines = [
     `*Up* ${formatDuration(snapshot.now - snapshot.startedAt)} — queue: ${snapshot.active} running, ${snapshot.queued} waiting`,
-    total === 0
+    total === 0 && !counts.skipped
       ? '*Reviews* none since start'
-      : `*Reviews* ${counts.pass} passed, ${counts.findings} with findings, ${counts.error} errored`,
+      : `*Reviews* ${counts.pass} passed, ${counts.findings} with findings, ${counts.error} errored${skipped}`,
   ]
   if (connection) lines.push(renderConnection(connection, snapshot.now))
   if (catchUp) lines.push(renderCatchUp(catchUp, snapshot.now))

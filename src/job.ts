@@ -24,6 +24,13 @@ export interface JobDeps {
   removeReaction(message: MessageRef, name: string): Promise<void>
   postThreadReply(message: MessageRef, text: string): Promise<void>
   runReview(request: ReviewRequest): Promise<ReviewRunResult>
+  /**
+   * Whether the triggering message still exists. Optional: the CLI has no Slack to ask. When
+   * present, the job checks it the moment a slot frees — a request can sit in the queue for
+   * hours, and a message deleted in the meantime should not cost a 20-minute review whose
+   * findings would land on a thread nobody can see.
+   */
+  messageExists?(message: MessageRef): Promise<boolean>
   log(event: string, fields: Record<string, unknown>): void
 }
 
@@ -46,7 +53,7 @@ export interface JobOptions {
   queued?: boolean
 }
 
-export type JobOutcome = 'pass' | 'findings' | 'error'
+export type JobOutcome = 'pass' | 'findings' | 'error' | 'skipped'
 
 /**
  * Acknowledge, review, and report.
@@ -62,6 +69,29 @@ export async function runJob(
   options: JobOptions = {}
 ): Promise<JobOutcome> {
   const urls = request.prs.map(pr => pr.url)
+
+  // Checked before anything else, because this runs the instant a slot frees — the message may
+  // have been deleted while it waited in the queue. A check that itself fails is treated as
+  // "still there": a transient Slack error is no reason to silently drop a real request, and
+  // the worst case is one review of an already-gone message rather than a dropped live one.
+  if (deps.messageExists) {
+    let exists = true
+    try {
+      exists = await deps.messageExists(request.message)
+    } catch (error) {
+      deps.log('review.exists.failed', { prs: urls, error: String(error) })
+    }
+    if (!exists) {
+      deps.log('review.aborted', {
+        channel: request.message.channel,
+        ts: request.message.ts,
+        prs: urls,
+        reason: 'message-deleted',
+      })
+      return 'skipped'
+    }
+  }
+
   deps.log('review.start', { channel: request.message.channel, ts: request.message.ts, prs: urls })
 
   // A failure to react must not cancel the review; the reaction is a status surface,

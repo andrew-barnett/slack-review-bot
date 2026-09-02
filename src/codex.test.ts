@@ -6,6 +6,8 @@ import { PassThrough } from 'stream'
 import test from 'tape'
 import {
   buildCodexArgs,
+  CodexStalledError,
+  describeStall,
   describeTimeout,
   runCodexReview,
   stripSecretsFromEnv,
@@ -228,6 +230,79 @@ test('runCodexReview returns the parsed final message and stops the deadline on 
   // Enough ticks to have expired the budget had the deadline still been running.
   for (let i = 0; i < 10; i += 1) clock.tick(10_000)
   t.deepEqual(child.signals, [], 'no signal after the run has already finished')
+  t.end()
+})
+
+// A run that has printed nothing for its whole grace is wedged, not slow. It must be killed
+// and rejected with the typed error the runner retries on — and, like the timeout, measured in
+// active time so a closed lid is never mistaken for silence.
+test('runCodexReview kills a silent run and rejects with CodexStalledError', async t => {
+  const child = new FakeChild()
+  const spawner = (() => child) as unknown as Spawner
+  const clock = fakeClock()
+  const stalled: Record<string, unknown>[] = []
+  const log = (event: string, fields: Record<string, unknown>) => {
+    if (event === 'codex.stalled') stalled.push(fields)
+  }
+
+  const run = runCodexReview({ ...runOptions(log), stallTimeoutMs: 40_000 }, spawner, clock.deps).then(
+    () => 'resolved',
+    (error: unknown) => error
+  )
+  await settle()
+
+  for (let i = 0; i < 3; i += 1) clock.tick(10_000) // 30s of silence, under the 40s grace
+  t.deepEqual(child.signals, [], 'not killed before the grace is spent')
+  clock.tick(10_000) // 40s: the grace is up
+  await settle()
+
+  const outcome = await run
+  t.ok(outcome instanceof CodexStalledError, 'a stall rejects with the typed, retryable error')
+  t.equal((outcome as CodexStalledError).stallMs, 40_000, 'the error carries the grace it exceeded')
+  t.deepEqual(child.signals, ['SIGTERM'], 'the process tree was signalled to stop')
+  t.equal(stalled.length, 1, 'the stall was logged once')
+  t.equal(stalled[0].runId, 'test')
+  t.end()
+})
+
+// The wiring that makes the grace mean "silent", not "slow": every chunk of output resets the
+// clock, so a run that keeps talking is never killed even long past the grace from its start.
+test('runCodexReview does not kill a run that keeps producing output', async t => {
+  const child = new FakeChild()
+  const spawner = (() => child) as unknown as Spawner
+  const clock = fakeClock()
+
+  // A budget far larger than the run, so only a stall (not the timeout) could kill it here.
+  const run = runCodexReview(
+    { ...runOptions(), timeoutMs: 10 * 60_000, stallTimeoutMs: 40_000 },
+    spawner,
+    clock.deps
+  ).then(
+    () => 'resolved',
+    (error: unknown) => String(error)
+  )
+  await settle()
+
+  // Talk every 30s for well past the 40s grace measured from the start: 18 silent ticks would
+  // otherwise cross the grace six times over.
+  for (let i = 0; i < 6; i += 1) {
+    clock.tick(10_000)
+    clock.tick(10_000)
+    clock.tick(10_000)
+    child.stdout.write(`progress ${i}\n`)
+    await settle()
+  }
+  t.deepEqual(child.signals, [], 'a run that keeps printing is never judged stalled')
+  t.end()
+})
+
+// The thread's error line is what a requester sees when every retry stalled. It is phrased in
+// active time, since a run silent across a closed lid was not really silent for that span.
+test('describeStall states the grace and how far into the run it gave up', t => {
+  t.equal(
+    describeStall(2 * 60_000, { activeMs: 2 * 60_000, wallMs: 2 * 60_000, frozenMs: 0 }),
+    'Codex produced no output for 2 minutes of active time and was killed as stalled (2 minutes of active time into the run)'
+  )
   t.end()
 })
 

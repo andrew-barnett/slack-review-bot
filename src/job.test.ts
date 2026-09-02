@@ -162,3 +162,51 @@ test('runJob still reviews when removing the queued reaction fails', async t => 
   t.equal(outcome, 'pass')
   t.end()
 })
+
+// --- Deleted-message guard: a request can sit in the queue for hours before a slot frees. ---
+
+// A message deleted while it waited must not be reviewed: no 20-minute run, no thread posted
+// onto a message nobody can see. The job settles as 'skipped', distinct from an error.
+test('runJob skips a review when the triggering message no longer exists', async t => {
+  let reviewed = false
+  const events: string[] = []
+  const rec = recorder(
+    async () => {
+      reviewed = true
+      return result(pr('passed'))
+    },
+    { async messageExists() { return false }, log: (e: string) => events.push(e) }
+  )
+
+  const outcome = await runJob(request, emoji, rec.deps)
+  t.equal(outcome, 'skipped', 'a deleted message is skipped, not reviewed')
+  t.notOk(reviewed, 'the review never ran')
+  t.deepEqual(rec.added, [], 'a gone message gets no reactions')
+  t.deepEqual(rec.threads, [], 'and no thread')
+  t.ok(events.includes('review.aborted'), 'the skip is logged')
+  t.notOk(events.includes('review.start'), 'the run was never announced as started')
+  t.end()
+})
+
+// The ordinary case: a message that still exists is reviewed exactly as before the guard.
+test('runJob reviews normally when the message still exists', async t => {
+  const rec = recorder(async () => result(pr('passed')), { async messageExists() { return true } })
+  const outcome = await runJob(request, emoji, rec.deps)
+  t.equal(outcome, 'pass')
+  t.deepEqual(rec.added, ['eyes', 'approved_stamp'], 'the review proceeded')
+  t.end()
+})
+
+// Fail-open: a transient Slack error on the existence check is no reason to silently drop a
+// real request. Reviewing an occasionally-already-gone message is the lesser harm.
+test('runJob reviews anyway when the existence check itself fails', async t => {
+  const events: string[] = []
+  const rec = recorder(async () => result(pr('passed')), {
+    async messageExists() { throw new Error('slack down') },
+    log: (e: string) => events.push(e),
+  })
+  const outcome = await runJob(request, emoji, rec.deps)
+  t.equal(outcome, 'pass', 'a failed check does not block the review')
+  t.ok(events.includes('review.exists.failed'), 'the failed check is logged')
+  t.end()
+})

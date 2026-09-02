@@ -129,3 +129,116 @@ test('startActiveDeadline clamps the heartbeat to the budget', t => {
   t.deepEqual(intervals, [5_000])
   t.end()
 })
+
+// --- Stall detection: the run must show progress within a grace of *active* time. ---
+
+const STALL = 40_000 // four CHECK intervals
+
+// The core signal: a run that goes silent for its whole grace is flagged, once, and the
+// heartbeat stops. The grace is spent in whole CHECK intervals of accrued active time.
+test('startActiveDeadline flags a stall after the grace of silent active time', t => {
+  const clock = fakeClock()
+  const stalls: number[] = []
+  startActiveDeadline(10 * 60_000, () => t.fail('the budget must not expire in this test'), {
+    ...clock.deps,
+    checkMs: CHECK,
+    toleranceMs: TOLERANCE,
+    stallMs: STALL,
+    onStall: idle => stalls.push(idle),
+  })
+
+  for (let i = 0; i < 3; i += 1) clock.tick(CHECK)
+  t.equal(stalls.length, 0, '30s of silence is under the 40s grace')
+  clock.tick(CHECK)
+  t.equal(stalls.length, 1, 'the fourth silent tick crosses the grace')
+  t.ok(stalls[0] >= STALL, 'the reported idle is at least the grace')
+  t.equal(clock.cleared, 1, 'the heartbeat is cleared on a stall')
+  t.end()
+})
+
+// markActivity is what makes the grace mean "silent" rather than "slow": a run that keeps
+// producing output resets the clock each time and is never flagged, however long it runs.
+test('markActivity resets the stall clock so a talkative run is never flagged', t => {
+  const clock = fakeClock()
+  const stalls: number[] = []
+  const deadline = startActiveDeadline(10 * 60_000, () => t.fail('no expiry'), {
+    ...clock.deps,
+    checkMs: CHECK,
+    toleranceMs: TOLERANCE,
+    stallMs: STALL,
+    onStall: idle => stalls.push(idle),
+  })
+
+  // Progress on each of six ticks — well past the grace measured from the start.
+  for (let i = 0; i < 6; i += 1) {
+    clock.tick(CHECK)
+    deadline.markActivity()
+  }
+  t.equal(stalls.length, 0, 'activity every tick keeps the run alive indefinitely')
+
+  // Then fall silent: the grace is now measured from the last activity.
+  for (let i = 0; i < 3; i += 1) clock.tick(CHECK)
+  t.equal(stalls.length, 0, 'still under the grace since the last output')
+  clock.tick(CHECK)
+  t.equal(stalls.length, 1, 'flagged once the grace passes with no further output')
+  t.end()
+})
+
+// The regression this shares with the budget: a machine asleep is not a run gone silent. A
+// four-hour suspension is charged as one interval of idle, so it cannot trip the grace.
+test('startActiveDeadline does not count a suspension as idle toward a stall', t => {
+  const clock = fakeClock()
+  const stalls: number[] = []
+  startActiveDeadline(10 * 60_000, () => t.fail('no expiry'), {
+    ...clock.deps,
+    checkMs: CHECK,
+    toleranceMs: TOLERANCE,
+    stallMs: STALL,
+    onStall: idle => stalls.push(idle),
+  })
+
+  clock.tick(CHECK) // one active interval of silence
+  clock.tick(4 * 60 * 60 * 1000) // asleep four hours: charged as one interval, not four hours
+  t.equal(stalls.length, 0, 'four hours asleep is not four hours of silence')
+  clock.tick(CHECK)
+  clock.tick(CHECK)
+  t.equal(stalls.length, 1, 'the grace is reached only by real active silence once awake')
+  t.end()
+})
+
+// When a run both runs out of budget and crosses the stall grace on the same tick, the budget
+// wins: "used all its time" is the more accurate account than "went silent".
+test('startActiveDeadline reports expiry, not a stall, when both land on one tick', t => {
+  const clock = fakeClock()
+  const expired: DeadlineSnapshot[] = []
+  const stalls: number[] = []
+  startActiveDeadline(20_000, s => expired.push(s), {
+    ...clock.deps,
+    checkMs: CHECK,
+    toleranceMs: TOLERANCE,
+    stallMs: 20_000,
+    onStall: idle => stalls.push(idle),
+  })
+
+  clock.tick(CHECK)
+  clock.tick(CHECK) // active reaches 20s: both the budget and the stall grace at once
+  t.equal(expired.length, 1, 'the budget expiry is reported')
+  t.equal(stalls.length, 0, 'the stall is not also reported')
+  t.end()
+})
+
+// Stall detection is opt-in: with no grace configured the deadline behaves exactly as before,
+// counting the budget and nothing else.
+test('startActiveDeadline never stalls when no grace is configured', t => {
+  const clock = fakeClock()
+  const stalls: number[] = []
+  startActiveDeadline(10 * 60_000, () => t.fail('no expiry'), {
+    ...clock.deps,
+    checkMs: CHECK,
+    toleranceMs: TOLERANCE,
+    onStall: idle => stalls.push(idle),
+  })
+  for (let i = 0; i < 20; i += 1) clock.tick(CHECK)
+  t.equal(stalls.length, 0, 'no grace means no stall, however long the silence')
+  t.end()
+})

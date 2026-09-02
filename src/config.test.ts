@@ -1,5 +1,5 @@
 import test from 'tape'
-import { loadConfig, looksLikeUserId, parseUserIds } from './config'
+import { loadConfig, looksLikeUserId, parseMsList, parseUserIds } from './config'
 
 /** The two required keys, so a test can vary only the knob it cares about. */
 const credentials = { SLACK_BOT_TOKEN: 'placeholder', SLACK_APP_TOKEN: 'placeholder' }
@@ -87,5 +87,44 @@ test('loadConfig defaults the queued emoji and lets QUEUED_EMOJI override it', t
   t.equal(defaults.queuedEmoji, 'hourglass_flowing_sand')
   t.notEqual(defaults.queuedEmoji, defaults.ackEmoji, 'queued and ack must be distinct reactions')
   t.equal(loadConfig({ ...credentials, QUEUED_EMOJI: 'clock1' }).queuedEmoji, 'clock1')
+  t.end()
+})
+
+// --- Stall back-off schedule and its 15-minute ceiling. ---
+
+const MIN = 60 * 1000
+
+// The operator's schedule, verbatim: 2, 5, 7, 12 minutes, then give up. Shipping it as the
+// default means the bot behaves as specified with no configuration.
+test('loadConfig defaults the stall back-off to the specified escalating schedule', t => {
+  t.deepEqual(loadConfig({ ...credentials }).stallBackoffMs, [2, 5, 7, 12].map(m => m * MIN))
+  t.equal(loadConfig({ ...credentials }).stallMaxMs, 15 * MIN, 'and caps a single wait at 15 minutes')
+  t.end()
+})
+
+// STALL_BACKOFF_MS lets the schedule be retuned; every entry is still held under the ceiling
+// so no override can make the bot wait longer than the cap for a sign of life.
+test('loadConfig parses and clamps a custom stall schedule to the ceiling', t => {
+  const config = loadConfig({ ...credentials, STALL_BACKOFF_MS: '60000, 120000, 3600000' })
+  t.deepEqual(config.stallBackoffMs, [60_000, 120_000, 15 * MIN], 'the over-cap entry is clamped to 15 minutes')
+  t.end()
+})
+
+// A lower ceiling clamps even the built-in default schedule, so the ceiling is a true upper
+// bound rather than only a filter on overrides.
+test('loadConfig clamps the default schedule to a lowered ceiling', t => {
+  const config = loadConfig({ ...credentials, STALL_MAX_MS: String(3 * MIN) })
+  t.deepEqual(config.stallBackoffMs, [2, 3, 3, 3].map(m => m * MIN), 'nothing exceeds a 3-minute ceiling')
+  t.end()
+})
+
+// parseMsList in isolation: keep the well-formed positive values, drop the junk, and fall back
+// to the default when nothing usable survives so a typo cannot silently disable the feature.
+test('parseMsList keeps valid entries, clamps them, and falls back when empty', t => {
+  const fallback = [1000, 2000]
+  t.deepEqual(parseMsList('100, 200, 300', fallback, 250), [100, 200, 250], 'valid values, clamped')
+  t.deepEqual(parseMsList('nope, -5, 0', fallback, 5000), fallback, 'all-invalid input uses the fallback')
+  t.deepEqual(parseMsList(undefined, fallback, 1500), [1000, 1500], 'an absent value uses the clamped fallback')
+  t.deepEqual(parseMsList('', fallback, 5000), fallback, 'an empty string is treated as no usable entries')
   t.end()
 })
