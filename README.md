@@ -53,12 +53,13 @@ startup to make that a delay rather than a loss, but a closed laptop still revie
 | `src/progress.ts` | Live registry of what is running and waiting, for the status reply. |
 | `src/status.ts` | Per-process counters and the mrkdwn for a status reply. |
 | `src/help.ts` | The mrkdwn for the help reply. |
+| `src/command.ts` | Typo-tolerant matching of a mention's words to a command. |
 | `src/doctor.ts` | `npm run doctor` — the runtime preflight. |
 | `src/cli.ts` | Run one review from the terminal, no Slack. |
 
 `job.ts`, `render.ts`, `prompt.ts`, `parse-message.ts`, `schema.ts`, `queue.ts`, `cursor.ts`,
-`replay.ts`, `progress.ts` and `help.ts` are pure and unit-tested; everything that touches Slack
-or spawns a process is injected.
+`replay.ts`, `progress.ts`, `help.ts` and `command.ts` are pure and unit-tested; everything that
+touches Slack or spawns a process is injected.
 
 ### Trigger rules
 
@@ -602,9 +603,13 @@ that did not manage to backfill is still worth having — so those are `replay.f
 
 The bot answers two mentions. `help` (or any mention it does not otherwise recognise) prints
 what it does, the commands, and the common shortfalls — including that it pauses while its
-laptop is asleep. `status` (or `health`, or `ping`) reports live state. Anything else you
-@-mention it with — a bare mention, a typo'd command — also gets the help reply, so addressing
-the bot never falls silent; a mention carrying a PR link is reviewed instead.
+laptop is asleep. `status` (or `health`, or `ping`) reports live state. Commands are
+**typo-tolerant** (`command.ts`): a word within a small edit distance of a single command is
+taken as that command (`staus` → status, `pign` → ping), while a word close to *two* commands
+(`healp` — help or health?) is left ambiguous and falls to help rather than being guessed.
+Anything else you @-mention it with — a bare mention, an unrecognised command — also gets the
+help reply, so addressing the bot never falls silent; a mention carrying a PR link is reviewed
+instead.
 
 Mention the bot with `status` (or `health`, or `ping`) in an allowlisted channel and it
 replies in a thread:

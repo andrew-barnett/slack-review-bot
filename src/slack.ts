@@ -3,6 +3,7 @@
 // without constructing a Bolt app.
 
 import type { WebClient } from '@slack/web-api'
+import { resolveMentionCommand } from './command'
 import type { JobDeps, MessageRef } from './job'
 import { parseMessage } from './parse-message'
 import type { ReviewRequest } from './job'
@@ -123,7 +124,9 @@ export function isStatusRequest(event: SlackMessageEvent, options: StatusOptions
 
   const text = event.text || ''
   if (!text.includes(`<@${options.botUserId}>`)) return false
-  return /\b(status|health|ping)\b/i.test(text)
+  // Typo-tolerant: `status`, `health`, `ping`, or a near miss like `staus`/`helth`/`pign`.
+  // A word ambiguous between a status command and `help` resolves to neither and falls to help.
+  return resolveMentionCommand(text) === 'status'
 }
 
 /**

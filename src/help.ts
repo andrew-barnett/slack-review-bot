@@ -33,6 +33,7 @@ export function renderHelp(emoji: HelpEmoji): string {
     '• `help` — show this message',
     "• `status` (or `health`, `ping`) — uptime, what I'm reviewing now, the queue, connection, and config",
     '• a *pull-request link* — start a review',
+    "Close spellings work too, so `staus` or `helth` still get through.",
     "Mention me with anything I don't recognise and I'll show this help.",
     '',
     '*How I run & common shortfalls*',

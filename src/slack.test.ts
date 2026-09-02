@@ -229,3 +229,26 @@ test('isHelpRequest ignores bots, edits, and other channels, but answers in thre
   t.equal(isHelpRequest({ ...statusBase, thread_ts: '1699999999.000000' }, statusOptions), true, 'answers in a thread')
   t.end()
 })
+
+// --- Typo-tolerant status commands (see command.ts). ---
+
+// A misspelled status command still reports status rather than falling through to help.
+test('isStatusRequest tolerates typos in the status commands', t => {
+  t.equal(isStatusRequest({ ...statusBase, text: '<@U0BOT> staus' }, statusOptions), true, 'staus')
+  t.equal(isStatusRequest({ ...statusBase, text: '<@U0BOT> helth' }, statusOptions), true, 'helth -> health')
+  t.equal(isStatusRequest({ ...statusBase, text: '<@U0BOT> pign' }, statusOptions), true, 'pign -> ping')
+  t.end()
+})
+
+// A word ambiguous between help and a status command is not treated as status — it falls
+// through to the help reply, which lists the real commands.
+test('isStatusRequest does not guess an ambiguous word as status', t => {
+  t.equal(isStatusRequest({ ...statusBase, text: '<@U0BOT> healp' }, statusOptions), false, 'help or health — no guess')
+  t.end()
+})
+
+// A word nothing like a command is still not a status request (it becomes a help fallback).
+test('isStatusRequest ignores a mention with no command-like word', t => {
+  t.equal(isStatusRequest({ ...statusBase, text: '<@U0BOT> deploy please' }, statusOptions), false)
+  t.end()
+})
