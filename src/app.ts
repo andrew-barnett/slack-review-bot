@@ -14,6 +14,7 @@ import {
 import { runCodexReview } from './codex'
 import { loadConfig, looksLikeUserId } from './config'
 import { openCursorStore, openNullCursorStore } from './cursor'
+import { makeGitHubEffects } from './github'
 import { renderHelp } from './help'
 import { runJob, type JobDeps } from './job'
 import { createActiveReviews } from './progress'
@@ -210,6 +211,7 @@ async function main(): Promise<void> {
               pass: config.passEmoji,
               findings: config.findingsEmoji,
               error: config.errorEmoji,
+              humanReview: config.humanReviewEmoji,
             })
           )
         } catch (error) {
@@ -235,7 +237,7 @@ async function main(): Promise<void> {
     // instead of leaving a message acknowledged with :eyes: and never answered.
     cursors.begin(request.message.channel, request.message.ts)
 
-    const deps: JobDeps = { ...makeSlackEffects(client), runReview, log }
+    const deps: JobDeps = { ...makeSlackEffects(client), ...makeGitHubEffects(), runReview, log }
 
     // Track this request for the live status. Enqueued now (as waiting), promoted to active
     // when its slot is taken, and forgotten when it settles. Short `repo#number` labels, since
@@ -287,6 +289,7 @@ async function main(): Promise<void> {
             pass: config.passEmoji,
             findings: config.findingsEmoji,
             error: config.errorEmoji,
+            humanReview: config.humanReviewEmoji,
             removeAckOnComplete: config.removeAckOnComplete,
           },
           deps,

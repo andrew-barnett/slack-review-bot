@@ -8,6 +8,7 @@ const emoji: JobEmoji = {
   pass: 'approved_stamp',
   findings: 'comments',
   error: 'warning',
+  humanReview: 'raising_hand',
   removeAckOnComplete: false,
 }
 
@@ -208,5 +209,146 @@ test('runJob reviews anyway when the existence check itself fails', async t => {
   const outcome = await runJob(request, emoji, rec.deps)
   t.equal(outcome, 'pass', 'a failed check does not block the review')
   t.ok(events.includes('review.exists.failed'), 'the failed check is logged')
+  t.end()
+})
+
+// --- Human-review gate: deployments PRs that touch values.yaml are handed to a person. ---
+
+const deployRequest: ReviewRequest = {
+  message: { channel: 'C1', ts: '2.2' },
+  prs: [
+    { owner: 'trade-platform', repo: 'deployments', number: 5, url: 'https://github.com/trade-platform/deployments/pull/5' },
+  ],
+  instructions: '',
+}
+
+// The core rule: a deployments values.yaml change is not reviewed, is commented on, and is
+// flagged in the channel — the developer must not be left thinking the bot is merely slow.
+test('runJob hands a deployments values.yaml PR to a human and comments', async t => {
+  let reviewed = false
+  const comments: Array<{ url: string; body: string }> = []
+  const events: string[] = []
+  const rec = recorder(
+    async () => {
+      reviewed = true
+      return result(pr('passed'))
+    },
+    {
+      async listChangedFiles() { return ['values.yaml', 'README.md'] },
+      async postPrComment(p, body) { comments.push({ url: p.url, body }) },
+      log: (e: string) => events.push(e),
+    }
+  )
+
+  const outcome = await runJob(deployRequest, emoji, rec.deps)
+  t.equal(outcome, 'skipped', 'the request is skipped, not reviewed')
+  t.notOk(reviewed, 'the bot never ran the review')
+  t.equal(comments.length, 1, 'it commented on the PR')
+  t.ok(/human review is required/i.test(comments[0].body), 'the comment says a human is needed')
+  t.ok(rec.added.includes('raising_hand'), 'the human-review reaction is added')
+  t.ok(events.includes('review.human-required'), 'and it is logged')
+  t.end()
+})
+
+// A deployments PR that does not touch a values file is still the bot's to review.
+test('runJob reviews a deployments PR that does not touch values.yaml', async t => {
+  let reviewed = false
+  const comments: unknown[] = []
+  const rec = recorder(
+    async () => {
+      reviewed = true
+      return result(pr('passed'))
+    },
+    {
+      async listChangedFiles() { return ['README.md', 'chart/templates/deployment.yaml'] },
+      async postPrComment() { comments.push(1) },
+    }
+  )
+  const outcome = await runJob(deployRequest, emoji, rec.deps)
+  t.equal(outcome, 'pass', 'reviewed normally')
+  t.ok(reviewed, 'the review ran')
+  t.equal(comments.length, 0, 'no gate comment')
+  t.end()
+})
+
+// The gate must not add a GitHub call for the common case: a PR outside the deployments repo is
+// passed straight through without its files being listed.
+test('runJob does not inspect files for a non-deployments PR', async t => {
+  let listed = false
+  const rec = recorder(async () => result(pr('passed')), {
+    async listChangedFiles() { listed = true; return [] },
+  })
+  const outcome = await runJob(request, emoji, rec.deps) // request is repo "r"
+  t.equal(outcome, 'pass')
+  t.notOk(listed, 'a non-deployments PR is not inspected')
+  t.end()
+})
+
+// Fail safe: if the files of a deployments PR cannot be listed, it is handed to a human rather
+// than reviewed on a guess — the sensitive repo errs toward caution.
+test('runJob hands a deployments PR to a human when its files cannot be listed', async t => {
+  let reviewed = false
+  const comments: Array<{ body: string }> = []
+  const events: string[] = []
+  const rec = recorder(
+    async () => {
+      reviewed = true
+      return result(pr('passed'))
+    },
+    {
+      async listChangedFiles() { throw new Error('gh unavailable') },
+      async postPrComment(_p, body) { comments.push({ body }) },
+      log: (e: string) => events.push(e),
+    }
+  )
+  const outcome = await runJob(deployRequest, emoji, rec.deps)
+  t.equal(outcome, 'skipped', 'not reviewed on a guess')
+  t.notOk(reviewed)
+  t.equal(comments.length, 1, 'still comments')
+  t.ok(events.includes('gate.list-files.failed'), 'the failure is logged')
+  t.end()
+})
+
+// A mixed request: the gated deployments PR is set aside and commented on, while the other PR
+// is reviewed — the review runs on only the reviewable PRs.
+test('runJob reviews the other PRs when one is gated', async t => {
+  const mixed: ReviewRequest = {
+    message: { channel: 'C1', ts: '3.3' },
+    prs: [
+      { owner: 'trade-platform', repo: 'deployments', number: 5, url: 'https://github.com/trade-platform/deployments/pull/5' },
+      { owner: 'o', repo: 'r', number: 1, url: 'https://github.com/o/r/pull/1' },
+    ],
+    instructions: '',
+  }
+  let reviewedUrls: string[] = []
+  const comments: Array<{ url: string }> = []
+  const rec = recorder(
+    async req => {
+      reviewedUrls = req.prs.map(p => p.url)
+      return result(pr('passed'))
+    },
+    {
+      async listChangedFiles(p) { return p.repo === 'deployments' ? ['values.yaml'] : [] },
+      async postPrComment(p) { comments.push({ url: p.url }) },
+    }
+  )
+  const outcome = await runJob(mixed, emoji, rec.deps)
+  t.equal(outcome, 'pass', 'the reviewable PR was reviewed')
+  t.deepEqual(reviewedUrls, ['https://github.com/o/r/pull/1'], 'only the non-gated PR reached the review')
+  t.deepEqual(comments, [{ url: 'https://github.com/trade-platform/deployments/pull/5' }], 'the gated PR was commented on')
+  t.end()
+})
+
+// Without a GitHub client (the CLI case) the gate is inert and a deployments PR is reviewed as
+// before — the guard lives in the daemon, which wires the client.
+test('runJob leaves the gate inert when no GitHub client is wired', async t => {
+  let reviewed = false
+  const rec = recorder(async () => {
+    reviewed = true
+    return result(pr('passed'))
+  })
+  const outcome = await runJob(deployRequest, emoji, rec.deps)
+  t.equal(outcome, 'pass', 'reviewed, since the gate needs a GitHub client')
+  t.ok(reviewed)
   t.end()
 })

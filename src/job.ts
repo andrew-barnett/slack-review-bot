@@ -2,6 +2,7 @@
 // effects. Everything Slack- and Codex-specific is a dependency, so the whole
 // react -> review -> react -> thread sequence is unit-testable without either service.
 
+import { protectedDeploymentsFiles, renderHumanReviewComment, renderHumanReviewThread } from './gate'
 import type { PullRequestRef } from './parse-message'
 import { renderError, renderThread, verdictFor } from './render'
 import type { ReviewRunResult } from './schema'
@@ -31,6 +32,14 @@ export interface JobDeps {
    * findings would land on a thread nobody can see.
    */
   messageExists?(message: MessageRef): Promise<boolean>
+  /**
+   * A PR's changed file *names*. Used by the human-review gate to spot deployment values
+   * changes without reading their contents. Optional: the CLI has no GitHub client, so the
+   * gate is inert there (a person is already running the review locally).
+   */
+  listChangedFiles?(pr: PullRequestRef): Promise<string[]>
+  /** Post a comment on a PR — how the gate tells the author a human review is required. */
+  postPrComment?(pr: PullRequestRef, body: string): Promise<void>
   log(event: string, fields: Record<string, unknown>): void
 }
 
@@ -41,6 +50,8 @@ export interface JobEmoji {
   pass: string
   findings: string
   error: string
+  /** Worn when a PR is handed to a human instead of being reviewed (the deployments gate). */
+  humanReview: string
   removeAckOnComplete: boolean
 }
 
@@ -106,22 +117,35 @@ export async function runJob(
     )
   }
 
+  // Human-review gate. Some changes must not be reviewed by the bot at all: a `deployments` PR
+  // that touches values.yaml is handed to a person, with a comment on the PR, and the bot never
+  // reads or reviews it. Only deployments PRs are inspected, and only when a GitHub client is
+  // wired (the CLI has none), so the common path adds no GitHub calls.
+  const toReview = await applyHumanReviewGate(request, emoji, deps)
+  if (toReview.length === 0) {
+    // Everything in the request was handed to a human; there is nothing left to review.
+    await finishAck(deps, emoji, request.message)
+    return 'skipped'
+  }
+  const reviewRequest = toReview.length === request.prs.length ? request : { ...request, prs: toReview }
+  const reviewUrls = reviewRequest.prs.map(pr => pr.url)
+
   let result: ReviewRunResult
   try {
-    result = await deps.runReview(request)
+    result = await deps.runReview(reviewRequest)
   } catch (error) {
-    deps.log('review.failed', { prs: urls, error: String(error) })
+    deps.log('review.failed', { prs: reviewUrls, error: String(error) })
     await finishAck(deps, emoji, request.message)
     await swallow(deps, 'reaction.error.failed', () => deps.addReaction(request.message, emoji.error))
     await swallow(deps, 'thread.error.failed', () =>
-      deps.postThreadReply(request.message, renderError(urls, error))
+      deps.postThreadReply(request.message, renderError(reviewUrls, error))
     )
     return 'error'
   }
 
   const verdict = verdictFor(result)
   deps.log('review.done', {
-    prs: urls,
+    prs: reviewUrls,
     verdict,
     statuses: result.results.map(r => `${r.url}=${r.status}`),
   })
@@ -142,6 +166,58 @@ export async function runJob(
     deps.postThreadReply(request.message, renderThread(result))
   )
   return 'findings'
+}
+
+/**
+ * Apply the human-review gate and return the PRs that remain to be reviewed.
+ *
+ * A `deployments` PR touching a values file is removed from the review, commented on, and
+ * flagged in the thread. A deployments PR whose files cannot be listed is treated the same way
+ * — failing safe for the sensitive repo rather than reviewing on a guess. Everything else,
+ * including every non-deployments PR, passes straight through with no GitHub call.
+ */
+async function applyHumanReviewGate(
+  request: ReviewRequest,
+  emoji: JobEmoji,
+  deps: JobDeps
+): Promise<PullRequestRef[]> {
+  if (!deps.listChangedFiles) return request.prs
+
+  const gated: Array<{ pr: PullRequestRef; files: string[]; verified: boolean }> = []
+  const reviewable: PullRequestRef[] = []
+
+  for (const pr of request.prs) {
+    if (pr.repo !== 'deployments') {
+      reviewable.push(pr)
+      continue
+    }
+    try {
+      const files = await deps.listChangedFiles(pr)
+      const hits = protectedDeploymentsFiles(pr, files)
+      if (hits.length > 0) gated.push({ pr, files: hits, verified: true })
+      else reviewable.push(pr)
+    } catch (error) {
+      deps.log('gate.list-files.failed', { pr: pr.url, error: String(error) })
+      gated.push({ pr, files: [], verified: false })
+    }
+  }
+
+  for (const { pr, files, verified } of gated) {
+    deps.log('review.human-required', { pr: pr.url, files, verified })
+    if (deps.postPrComment) {
+      await swallow(deps, 'github.comment.failed', () =>
+        deps.postPrComment!(pr, renderHumanReviewComment(files, verified))
+      )
+    }
+  }
+  if (gated.length > 0) {
+    await swallow(deps, 'reaction.human.failed', () => deps.addReaction(request.message, emoji.humanReview))
+    await swallow(deps, 'thread.human.failed', () =>
+      deps.postThreadReply(request.message, renderHumanReviewThread(gated.map(g => `${g.pr.repo}#${g.pr.number}`)))
+    )
+  }
+
+  return reviewable
 }
 
 async function finishAck(deps: JobDeps, emoji: JobEmoji, message: MessageRef): Promise<void> {

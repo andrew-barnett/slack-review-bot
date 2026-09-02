@@ -12,6 +12,7 @@ export interface HelpEmoji {
   pass: string
   findings: string
   error: string
+  humanReview: string
 }
 
 export function renderHelp(emoji: HelpEmoji): string {
@@ -27,7 +28,7 @@ export function renderHelp(emoji: HelpEmoji): string {
     '*Reactions I use*',
     `:${emoji.ack}: reviewing · :${emoji.queued}: queued, waiting for a slot · ` +
       `:${emoji.pass}: all passed · :${emoji.findings}: findings posted · ` +
-      `:${emoji.error}: the run failed`,
+      `:${emoji.error}: the run failed · :${emoji.humanReview}: handed to a human`,
     '',
     '*Commands* — @-mention me, then:',
     '• `help` — show this message',
@@ -44,6 +45,8 @@ export function renderHelp(emoji: HelpEmoji): string {
       'queue behind each other.',
     '• I skip a request whose Slack message was deleted before I got to it.',
     "• I won't review a PR that is out of date with its base branch.",
+    "• I won't review a `deployments` PR that changes `values.yaml` — those need a human. I'll " +
+      'comment on the PR to say so.',
     '• A review that goes silent is retried a few times with growing patience, then given up ' +
       'and reported as an error.',
   ].join('\n')

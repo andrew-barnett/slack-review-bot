@@ -22,6 +22,8 @@ export interface ReviewConfig {
   findingsEmoji: string
   /** Emoji posted when the run itself failed (Codex crashed, bad output, timeout). */
   errorEmoji: string
+  /** Emoji posted when a PR is handed to a human instead of reviewed (the deployments gate). */
+  humanReviewEmoji: string
   /** Remove the ack emoji once a terminal reaction is added. */
   removeAckOnComplete: boolean
   /** Path to the codex binary. */
@@ -181,6 +183,7 @@ export function loadReviewConfig(env: NodeJS.ProcessEnv = process.env): ReviewCo
     passEmoji: env.PASS_EMOJI || 'approved_stamp',
     findingsEmoji: env.FINDINGS_EMOJI || 'comments',
     errorEmoji: env.ERROR_EMOJI || 'warning',
+    humanReviewEmoji: env.HUMAN_REVIEW_EMOJI || 'raising_hand',
     removeAckOnComplete: parseBool(env.REMOVE_ACK_ON_COMPLETE, false),
     codexBin: env.CODEX_BIN || 'codex',
     codexProfile: env.CODEX_PROFILE || 'review-bot',

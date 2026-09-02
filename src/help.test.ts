@@ -7,6 +7,7 @@ const emoji = {
   pass: 'approved_stamp',
   findings: 'comments',
   error: 'warning',
+  humanReview: 'raising_hand',
 }
 
 // The help reply has to answer the three questions someone new to the bot actually has: what

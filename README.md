@@ -54,12 +54,14 @@ startup to make that a delay rather than a loss, but a closed laptop still revie
 | `src/status.ts` | Per-process counters and the mrkdwn for a status reply. |
 | `src/help.ts` | The mrkdwn for the help reply. |
 | `src/command.ts` | Typo-tolerant matching of a mention's words to a command. |
+| `src/gate.ts` | The human-review gate: which changes the bot must not review, and the notices it leaves. |
+| `src/github.ts` | The `gh` calls the gate needs — list a PR's changed file names, post a PR comment. |
 | `src/doctor.ts` | `npm run doctor` — the runtime preflight. |
 | `src/cli.ts` | Run one review from the terminal, no Slack. |
 
 `job.ts`, `render.ts`, `prompt.ts`, `parse-message.ts`, `schema.ts`, `queue.ts`, `cursor.ts`,
-`replay.ts`, `progress.ts`, `help.ts` and `command.ts` are pure and unit-tested; everything that
-touches Slack or spawns a process is injected.
+`replay.ts`, `progress.ts`, `help.ts`, `command.ts` and `gate.ts` are pure and unit-tested;
+everything that touches Slack, GitHub, or spawns a process is injected.
 
 ### Trigger rules
 
@@ -315,6 +317,24 @@ check that itself errors fails open — a transient Slack hiccup is no reason to
 request — so the worst case is one review of an already-deleted message, not a dropped live
 one.
 
+### Changes a human must review
+
+Some changes must not be reviewed by the bot at all. A pull request in the **`deployments`**
+repo that touches **`values.yaml`** (or a per-environment sibling like `values-prod.yaml`) is
+one: those carry the deployed image tags and sit next to encrypted secrets, so a person has to
+review them. The moment such a PR reaches a slot the bot declines it — it never checks the
+branch out or reads the file — leaves a comment on the PR saying a human review is required
+(`gate.ts` / `github.ts`), reacts with `HUMAN_REVIEW_EMOJI`, and notes it in the thread. The
+commenting is the point: silence would read as "the bot is slow", so the developer is told
+plainly.
+
+Only `deployments` PRs are inspected, and only their changed file *names* are fetched (never
+the contents), so the common path adds no GitHub calls and no secret is read. The check fails
+**safe**, not open: a `deployments` PR whose files cannot be listed is handed to a human rather
+than reviewed on a guess — the opposite of the deleted-message check, because here the risk is
+reviewing something sensitive, not dropping something routine. In a mixed request the gated PR
+is set aside and commented on while the others are reviewed normally.
+
 ## Codex permissions
 
 This is the part that needed solving. `$review-pr` cannot run unattended under the
@@ -508,6 +528,7 @@ All optional except the two tokens.
 | `PASS_EMOJI` | `approved_stamp` | Every PR passed. |
 | `FINDINGS_EMOJI` | `comments` | Any PR has findings or was blocked. |
 | `ERROR_EMOJI` | `warning` | The run itself failed. |
+| `HUMAN_REVIEW_EMOJI` | `raising_hand` | A PR was handed to a human instead of reviewed (the deployments gate). |
 | `REMOVE_ACK_ON_COMPLETE` | `false` | Remove `:eyes:` once a verdict is posted. |
 | `CONCURRENCY` | `1` | Reviews running at once. |
 | `RUN_TIMEOUT_MS` | `10800000` | Hard kill for one Codex run (3h of *active* time — see [Operating notes](#operating-notes)). |
