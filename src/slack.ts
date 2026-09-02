@@ -126,6 +126,25 @@ export function isStatusRequest(event: SlackMessageEvent, options: StatusOptions
   return /\b(status|health|ping)\b/i.test(text)
 }
 
+/**
+ * Whether a message should get the help reply.
+ *
+ * The catch-all for talking to the bot: any @-mention of it that is not a review request and
+ * not a status question — an explicit `help`, a command it does not understand, or a bare
+ * mention — lands here. The caller checks the more specific triggers (review, then status)
+ * first, so this only needs to recognise "someone is addressing the bot". Deliberately does
+ * not consult the keyword or the ignore list: a person who mentioned the bot and got nothing
+ * back would have no way to learn what it does, which is the opposite of help.
+ */
+export function isHelpRequest(event: SlackMessageEvent, options: StatusOptions): boolean {
+  if (event.type !== 'message') return false
+  if (event.subtype && event.subtype !== 'thread_broadcast') return false
+  if (event.bot_id || !event.user) return false
+  if (!event.channel || !event.ts) return false
+  if (options.channelIds.length && !options.channelIds.includes(event.channel)) return false
+  return (event.text || '').includes(`<@${options.botUserId}>`)
+}
+
 /** Web API implementations of the reaction and thread effects the job needs. */
 export function makeSlackEffects(
   client: WebClient

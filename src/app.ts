@@ -14,12 +14,13 @@ import {
 import { runCodexReview } from './codex'
 import { loadConfig, looksLikeUserId } from './config'
 import { openCursorStore, openNullCursorStore } from './cursor'
+import { renderHelp } from './help'
 import { runJob, type JobDeps } from './job'
 import { createActiveReviews } from './progress'
 import { TaskQueue } from './queue'
 import { fetchHistorySince, replayMissed, type ReplaySummary } from './replay'
 import { makeReviewRunner } from './review'
-import { decideTrigger, isStatusRequest, makeSlackEffects, type SlackMessageEvent } from './slack'
+import { decideTrigger, isHelpRequest, isStatusRequest, makeSlackEffects, type SlackMessageEvent } from './slack'
 import { createStats, renderStatus } from './status'
 
 function log(event: string, fields: Record<string, unknown> = {}): void {
@@ -190,6 +191,33 @@ async function main(): Promise<void> {
         }
         return false
       }
+
+      // Any other mention of the bot — an explicit `help`, a command it does not know, or a
+      // bare mention — gets the help text, so addressing the bot never falls silent.
+      if (isHelpRequest(event, { botUserId, channelIds: config.channelIds })) {
+        const message = { channel: event.channel as string, ts: event.ts as string }
+        const key = `help:${message.channel}/${message.ts}`
+        if (handled.has(key)) return false
+        markHandled(key)
+
+        log('help.requested', { channel: message.channel })
+        try {
+          await makeSlackEffects(client).postThreadReply(
+            message,
+            renderHelp({
+              ack: config.ackEmoji,
+              queued: config.queuedEmoji,
+              pass: config.passEmoji,
+              findings: config.findingsEmoji,
+              error: config.errorEmoji,
+            })
+          )
+        } catch (error) {
+          log('help.failed', { error: String(error) })
+        }
+        return false
+      }
+
       if (decision.reason !== 'no-pull-requests' && decision.reason !== 'not-a-message') {
         log('message.skipped', { reason: decision.reason })
       }

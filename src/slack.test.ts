@@ -1,6 +1,6 @@
 import type { WebClient } from '@slack/web-api'
 import test from 'tape'
-import { decideTrigger, isStatusRequest, makeSlackEffects, type SlackMessageEvent } from './slack'
+import { decideTrigger, isHelpRequest, isStatusRequest, makeSlackEffects, type SlackMessageEvent } from './slack'
 
 const base: SlackMessageEvent = {
   type: 'message',
@@ -191,5 +191,41 @@ test('messageExists returns false when the ts is not among the returned messages
   const { client } = clientReturning([{ ts: '2.2' }])
   const effects = makeSlackEffects(client)
   t.equal(await effects.messageExists!({ channel: 'C1', ts: '1.1' }), false)
+  t.end()
+})
+
+// --- isHelpRequest: the catch-all for anyone addressing the bot. ---
+
+// Any mention that is not a review or a status question should get help, so a bare mention,
+// an explicit "help", and an unrecognised command all qualify.
+test('isHelpRequest answers any mention, whatever the words are', t => {
+  t.equal(isHelpRequest({ ...statusBase, text: '<@U0BOT> help' }, statusOptions), true, 'explicit help')
+  t.equal(isHelpRequest({ ...statusBase, text: '<@U0BOT> what can you do?' }, statusOptions), true, 'a question')
+  t.equal(isHelpRequest({ ...statusBase, text: 'hey <@U0BOT> frobnicate' }, statusOptions), true, 'an unknown command')
+  t.equal(isHelpRequest({ ...statusBase, text: '<@U0BOT>' }, statusOptions), true, 'a bare mention')
+  t.end()
+})
+
+// It fires for a status mention too — precedence (review, then status, then help) is the
+// dispatcher's job, so this only has to recognise that the bot was addressed.
+test('isHelpRequest also matches a status mention (dispatch orders the two)', t => {
+  t.equal(isHelpRequest(statusBase, statusOptions), true)
+  t.end()
+})
+
+// A message that does not mention the bot must not draw a help reply, or the bot would answer
+// ordinary channel chatter.
+test('isHelpRequest ignores a message that does not mention the bot', t => {
+  t.equal(isHelpRequest({ ...statusBase, text: 'help me somebody' }, statusOptions), false)
+  t.end()
+})
+
+// Same guards as the status trigger: not the bot's own messages, not edits, only allowlisted
+// channels — but a thread mention is fair game, as with status.
+test('isHelpRequest ignores bots, edits, and other channels, but answers in threads', t => {
+  t.equal(isHelpRequest({ ...statusBase, bot_id: 'B1' }, statusOptions), false, 'not a bot')
+  t.equal(isHelpRequest({ ...statusBase, subtype: 'message_changed' }, statusOptions), false, 'not an edit')
+  t.equal(isHelpRequest(statusBase, { ...statusOptions, channelIds: ['C999'] }), false, 'only allowlisted channels')
+  t.equal(isHelpRequest({ ...statusBase, thread_ts: '1699999999.000000' }, statusOptions), true, 'answers in a thread')
   t.end()
 })
