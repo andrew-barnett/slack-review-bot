@@ -1,4 +1,5 @@
 import test from 'tape'
+import type { ActivitySnapshot } from './progress'
 import { createStats, formatDuration, renderStatus } from './status'
 
 const MINUTE = 60_000
@@ -202,5 +203,71 @@ test('renderStatus shows counts when only skips have happened', t => {
   const text = renderStatus(stats.snapshot(30 * MINUTE, 0, 0, config))
   t.notOk(text.includes('none since start'), 'a skip is activity, not silence')
   t.ok(text.includes('1 skipped'), 'and it is counted')
+  t.end()
+})
+
+// --- Live activity block: what the bot is working on right now. ---
+
+// The headline feature: the status reply names the active review, how long it has run, how
+// much of that was active, which attempt it is on, and the last thing Codex printed.
+test('renderStatus shows the active review with duration, attempt, and last output', t => {
+  const stats = createStats(0)
+  const activity: ActivitySnapshot = {
+    active: [
+      {
+        labels: ['trade-platform-monorepo#304', 'aix-ui#5459'],
+        wallMs: 6 * MINUTE,
+        activeMs: 4 * MINUTE,
+        attempt: 1,
+        attempts: 4,
+        lastLine: 'running jest in libs/orders',
+        sinceOutputMs: 12_000,
+      },
+    ],
+    waiting: [],
+  }
+  const text = renderStatus(stats.snapshot(30 * MINUTE, 1, 0, config), undefined, undefined, activity)
+  t.ok(
+    text.includes('*Reviewing* trade-platform-monorepo#304, aix-ui#5459 — in review 6m (4m active) · attempt 1/4'),
+    'names, duration, active time and attempt'
+  )
+  t.ok(text.includes('_last update 12s ago:_ `running jest in libs/orders`'), 'the live output line')
+  t.end()
+})
+
+// Waiting requests are named, not just counted — the second half of what a backlog check wants.
+test('renderStatus lists waiting reviews by name', t => {
+  const stats = createStats(0)
+  const activity: ActivitySnapshot = {
+    active: [],
+    waiting: [{ labels: ['aix-ui#5460'] }, { labels: ['deployments#1230'] }],
+  }
+  const text = renderStatus(stats.snapshot(30 * MINUTE, 0, 2, config), undefined, undefined, activity)
+  t.ok(text.includes('*Waiting* aix-ui#5460, deployments#1230'), 'waiting PRs named')
+  t.end()
+})
+
+// The noise-control cases: a single-attempt run shows no "attempt" clause, a run that has not
+// printed yet shows no "last update" line, and zero active time is not rendered as "(0s active)".
+test('renderStatus omits attempt, active time, and last-output when they add nothing', t => {
+  const stats = createStats(0)
+  const activity: ActivitySnapshot = {
+    active: [{ labels: ['repo#1'], wallMs: 5000, activeMs: 0, attempt: 1, attempts: 1 }],
+    waiting: [],
+  }
+  const text = renderStatus(stats.snapshot(30 * MINUTE, 1, 0, config), undefined, undefined, activity)
+  t.ok(text.includes('*Reviewing* repo#1 — in review 5s'), 'just the review and its duration')
+  t.notOk(text.includes('attempt'), 'no attempt clause for a single-attempt run')
+  t.notOk(text.includes('active)'), 'no active-time clause before any is measured')
+  t.notOk(text.includes('last update'), 'no output line before the run prints')
+  t.end()
+})
+
+// An idle daemon passes an empty activity snapshot; the block simply does not appear.
+test('renderStatus shows no activity block when nothing is running or waiting', t => {
+  const stats = createStats(0)
+  const text = renderStatus(stats.snapshot(30 * MINUTE, 0, 0, config), undefined, undefined, { active: [], waiting: [] })
+  t.notOk(text.includes('*Reviewing*'), 'nothing to report')
+  t.notOk(text.includes('*Waiting*'), 'and nothing waiting')
   t.end()
 })

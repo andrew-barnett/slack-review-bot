@@ -296,6 +296,44 @@ test('runCodexReview does not kill a run that keeps producing output', async t =
   t.end()
 })
 
+// The status reply's live feed: each chunk of output is reported with its text and the run's
+// active time so far, so a watcher can see what the review is doing right now.
+test('runCodexReview reports output progress with the active time', async t => {
+  const child = new FakeChild()
+  let outputPath = ''
+  const spawner = ((_bin: string, args: string[]) => {
+    outputPath = args[args.indexOf('--output-last-message') + 1]
+    return child
+  }) as unknown as Spawner
+  const clock = fakeClock()
+  const progress: Array<{ line: string; activeMs: number }> = []
+
+  const run = runCodexReview(
+    { ...runOptions(), timeoutMs: 10 * 60_000, onProgress: (line, activeMs) => progress.push({ line, activeMs }) },
+    spawner,
+    clock.deps
+  )
+  await settle()
+
+  clock.tick(10_000) // ten seconds of active time
+  child.stdout.write('reading files\nrunning jest\n')
+  await settle()
+
+  t.equal(progress.length, 1, 'one report per output chunk')
+  t.ok(progress[0].line.includes('running jest'), 'carries the output text')
+  t.equal(progress[0].activeMs, 10_000, 'with the active time at that moment')
+
+  fs.writeFileSync(
+    outputPath,
+    JSON.stringify({
+      results: [{ url: 'https://github.com/o/r/pull/1', status: 'passed', summary: '', pushedTestCommits: false, reviewUrl: '' }],
+    })
+  )
+  child.emit('close', 0)
+  await run
+  t.end()
+})
+
 // The thread's error line is what a requester sees when every retry stalled. It is phrased in
 // active time, since a run silent across a closed lid was not really silent for that span.
 test('describeStall states the grace and how far into the run it gave up', t => {

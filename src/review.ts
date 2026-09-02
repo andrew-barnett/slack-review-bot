@@ -5,6 +5,7 @@
 import { CodexStalledError, runCodexReview } from './codex'
 import type { ReviewConfig } from './config'
 import type { ReviewRequest } from './job'
+import type { ActiveReviews } from './progress'
 import { buildPrompt } from './prompt'
 import { reconcileResults, type ReviewRunResult } from './schema'
 
@@ -13,14 +14,22 @@ export function runIdFor(request: ReviewRequest): string {
   return `${request.message.channel}-${request.message.ts.replace('.', '')}`
 }
 
+/** The live-status key for a request — the same channel/ts the dispatcher and cursor use. */
+function progressKey(request: ReviewRequest): string {
+  return `${request.message.channel}/${request.message.ts}`
+}
+
 export function makeReviewRunner(
   config: ReviewConfig,
   /** Daemon log for the run's own events (`codex.frozen`, `codex.stalled`, retries). The CLI passes nothing. */
   log?: (event: string, fields: Record<string, unknown>) => void,
   /** Injection seam so the retry loop is testable without spawning Codex. */
-  runCodex: typeof runCodexReview = runCodexReview
+  runCodex: typeof runCodexReview = runCodexReview,
+  /** Live-status registry, updated per attempt and per output chunk. The CLI passes nothing. */
+  reviews?: ActiveReviews
 ): (request: ReviewRequest) => Promise<ReviewRunResult> {
   return async request => {
+    const key = progressKey(request)
     const prompt = buildPrompt({
       prs: request.prs,
       instructions: request.instructions,
@@ -42,6 +51,9 @@ export function makeReviewRunner(
       // in its own log file rather than appended after the wedged attempt's.
       const runId = attempt === 0 ? baseRunId : `${baseRunId}.retry${attempt}`
 
+      // Reflect the attempt in the live status so a watcher can see a retry in progress.
+      reviews?.attempt(key, attempt + 1)
+
       try {
         const outcome = await runCodex({
           prompt,
@@ -55,6 +67,7 @@ export function makeReviewRunner(
           logDir: config.runLogDir,
           runId,
           log,
+          onProgress: reviews ? (line, activeMs) => reviews.output(key, line, activeMs) : undefined,
         })
         // Never trust the run to have covered everything it was asked to cover.
         return reconcileResults(urls, outcome.result)

@@ -115,3 +115,36 @@ test('makeReviewRunner runs once with no grace when the schedule is empty', asyn
   t.deepEqual(graces, [undefined], 'no grace is passed, so the run does no stall detection')
   t.end()
 })
+
+// The runner feeds the live-status registry: it reports the attempt number for each try and
+// forwards Codex output as progress, keyed by the same channel/ts the dispatcher uses.
+test('makeReviewRunner reports attempt and output to the live-status registry', async t => {
+  const attempts: Array<[string, number]> = []
+  const outputs: Array<[string, string, number]> = []
+  const reviews: import('./progress').ActiveReviews = {
+    enqueue() {},
+    start() {},
+    done() {},
+    attempt(key, n) { attempts.push([key, n]) },
+    output(key, line, activeMs) { outputs.push([key, line, activeMs]) },
+    snapshot() { return { active: [], waiting: [] } },
+  }
+
+  let calls = 0
+  const fakeRun: typeof runCodexReview = async opts => {
+    calls += 1
+    opts.onProgress?.(`output from attempt ${calls}`, calls * 1000)
+    if (calls < 2) throw stall(opts.stallTimeoutMs)
+    return passed()
+  }
+  const runner = makeReviewRunner(config([1000, 2000]), () => {}, fakeRun, reviews)
+
+  await runner(request)
+  t.deepEqual(attempts, [['C1/1.1', 1], ['C1/1.1', 2]], 'attempt 1, then attempt 2 on the retry')
+  t.deepEqual(
+    outputs,
+    [['C1/1.1', 'output from attempt 1', 1000], ['C1/1.1', 'output from attempt 2', 2000]],
+    'output forwarded from both attempts, keyed by channel/ts'
+  )
+  t.end()
+})

@@ -36,6 +36,12 @@ export interface CodexRunOptions {
   runId: string
   /** Structured daemon log for the run's own events. Optional: the CLI has none. */
   log?: (event: string, fields: Record<string, unknown>) => void
+  /**
+   * Called on each chunk of Codex output with its last line and the run's active time so far,
+   * so the status reply can show what a review is doing right now. Best-effort and optional —
+   * the CLI passes nothing, and it must never be relied on for correctness.
+   */
+  onProgress?: (line: string, activeMs: number) => void
 }
 
 export interface CodexRunOutcome {
@@ -233,6 +239,15 @@ export async function runCodexReview(
         appendLog(text)
         // Any output is progress: reset the stall clock so only genuine silence trips it.
         deadline.markActivity()
+        // Surface the latest line for the status reply. Guarded so a broken progress sink can
+        // never take a review down — reporting what a run is doing is not worth failing it.
+        if (options.onProgress) {
+          try {
+            options.onProgress(text, deadline.snapshot().activeMs)
+          } catch {
+            // A status-side failure is not the run's problem.
+          }
+        }
       }
       child.stdout?.on('data', capture)
       child.stderr?.on('data', capture)

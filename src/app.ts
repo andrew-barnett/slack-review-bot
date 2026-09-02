@@ -11,9 +11,11 @@ import {
   type CatchUpReason,
   type ConnectionState,
 } from './catchup'
+import { runCodexReview } from './codex'
 import { loadConfig, looksLikeUserId } from './config'
 import { openCursorStore, openNullCursorStore } from './cursor'
 import { runJob, type JobDeps } from './job'
+import { createActiveReviews } from './progress'
 import { TaskQueue } from './queue'
 import { fetchHistorySince, replayMissed, type ReplaySummary } from './replay'
 import { makeReviewRunner } from './review'
@@ -89,7 +91,12 @@ async function main(): Promise<void> {
   const startedAt = Date.now()
   const stats = createStats(startedAt)
   const queue = new TaskQueue(config.concurrency)
-  const runReview = makeReviewRunner(config, log)
+  // Live view of what is running and waiting, for the status reply. Reads are in-memory, so
+  // answering "what are you working on?" never waits on the review it is describing.
+  const reviews = createActiveReviews()
+  // Number of attempts a stalled run gets, mirrored into the status so a retry is visible.
+  const reviewAttempts = config.stallBackoffMs.length > 0 ? config.stallBackoffMs.length : 1
+  const runReview = makeReviewRunner(config, log, runCodexReview, reviews)
   // How far each channel has been processed, on disk. This is what makes a restart able to
   // pick up messages posted while the socket was down — Slack never redelivers them.
   const cursors = config.cursorFile
@@ -172,7 +179,8 @@ async function main(): Promise<void> {
             last: catchUps.last(),
             runningForMs: catchUps.runningForMs(Date.now()),
           },
-          connection
+          connection,
+          reviews.snapshot(Date.now())
         )
         log('status.requested', { channel: message.channel })
         try {
@@ -200,6 +208,12 @@ async function main(): Promise<void> {
     cursors.begin(request.message.channel, request.message.ts)
 
     const deps: JobDeps = { ...makeSlackEffects(client), runReview, log }
+
+    // Track this request for the live status. Enqueued now (as waiting), promoted to active
+    // when its slot is taken, and forgotten when it settles. Short `repo#number` labels, since
+    // that is what reads well in a Slack line.
+    const labels = request.prs.map(pr => `${pr.repo}#${pr.number}`)
+    reviews.enqueue(key, labels)
 
     // Whether this message has to wait for a slot. Read before the job is handed to the queue,
     // because that is the last moment the answer is knowable from here.
@@ -232,8 +246,12 @@ async function main(): Promise<void> {
     // review takes far longer than Slack's ack window. The queue, not the handler,
     // is what serialises the work.
     void queue
-      .run(() =>
-        runJob(
+      .run(() => {
+        // The slot is taken: promote from waiting to active in the live status. Done here, not
+        // inside the job, so the status shows it running the instant it starts — before the
+        // deleted-message check and the first Codex output.
+        reviews.start(key, reviewAttempts)
+        return runJob(
           request,
           {
             ack: config.ackEmoji,
@@ -246,7 +264,7 @@ async function main(): Promise<void> {
           deps,
           { queued: queuedReaction }
         )
-      )
+      })
       .then(outcome => stats.record(outcome, request.prs.length, Date.now()))
       .catch(error => {
         // A crash never reaches runJob's own reporting, so count it as an error outcome
@@ -258,6 +276,8 @@ async function main(): Promise<void> {
         // Settled either way: the message has had its review, and a run that failed has
         // already reported that in the channel. Replaying it would repeat the failure.
         cursors.settle(request.message.channel, request.message.ts)
+        // And it is no longer running or waiting, so it leaves the live status too.
+        reviews.done(key)
       })
 
     return true

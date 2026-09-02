@@ -5,6 +5,7 @@
 
 import type { CatchUpRecord, ConnectionState } from './catchup'
 import type { JobOutcome } from './job'
+import type { ActivitySnapshot } from './progress'
 
 export interface StatusConfigSummary {
   codexProfile: string
@@ -161,21 +162,47 @@ function renderCatchUp(catchUp: CatchUpStatus, now: number): string {
 }
 
 /**
+ * The live "what are you working on right now" block: the review(s) in progress with how
+ * long each has run, which attempt it is on, and the last thing Codex printed — plus the PRs
+ * still waiting for a slot, by name. This is the part that turns "1 running, 2 waiting" from a
+ * number into something a reader can act on.
+ */
+function renderActivity(activity: ActivitySnapshot): string[] {
+  const lines: string[] = []
+  for (const review of activity.active) {
+    let head = `*Reviewing* ${review.labels.join(', ')} — in review ${formatDuration(review.wallMs)}`
+    // Active time is shown when it has been measured; well under the wall time means the run
+    // spent a stretch suspended, which is exactly the thing worth seeing.
+    if (review.activeMs > 0) head += ` (${formatDuration(review.activeMs)} active)`
+    if (review.attempts > 1) head += ` · attempt ${review.attempt}/${review.attempts}`
+    lines.push(head)
+    if (review.lastLine) {
+      const ago = review.sinceOutputMs === undefined ? '' : ` ${formatDuration(review.sinceOutputMs)} ago`
+      lines.push(`_last update${ago}:_ \`${review.lastLine}\``)
+    }
+  }
+  const waiting = activity.waiting.flatMap(w => w.labels)
+  if (waiting.length) lines.push(`*Waiting* ${waiting.join(', ')}`)
+  return lines
+}
+
+/**
  * Slack mrkdwn for a status reply.
  *
  * Answers the questions that silence in the channel cannot distinguish between: is the
- * process up, is the socket up, did it catch up on anything it missed, is it wedged on a long
- * review, has it reviewed anything at all, and is it configured the way you think it is.
+ * process up, is the socket up, did it catch up on anything it missed, what is it working on
+ * right now, has it reviewed anything at all, and is it configured the way you think it is.
  *
- * `catchUp` and `connection` are optional so the CLI and the tests can render a status
- * without inventing a socket, but the daemon always passes both — the whole point of the
- * pair is that a bot which stopped receiving messages should say so here rather than looking
- * merely idle.
+ * `activity`, `catchUp` and `connection` are optional so the CLI and the tests can render a
+ * status without inventing a socket or a live registry, but the daemon always passes them —
+ * the whole point is that a bot which stopped receiving messages, or is wedged on one review,
+ * should say so here rather than looking merely idle.
  */
 export function renderStatus(
   snapshot: StatusSnapshot,
   catchUp?: CatchUpStatus,
-  connection?: ConnectionState
+  connection?: ConnectionState,
+  activity?: ActivitySnapshot
 ): string {
   const { counts, config, lastReview } = snapshot
   const total = counts.pass + counts.findings + counts.error
@@ -184,10 +211,14 @@ export function renderStatus(
   const skipped = counts.skipped ? `, ${counts.skipped} skipped` : ''
   const lines = [
     `*Up* ${formatDuration(snapshot.now - snapshot.startedAt)} — queue: ${snapshot.active} running, ${snapshot.queued} waiting`,
+  ]
+  // Right after uptime, because "what is it doing now" is the first thing a status check wants.
+  if (activity) lines.push(...renderActivity(activity))
+  lines.push(
     total === 0 && !counts.skipped
       ? '*Reviews* none since start'
-      : `*Reviews* ${counts.pass} passed, ${counts.findings} with findings, ${counts.error} errored${skipped}`,
-  ]
+      : `*Reviews* ${counts.pass} passed, ${counts.findings} with findings, ${counts.error} errored${skipped}`
+  )
   if (connection) lines.push(renderConnection(connection, snapshot.now))
   if (catchUp) lines.push(renderCatchUp(catchUp, snapshot.now))
   if (lastReview) {

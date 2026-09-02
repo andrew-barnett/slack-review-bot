@@ -50,13 +50,14 @@ startup to make that a delay rather than a loss, but a closed laptop still revie
 | `src/cursor.ts` | How far each channel has been processed, persisted across restarts. |
 | `src/replay.ts` | Reads history back to the cursor and re-dispatches what was missed. |
 | `src/catchup.ts` | When that happens: startup, reconnect, timer — serialised and coalesced. |
+| `src/progress.ts` | Live registry of what is running and waiting, for the status reply. |
 | `src/status.ts` | Per-process counters and the mrkdwn for a status reply. |
 | `src/doctor.ts` | `npm run doctor` — the runtime preflight. |
 | `src/cli.ts` | Run one review from the terminal, no Slack. |
 
-`job.ts`, `render.ts`, `prompt.ts`, `parse-message.ts`, `schema.ts`, `queue.ts`, `cursor.ts`
-and `replay.ts` are pure and unit-tested; everything that touches Slack or spawns a process
-is injected.
+`job.ts`, `render.ts`, `prompt.ts`, `parse-message.ts`, `schema.ts`, `queue.ts`, `cursor.ts`,
+`replay.ts` and `progress.ts` are pure and unit-tested; everything that touches Slack or spawns
+a process is injected.
 
 ### Trigger rules
 
@@ -603,6 +604,9 @@ replies in a thread:
 
 ```
 *Up* 3h 12m — queue: 1 running, 2 waiting
+*Reviewing* trade-platform-monorepo#304, aix-ui#5459 — in review 6m (4m active) · attempt 1/4
+_last update 12s ago:_ `running jest in libs/orders`
+*Waiting* aix-ui#5460, deployments#1230
 *Reviews* 4 passed, 2 with findings, 1 errored
 *Link* connected for 22m, 20 reconnects
 *Catch-up* 2 requeued, 1 skipped — 4m ago (reconnect) · every 5m
@@ -610,15 +614,24 @@ replies in a thread:
 *Config* profile `review-bot`, concurrency 1, timeout 3h 0m, 1 channel, 1 ignored user
 ```
 
-Queue depth is the number that distinguishes "wedged on a long review" from "idle and
-ignoring you". `*Link*` and `*Catch-up*` answer the pair of questions that silence in the
+The `*Reviewing*` and `*Waiting*` lines are the live view of what the bot is doing *right now*:
+the PRs under review, how long the run has taken (and how much of that was active rather than
+asleep), which stall attempt it is on, and the last line Codex printed with how long ago. This
+reply is answered immediately even mid-review — the review runs in a child process, so the
+bot's event loop is free, and the status is read from an in-memory registry that never waits on
+the run it describes. The last-output line is raw tool output, cleaned and truncated: a hint at
+what the run is doing, not trusted or complete text.
+
+`*Link*` and `*Catch-up*` answer the pair of questions that silence in the
 channel cannot: whether the socket is actually up, and whether anything posted during a gap
 was picked up, dropped, or never read. A high reconnect count with a healthy catch-up line is
 a flaky network being handled; a healthy link with `*Catch-up* failed` is a scope or
-membership problem. Five details worth knowing:
+membership problem. Details worth knowing:
 
 - **No extra scope or event subscription.** The mention is matched in the ordinary message
   stream against the bot's own user ID, which it learns from `auth.test`.
+- **The status reply never blocks on a review.** Progress is pushed to an in-memory registry
+  (`progress.ts`) as Codex prints; answering a status request only reads it.
 - **Reviews take precedence.** A message carrying PR URLs is reviewed even if it also says
   "status", so the two triggers cannot collide.
 - **Users on the ignore list still get an answer.** The list exists to avoid wasting half
