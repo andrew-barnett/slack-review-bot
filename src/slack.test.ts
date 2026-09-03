@@ -57,6 +57,45 @@ test('decideTrigger matches ignored user IDs case-insensitively', t => {
   t.end()
 })
 
+// Regression for the reported bug: an ignored user @-mentioning the bot with a PR URL used
+// to be dropped as ignored-user and fall through to the help reply. An explicit mention is a
+// deliberate request, so it overrides the ignore list and the review runs.
+test('decideTrigger reviews an ignored user who explicitly mentions the bot', t => {
+  const event = { ...base, text: '<@U0BOT> https://github.com/o/r/pull/312' }
+  const decision = decideTrigger(event, { channelIds: [], ignoreUserIds: ['U1'], botUserId: 'U0BOT' })
+  t.equal(decision.review, true, 'the mention overrides the ignore list')
+  if (decision.review) t.equal(decision.request.prs[0].number, 312)
+  t.end()
+})
+
+// The override is scoped to a mention of THIS bot. An ignored user with a PR but no mention
+// (or a mention of someone else) is still skipped, so the cost filter for stray in-channel
+// PR links is unchanged.
+test('decideTrigger still ignores a listed user without an explicit mention', t => {
+  t.equal(
+    decideTrigger(base, { channelIds: [], ignoreUserIds: ['U1'], botUserId: 'U0BOT' }).review,
+    false,
+    'no mention -> still ignored'
+  )
+  t.equal(
+    decideTrigger(
+      { ...base, text: '<@U0OTHER> https://github.com/o/r/pull/1' },
+      { channelIds: [], ignoreUserIds: ['U1'], botUserId: 'U0BOT' }
+    ).review,
+    false,
+    'mention of another user -> still ignored'
+  )
+  t.end()
+})
+
+// Without a configured botUserId (the CLI, older callers) there is no way to detect a
+// mention, so the override is off and the ignore list applies as it always did.
+test('decideTrigger keeps ignoring a listed user when no botUserId is configured', t => {
+  const event = { ...base, text: '<@U0BOT> https://github.com/o/r/pull/1' }
+  t.equal(decideTrigger(event, { channelIds: [], ignoreUserIds: ['U1'] }).review, false)
+  t.end()
+})
+
 // Configured trigger rule: only top-level messages start reviews, so discussion inside
 // the bot's own thread does not re-queue the same PRs.
 test('decideTrigger ignores replies inside a thread', t => {
