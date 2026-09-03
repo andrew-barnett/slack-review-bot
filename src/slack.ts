@@ -26,6 +26,12 @@ export interface TriggerOptions {
   channelIds: string[]
   /** Slack user IDs whose messages are never reviewed. Empty means everyone is reviewed. */
   ignoreUserIds?: string[]
+  /**
+   * The bot's own user ID, from auth.test at startup. When set, an explicit `<@bot>`
+   * mention overrides the ignore list, so a listed user can still ask for a review by
+   * addressing the bot directly. Omitted (the CLI, older callers) means no override.
+   */
+  botUserId?: string
 }
 
 export type SkipReason =
@@ -57,6 +63,12 @@ export type TriggerDecision =
  * particular human, and a review of that human's own PR burns 10-30 minutes to produce a
  * verdict GitHub will not accept as an approval anyway. It matches on who posted the
  * message, which is not quite the same thing as who wrote the PR — see the README.
+ *
+ * An explicit `<@bot>` mention overrides the ignore list. The list exists to stop the bot
+ * auto-reviewing PR links that a listed user drops into the channel in passing; a message
+ * that names the bot is a deliberate request for that review, so a listed user who mentions
+ * the bot gets one. This needs the bot's own user ID (`options.botUserId`); without it the
+ * override is off and the ignore list applies as before.
  */
 export function decideTrigger(
   event: SlackMessageEvent,
@@ -70,8 +82,15 @@ export function decideTrigger(
     return { review: false, reason: 'edited-or-deleted' }
   }
   if (event.bot_id || !event.user) return { review: false, reason: 'from-a-bot' }
+  // An explicit @-mention is a deliberate request that overrides the ignore list. Matched on
+  // the raw text, before markup is flattened, since that is where the `<@…>` token survives.
+  const mentionsBot =
+    Boolean(options.botUserId) && (event.text || '').includes(`<@${options.botUserId}>`)
   // Compared case-insensitively: real IDs are uppercase, but these are typed by hand.
-  if (options.ignoreUserIds?.some(id => id.toUpperCase() === event.user!.toUpperCase())) {
+  if (
+    !mentionsBot &&
+    options.ignoreUserIds?.some(id => id.toUpperCase() === event.user!.toUpperCase())
+  ) {
     return { review: false, reason: 'ignored-user' }
   }
   if (!event.channel || !event.ts) return { review: false, reason: 'not-a-message' }

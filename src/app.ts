@@ -126,7 +126,13 @@ async function main(): Promise<void> {
     }
   }
 
-  const triggerOptions = { channelIds: config.channelIds, ignoreUserIds: config.ignoreUserIds }
+  const triggerOptions = {
+    channelIds: config.channelIds,
+    ignoreUserIds: config.ignoreUserIds,
+    // Lets an explicit @-mention override the ignore list, so a listed user (typically the
+    // operator) can still request a review of their own PR by addressing the bot directly.
+    botUserId,
+  }
   const isRequest = (message: SlackMessageEvent): boolean =>
     decideTrigger(message, triggerOptions).review
 

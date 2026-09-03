@@ -101,6 +101,13 @@ and the bot's only failure signal is silence.
 Ignored messages are logged as `message.skipped` with reason `ignored-user`, so a message
 that unexpectedly goes unreviewed can be told apart from one the bot never saw.
 
+**An explicit `@mention` of the bot overrides the ignore list.** The list exists to stop the
+bot auto-reviewing PR links you drop into the channel in passing; a message that names the
+bot (`@Review Bot https://github.com/o/r/pull/312`) is a deliberate request, so it is
+reviewed even if you are on the list. Post the same PR without mentioning the bot and the
+ignore list still applies. (A bare mention with no PR URL is not a review — it gets the help
+reply.)
+
 **This filters on who posted the message, not who wrote the PR** — two cases follow from
 that, and neither is worth an extra GitHub API call per message to fix:
 
