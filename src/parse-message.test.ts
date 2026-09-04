@@ -72,12 +72,18 @@ test('extractPullRequests ignores non-PR GitHub URLs and other hosts', t => {
   t.end()
 })
 
-// '/pull/12x' is not PR 12. Without the digit boundary the regex would happily match
-// the '12' prefix and review the wrong pull request.
-test('extractPullRequests does not match a number with trailing digits glued on', t => {
-  t.equal(extractPullRequests('https://github.com/o/r/pull/12abc').length, 1)
-  t.equal(extractPullRequests('https://github.com/o/r/pull/12abc')[0].number, 12)
-  t.equal(extractPullRequests('https://github.com/o/r/pullx/12').length, 0)
+// #15: '/pull/12abc' is not PR 12. The number must be followed by a real URL boundary, or the
+// bot would match the '12' prefix and review the wrong pull request. (A bare `(?!\d)` only
+// blocked a trailing digit, so 'abc' slipped through.)
+test('extractPullRequests rejects a PR number with trailing junk glued on', t => {
+  t.equal(extractPullRequests('https://github.com/o/r/pull/12abc').length, 0, '12abc is not a PR')
+  t.equal(extractPullRequests('https://github.com/o/r/pull/12-3').length, 0, 'no hyphen-glued suffix')
+  t.equal(extractPullRequests('https://github.com/o/r/pullx/12').length, 0, 'pullx is not pull')
+  // A genuine boundary after the number is still accepted, and canonicalises to just the number.
+  t.equal(extractPullRequests('https://github.com/o/r/pull/12')[0]?.number, 12, 'end of string')
+  t.equal(extractPullRequests('https://github.com/o/r/pull/12/files')[0]?.number, 12, 'a path boundary')
+  t.equal(extractPullRequests('https://github.com/o/r/pull/12?tab=x')[0]?.number, 12, 'a query boundary')
+  t.equal(extractPullRequests('review https://github.com/o/r/pull/12 now')[0]?.number, 12, 'whitespace boundary')
   t.end()
 })
 
