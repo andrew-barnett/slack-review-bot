@@ -63,11 +63,14 @@ export interface JobEmoji {
 
 export interface JobOptions {
   /**
-   * The message is already wearing `emoji.queued`, added by the dispatcher when it had to
-   * wait for a slot. The job takes it off once the ack is on, so the message never has no
-   * reaction and never has two.
+   * Resolves to whether the dispatcher added `emoji.queued` (the message waited for a slot).
+   *
+   * A promise, not a boolean, so the dispatcher can enqueue the job WITHOUT waiting for that
+   * reaction to land — a slow or wedged `reactions.add` must never gate enqueueing (issue #16).
+   * The job awaits it before removing the queued reaction, which keeps the add strictly before
+   * the remove: doing otherwise could leave a stale hourglass if the job started first.
    */
-  queued?: boolean
+  queued?: Promise<boolean>
   /**
    * Post a per-review usage line (tokens, active time, attempts) as a thread reply. The status
    * totals are recorded regardless via {@link JobDeps.recordUsage}; this only controls the
@@ -122,8 +125,10 @@ export async function runJob(
   // them the work.
   await swallow(deps, 'reaction.ack.failed', () => deps.addReaction(request.message, emoji.ack))
   // Ack on before queued off: a reader glancing at the channel between the two calls
-  // should see the bot working on it, not a message with no reaction at all.
-  if (options.queued) {
+  // should see the bot working on it, not a message with no reaction at all. Awaiting the
+  // dispatcher's add here keeps it strictly before this remove, so the hourglass cannot be
+  // added back after the job has already taken it off.
+  if (options.queued && (await options.queued.catch(() => false))) {
     await swallow(deps, 'reaction.queued.remove.failed', () =>
       deps.removeReaction(request.message, emoji.queued)
     )
@@ -139,6 +144,9 @@ export async function runJob(
     await finishAck(deps, emoji, request.message)
     return 'skipped'
   }
+  // Some PRs were removed by the gate and handed to a human. A partial review must never earn
+  // the clean pass stamp, however the reviewed subset turns out.
+  const gatedAny = toReview.length < request.prs.length
   const reviewRequest = toReview.length === request.prs.length ? request : { ...request, prs: toReview }
   const reviewUrls = reviewRequest.prs.map(pr => pr.url)
 
@@ -171,6 +179,13 @@ export async function runJob(
   await finishAck(deps, emoji, request.message)
 
   if (verdict === 'pass') {
+    if (gatedAny) {
+      // The reviewed subset passed, but a PR was handed to a human. The gate already added the
+      // human-review reaction and thread; stamping approved_stamp on top would claim the whole
+      // message cleared review. Leave the human-review signal as the terminal one.
+      await reportUsage(deps, options, request.message, usage)
+      return 'skipped'
+    }
     await swallow(deps, 'reaction.pass.failed', () => deps.addReaction(request.message, emoji.pass))
     await reportUsage(deps, options, request.message, usage)
     return 'pass'
@@ -230,7 +245,9 @@ async function applyHumanReviewGate(
   const reviewable: PullRequestRef[] = []
 
   for (const pr of request.prs) {
-    if (pr.repo !== 'deployments') {
+    // Case-insensitive: GitHub resolves repo names case-insensitively, so `Deployments/pull/5`
+    // reaches the same repo and must not slip past the gate that protects values files.
+    if (pr.repo.toLowerCase() !== 'deployments') {
       reviewable.push(pr)
       continue
     }
