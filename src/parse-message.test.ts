@@ -83,7 +83,24 @@ test('extractPullRequests rejects a PR number with trailing junk glued on', t =>
   t.equal(extractPullRequests('https://github.com/o/r/pull/12')[0]?.number, 12, 'end of string')
   t.equal(extractPullRequests('https://github.com/o/r/pull/12/files')[0]?.number, 12, 'a path boundary')
   t.equal(extractPullRequests('https://github.com/o/r/pull/12?tab=x')[0]?.number, 12, 'a query boundary')
+  t.equal(extractPullRequests('https://github.com/o/r/pull/12#discussion')[0]?.number, 12, 'a fragment boundary')
   t.equal(extractPullRequests('review https://github.com/o/r/pull/12 now')[0]?.number, 12, 'whitespace boundary')
+  t.end()
+})
+
+// The boundary must NOT reject natural prose/markup punctuation — that was the round-1 regression
+// where the terminator was too narrow and dropped comma/period/paren-delimited links.
+test('extractPullRequests accepts PR URLs delimited by ordinary punctuation', t => {
+  t.equal(extractPullRequests('https://github.com/o/r/pull/12, thanks')[0]?.number, 12, 'comma')
+  t.equal(extractPullRequests('see https://github.com/o/r/pull/12.')[0]?.number, 12, 'period')
+  t.equal(extractPullRequests('(https://github.com/o/r/pull/12)')[0]?.number, 12, 'parenthesis')
+  // A comma-separated pair must yield BOTH PRs, not just the last one.
+  const both = extractPullRequests('https://github.com/o/r/pull/12, https://github.com/o/r/pull/13')
+  t.deepEqual(
+    both.map(p => p.number),
+    [12, 13],
+    'both PRs in a comma-separated list are extracted'
+  )
   t.end()
 })
 

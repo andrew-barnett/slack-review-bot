@@ -22,12 +22,13 @@ export interface ParsedMessage {
 
 // github.com/<owner>/<repo>/pull/<number>, with optional trailing path (/files),
 // query, or fragment that we deliberately drop when canonicalizing. Owner and repo
-// use GitHub's allowed character set. The number must be followed by a real URL boundary —
-// end of string, or one of `/ ? # > |` or whitespace — so `pull/12abc` is rejected outright
-// rather than read as PR 12 and pointed at the wrong pull request. (A bare `(?!\d)` only
-// blocked a following digit, not a letter.)
+// use GitHub's allowed character set. The number must not be followed by a word char or a
+// hyphen: `(?![\w-])` rejects a glued suffix like `/pull/12abc` or `/pull/12-3` (which would
+// otherwise be read as PR 12 and point at the wrong pull request) while still accepting every
+// natural terminator — end of string, `/ ? #`, and prose/markup punctuation like `, . ) > |`.
+// (A bare `(?!\d)` only blocked a trailing digit, not a letter.)
 const PR_URL_RE =
-  /https?:\/\/(?:www\.)?github\.com\/([A-Za-z0-9][A-Za-z0-9-_.]*)\/([A-Za-z0-9][A-Za-z0-9-_.]*)\/pull\/(\d+)(?=$|[/?#>|\s])/gi
+  /https?:\/\/(?:www\.)?github\.com\/([A-Za-z0-9][A-Za-z0-9-_.]*)\/([A-Za-z0-9][A-Za-z0-9-_.]*)\/pull\/(\d+)(?![\w-])/gi
 
 /** Reverse Slack's HTML escaping. Only these three entities are escaped by Slack. */
 export function unescapeSlack(text: string): string {
