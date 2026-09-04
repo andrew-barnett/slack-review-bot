@@ -124,7 +124,9 @@ const OUTCOME_WORD: Record<JobOutcome, string> = {
   pass: 'all passed',
   findings: 'findings',
   error: 'errored',
-  skipped: 'skipped (message gone)',
+  // A skip has more than one cause now (a deleted message, or a PR handed to the human-review
+  // gate), so the label no longer claims "message gone". Issue #19 will distinguish the reasons.
+  skipped: 'skipped',
 }
 
 function plural(n: number, one: string, many = `${one}s`): string {
