@@ -586,6 +586,7 @@ All optional except the two tokens.
 | `CATCHUP_INTERVAL_MS` | `300000` | Catch up on a timer as well (5m). `0` disables the timer. |
 | `CATCHUP_ON_RECONNECT` | `true` | Catch up as soon as the socket reconnects. |
 | `USAGE_REPLY_ENABLED` | `true` | Post a per-review usage line (tokens, active time, attempts) as a thread reply on every completed review. Off silences the reply; the `status` token totals are kept either way. |
+| `SLACK_REQUEST_TIMEOUT_MS` | `30000` | Per-request timeout for the bot's Slack Web API calls. The WebClient defaults to no timeout, so a wedged `conversations.history` could hang the catch-up forever; this caps it, paired with a five-minute bounded retry policy. |
 
 Booleans accept `1`, `true`, `yes` or `on`, case-insensitively; any other non-empty value
 is false, and an empty one falls back to the default rather than to false.

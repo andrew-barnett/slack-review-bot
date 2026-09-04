@@ -64,6 +64,24 @@ test('CATCHUP_INTERVAL_MS treats 0 as off but still rejects nonsense', t => {
   t.end()
 })
 
+// The Slack request timeout defaults to a finite value so a wedged call can never hang the
+// catch-up (issue #6), and is tunable for a slow network. A typo falls back rather than
+// silently disabling the timeout.
+test('SLACK_REQUEST_TIMEOUT_MS defaults finite and is tunable', t => {
+  t.equal(loadConfig({ ...credentials }).slackRequestTimeoutMs, 30_000, 'default 30s')
+  t.equal(
+    loadConfig({ ...credentials, SLACK_REQUEST_TIMEOUT_MS: '60000' }).slackRequestTimeoutMs,
+    60_000,
+    'override honoured'
+  )
+  t.equal(
+    loadConfig({ ...credentials, SLACK_REQUEST_TIMEOUT_MS: 'soon' }).slackRequestTimeoutMs,
+    30_000,
+    'a typo falls back to the default, not to no timeout'
+  )
+  t.end()
+})
+
 // The per-review usage reply defaults on — the feature is only useful if it appears without
 // configuration — but an operator who finds it noisy has to be able to switch it off, while the
 // status totals it feeds keep accruing regardless.

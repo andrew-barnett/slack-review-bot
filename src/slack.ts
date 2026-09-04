@@ -2,7 +2,7 @@
 // calls the job needs. Kept separate from app.ts so the trigger rules are testable
 // without constructing a Bolt app.
 
-import type { WebClient } from '@slack/web-api'
+import { retryPolicies, type WebClient, type WebClientOptions } from '@slack/web-api'
 import { resolveMentionCommand } from './command'
 import type { JobDeps, MessageRef } from './job'
 import { parseMessage } from './parse-message'
@@ -165,6 +165,24 @@ export function isHelpRequest(event: SlackMessageEvent, options: StatusOptions):
   if (!event.channel || !event.ts) return false
   if (options.channelIds.length && !options.channelIds.includes(event.channel)) return false
   return (event.text || '').includes(`<@${options.botUserId}>`)
+}
+
+/**
+ * WebClient options that bound how long any Slack call can take.
+ *
+ * The WebClient ships with no request timeout (`timeout: 0`) and a retry policy spanning about
+ * thirty minutes, so a wedged `conversations.history` — the call the catch-up makes — can hang
+ * forever, leaving the catch-up runner busy and coalescing away every later pass with no error
+ * anywhere (issue #6). A finite per-request timeout plus a bounded retry policy caps the total:
+ * a stuck call fails in bounded time and the catch-up completes, or fails loudly, rather than
+ * wedging. Five minutes of retries is deliberate — the catch-up timer is the real backstop for
+ * a longer Slack outage, so a single call need not retry for half an hour.
+ */
+export function slackClientOptions(timeoutMs: number): WebClientOptions {
+  return {
+    timeout: timeoutMs,
+    retryConfig: retryPolicies.fiveRetriesInFiveMinutes,
+  }
 }
 
 /** Web API implementations of the reaction and thread effects the job needs. */
