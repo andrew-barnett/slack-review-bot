@@ -695,8 +695,8 @@ stop the daemon.
 
 After connecting, the catch-up logs `replay.channel` for each channel and one `replay.done`.
 Neither a channel it cannot read nor a failure in the catch-up itself stops the daemon — a bot
-that did not manage to backfill is still worth having — so those are `replay.failed` and
-`replay.crashed` lines rather than an exit.
+that did not manage to backfill is still worth having — so those are `replay.failed` (a channel)
+and `catchup.failed` (the pass) lines rather than an exit.
 
 ### Asking in Slack
 

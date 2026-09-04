@@ -145,9 +145,21 @@ async function checkChannels(client: WebClient, ids: string[]): Promise<CheckRes
  * which is the part anyone actually looks at. Only custom emoji are listable, so a name
  * that is absent may still be a valid built-in — hence a warning, never a failure.
  */
-async function checkEmoji(client: WebClient, config: Config): Promise<CheckResult> {
+export async function checkEmoji(client: WebClient, config: Config): Promise<CheckResult> {
   const name = 'emoji'
-  const wanted = [config.ackEmoji, config.passEmoji, config.findingsEmoji, config.errorEmoji]
+  // Every emoji the bot actually reacts with, so the preflight can't pass while a configured
+  // queued/human-review emoji is missing and its reaction fails at runtime (#20). Deduped in
+  // case an operator points two of them at the same name.
+  const wanted = [
+    ...new Set([
+      config.ackEmoji,
+      config.queuedEmoji,
+      config.passEmoji,
+      config.findingsEmoji,
+      config.errorEmoji,
+      config.humanReviewEmoji,
+    ]),
+  ]
   try {
     const res = await client.emoji.list()
     const custom = new Set(Object.keys(res.emoji ?? {}))

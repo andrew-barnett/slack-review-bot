@@ -50,6 +50,17 @@ test('renderStatus reports queue depth and the last outcome', t => {
   t.end()
 })
 
+// #19: a skip is no longer only a deleted message — a PR handed to the human-review gate also
+// settles as skipped — so the *Last* line must read neutrally and not claim the message vanished.
+test('renderStatus does not label a skipped last review as a deleted message', t => {
+  const stats = createStats(0)
+  stats.record('skipped', 1, 10 * MINUTE)
+  const text = renderStatus(stats.snapshot(12 * MINUTE, 0, 0, config))
+  t.ok(text.includes('*Last* skipped'), 'the last outcome reads neutrally as "skipped"')
+  t.notOk(text.toLowerCase().includes('message gone'), 'it does not falsely claim the message was deleted')
+  t.end()
+})
+
 // The token line sums only the reviews that reported a count, and the average's denominator is
 // those same reviews — so a run that reported none (a killed run, recorded with no tokens) does
 // not drag the average toward zero. Figures are compact: total, last, and the mean per review.
