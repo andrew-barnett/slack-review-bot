@@ -2,9 +2,11 @@ import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
 import test from 'tape'
+import type { WebClient } from '@slack/web-api'
 import { loadConfig, type Config } from './config'
 import {
   checkCursor,
+  checkEmoji,
   checkIgnoreList,
   explainHistoryError,
   findOnPath,
@@ -182,5 +184,30 @@ test('findOnPath takes the leftmost match', t => {
 test('findOnPath skips empty segments and reports a genuine miss', t => {
   t.equal(findOnPath('codex', '/nope::/also-nope', () => false), undefined)
   t.equal(findOnPath('codex', ':/bin', c => c === 'codex'), undefined, 'never resolves relative to cwd')
+  t.end()
+})
+
+// #20: doctor's emoji preflight must cover EVERY emoji the bot reacts with — including the
+// queued and human-review emoji, which it previously omitted, letting the check report healthy
+// while a configured custom emoji was missing and the reaction failed at runtime.
+test('checkEmoji checks the queued and human-review emoji too', async t => {
+  const config = configWith({})
+  // A workspace whose custom emoji set has none of the defaults, so every wanted name shows up.
+  const client = { emoji: { list: async () => ({ emoji: {} }) } } as unknown as WebClient
+  const res = await checkEmoji(client, config)
+  t.ok(res.detail?.includes(config.queuedEmoji), 'the queued emoji is in the preflight')
+  t.ok(res.detail?.includes(config.humanReviewEmoji), 'the human-review emoji is in the preflight')
+  // And the ones it already checked remain covered.
+  t.ok(res.detail?.includes(config.passEmoji), 'the pass emoji is still checked')
+  t.end()
+})
+
+// Deduped: pointing two roles at the same emoji name must not list it twice.
+test('checkEmoji deduplicates emoji names shared across roles', async t => {
+  const config = configWith({ ACK_EMOJI: 'eyes', QUEUED_EMOJI: 'eyes' })
+  const client = { emoji: { list: async () => ({ emoji: {} }) } } as unknown as WebClient
+  const res = await checkEmoji(client, config)
+  const eyesCount = (res.detail?.match(/\beyes\b/g) ?? []).length
+  t.equal(eyesCount, 1, 'a name shared by two roles appears once')
   t.end()
 })
