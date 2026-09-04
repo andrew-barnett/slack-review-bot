@@ -520,6 +520,40 @@ tail -f ~/Library/Logs/slack-review-bot.out.log
 
 `scripts/install-service.sh --uninstall` removes the agent.
 
+### Running a second reviewer
+
+There is no shared server and no work queue here: this is a per-machine daemon talking to
+Slack over Socket Mode. "Other developers participate" therefore means each of them runs
+their own daemon from the steps above — and how their instances share the work depends on
+which Slack app they connect as.
+
+**Shared app, several machines.** Give each machine the *same* `xapp-`/`xoxb-` pair. Slack
+delivers any one message event to only **one** of an app's open Socket Mode connections, so
+reviews spread across whoever is online, and every reaction and thread posts as the one bot
+identity. This is the closest thing to "the team shares the load" available today, but it is
+Slack's load-balancer, not a scheduler you can steer: which machine takes a given PR is
+Slack's choice, a machine that is asleep or wedged is simply passed over, and there is no
+per-PR claiming, no hand-off, and no retry if the chosen machine drops mid-review. The
+in-process dedupe (`app.ts`) is per-machine and does not span machines, so a socket flap that
+lands the same event on two connections can produce two reviews.
+
+**Separate apps, one per developer.** Each runs its own bot identity. Every instance sees
+every message and will independently review the same PR — duplicate runs, duplicate
+reactions, each trying to post its own GitHub review. That is only useful if each developer
+wants their own bot in their own channel, not for sharing a single channel.
+
+Either way, put **each machine's own Slack user ID** in `SLACK_IGNORE_USER_IDS` so a
+developer's own PRs do not start a review — the bot cannot approve a PR authored by the
+account it runs as, so reviewing it only burns machine time (see
+[Ignoring your own messages](#ignoring-your-own-messages)).
+
+**What is deliberately not here yet:** a shared work queue that hands each PR to exactly one
+reviewer and re-queues it if that machine drops. Distributing reviews by dispatching PRs onto
+a queue (an SQS FIFO, one consumer claiming each) is a separate design — the "peer-review
+dispatch" work — and **nothing in this bot consumes a queue today**; it only reads Slack. If
+you were expecting an SQS client here, that is the piece that does not exist yet. Until it
+does, use the shared-app arrangement for casual load-sharing and accept its limits.
+
 ## Configuration
 
 All optional except the two tokens.
@@ -560,6 +594,42 @@ is false, and an empty one falls back to the default rather than to false.
 Changing `WORKTREE_ROOT` means editing the template's `writable_roots` and re-running
 `scripts/install-codex-profile.sh` — the daemon passes the root to `--add-dir`, but a
 mismatch between the two is a permissions failure mid-review.
+
+## Swapping the review model
+
+The review engine is Codex, run as a subprocess, and switching to Claude or another model is
+an **adapter change, not a configuration flip**. The Codex-specific contract is narrow and
+lives in one place, `src/codex.ts` (`buildCodexArgs`), which spawns:
+
+```
+codex exec --profile <name> --cd <workspace> --add-dir <worktree-root>
+           --skip-git-repo-check --output-schema <schema.json>
+           --output-last-message <out.json> <prompt>
+```
+
+Three of those are Codex features the rest of the bot leans on:
+
+- **`--profile`** selects the unattended sandbox profile — approvals off, network on, writable
+  worktree and caches (see [Codex permissions](#codex-permissions)). A different engine needs
+  its own equivalent way to run non-interactively with network and a writable checkout.
+- **`--output-schema`** forces the structured verdict the bot parses. The shape is
+  `REVIEW_OUTPUT_SCHEMA` in `src/schema.ts`: one `{ url, status, summary, pushedTestCommits,
+  reviewUrl }` per PR. Another engine must emit the same JSON, or gain a parsing shim.
+- The **prompt** tells the engine to run the `review-pr` skill; the review rules themselves
+  live in that skill (in `aqua-skills`), not in this repo.
+
+`CODEX_BIN` does **not** get you there. It only changes *which binary* is executed with those
+exact Codex arguments — it is for pointing at a particular `codex` build, not a different tool,
+which would be handed flags it does not understand.
+
+So adding a model means extracting the Codex-specific bits of `src/codex.ts` behind a small
+interface — build the argument list, and capture the final structured message — and selecting
+the engine by config. That is a contained refactor of `codex.ts` (and the seam in
+`src/review.ts` that calls it), not a rewrite, but it is code to write, not a setting to
+change. Claude Code can run the same `review-pr`/`resolve-review` skills, so it is a natural
+second engine to wire in at that seam; its non-interactive invocation and structured-output
+capture differ from Codex's flags, which is exactly what the adapter would absorb. Until that
+seam exists, the bot is Codex-only.
 
 ## Health and status
 
