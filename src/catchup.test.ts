@@ -439,3 +439,32 @@ test('the live gate is not armed when the reconnect catch-up is off', t => {
   t.equal(gate.opened, 0)
   t.end()
 })
+
+// Socket Mode's normal auto-reconnect emits `reconnecting` on a websocket close and never
+// `disconnected` (reserved for shutdown / reconnect-disabled). The gate must arm on that path
+// too, or the common reconnect leaves the cursor race wide open. Regression for round-1's
+// finding on the fix itself.
+test('the reconnecting path also arms the gate until the catch-up completes', async t => {
+  const gate = recordingGate()
+  const catchUp = deferred<void>()
+  const tracker = createConnectionTracker({
+    catchUp: () => catchUp.promise,
+    log: () => {},
+    now: () => 0,
+    catchUpOnReconnect: true,
+    liveGate: gate,
+  })
+
+  tracker.onConnected() // first connection
+  tracker.onReconnecting() // websocket closed; no `disconnected` on this path
+  t.deepEqual(gate.armed, ['reconnect'], 'reconnecting holds live events')
+
+  tracker.onConnected() // reconnect: catch-up requested
+  await drain()
+  t.equal(gate.opened, 0, 'the gate stays shut until the catch-up has read history')
+
+  catchUp.resolve()
+  await drain()
+  t.equal(gate.opened, 1, 'and opens once the reconnect catch-up completes')
+  t.end()
+})

@@ -352,6 +352,12 @@ export function createConnectionTracker(deps: ConnectionDeps): {
     },
     onReconnecting(): void {
       state.connected = false
+      // Arm here too, not only in onDisconnected: Socket Mode's normal auto-reconnect emits
+      // `reconnecting` on a websocket close and never `disconnected` (which is reserved for
+      // shutdown / reconnect-disabled). Arming only on `disconnected` would leave the common
+      // reconnect path ungated, so a live message could still race the recovery catch-up — the
+      // exact bug this gate exists to close. `arm` is idempotent, so both paths are safe.
+      if (deps.catchUpOnReconnect) deps.liveGate?.arm('reconnect')
       deps.log('socket.reconnecting', { reconnects: state.reconnects })
     },
   }
