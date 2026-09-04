@@ -12,6 +12,7 @@ import { buildPrompt } from './prompt'
 import { renderThread, verdictFor } from './render'
 import { makeReviewRunner } from './review'
 import type { ReviewRequest } from './job'
+import { renderUsageLine } from './usage'
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2)
@@ -48,10 +49,11 @@ async function main(): Promise<void> {
   }
 
   process.stderr.write(`Reviewing ${request.prs.length} pull request(s) via Codex...\n`)
-  const result = await makeReviewRunner(config)(request)
+  const { result, usage } = await makeReviewRunner(config)(request)
 
   process.stdout.write(`\n${JSON.stringify(result, null, 2)}\n`)
   process.stdout.write(`\nVerdict: ${verdictFor(result)}\n`)
+  process.stdout.write(`\n${renderUsageLine(usage)}\n`)
   process.stdout.write(`\n--- Slack thread that would be posted ---\n${renderThread(result)}\n`)
   // Non-zero exit when anything did not pass, so a CI or shell caller can branch on it.
   process.exitCode = verdictFor(result) === 'pass' ? 0 : 1

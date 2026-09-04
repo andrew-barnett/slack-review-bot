@@ -6,7 +6,9 @@ import { PassThrough } from 'stream'
 import test from 'tape'
 import {
   buildCodexArgs,
+  CodexOutputError,
   CodexStalledError,
+  CodexTimeoutError,
   describeStall,
   describeTimeout,
   runCodexReview,
@@ -178,8 +180,8 @@ test('runCodexReview does not charge a machine-asleep gap against the run timeou
   // The rejection lands on the tick that kills, before this test gets back to await it; a
   // handler attached up front keeps it from surfacing as an unhandled rejection meanwhile.
   const run = runCodexReview(runOptions(log), spawner, clock.deps).then(
-    () => 'resolved',
-    (error: unknown) => String(error)
+    () => undefined,
+    (error: unknown) => error
   )
   await settle()
 
@@ -195,10 +197,16 @@ test('runCodexReview does not charge a machine-asleep gap against the run timeou
   await settle()
   t.deepEqual(child.signals, ['SIGTERM'], 'killed once sixty seconds of active time are spent')
 
-  const message = await run
-  t.notEqual(message, 'resolved', 'a killed run must reject')
-  t.ok(message.includes('exceeded the 1 minute timeout'), message)
-  t.ok(message.includes('asleep were not counted'), 'the error accounts for the discounted time')
+  const error = await run
+  t.ok(error !== undefined, 'a killed run must reject')
+  // A distinct error type carrying the deadline snapshot, so the caller can charge the active time
+  // the run spent before the kill rather than reporting a timed-out run as free.
+  t.ok(error instanceof CodexTimeoutError, 'it rejects with CodexTimeoutError')
+  t.ok(String(error).includes('exceeded the 1 minute timeout'), String(error))
+  t.ok(String(error).includes('asleep were not counted'), 'the error accounts for the discounted time')
+  if (error instanceof CodexTimeoutError) {
+    t.ok(error.snapshot.activeMs >= 60_000, 'the snapshot carries the active time the run spent')
+  }
   t.end()
 })
 
@@ -230,6 +238,120 @@ test('runCodexReview returns the parsed final message and stops the deadline on 
   // Enough ticks to have expired the budget had the deadline still been running.
   for (let i = 0; i < 10; i += 1) clock.tick(10_000)
   t.deepEqual(child.signals, [], 'no signal after the run has already finished')
+  t.end()
+})
+
+// The run has to surface what it cost: Codex's "tokens used" total, parsed out of the
+// transcript, and the active time the deadline charged. This is what the status totals and the
+// per-review thread line are built from.
+test('runCodexReview reports the token total and active time on a completed run', async t => {
+  const child = new FakeChild()
+  let outputPath = ''
+  const spawner = ((_bin: string, args: string[]) => {
+    outputPath = args[args.indexOf('--output-last-message') + 1]
+    return child
+  }) as unknown as Spawner
+  const clock = fakeClock()
+
+  const run = runCodexReview(runOptions(), spawner, clock.deps)
+  await settle()
+  clock.tick(10_000) // one heartbeat of active time
+  // Codex prints its running total to the transcript; the two-line form is what `codex exec` emits.
+  child.stdout.write('reviewing...\ntokens used\n300,448\n')
+  await settle()
+  fs.writeFileSync(
+    outputPath,
+    JSON.stringify({
+      results: [{ url: 'https://github.com/o/r/pull/1', status: 'passed', summary: '', pushedTestCommits: false, reviewUrl: '' }],
+    })
+  )
+  child.emit('close', 0)
+  const outcome = await run
+  t.equal(outcome.tokensUsed, 300_448, 'the token total is parsed from the transcript')
+  t.equal(outcome.activeMs, 10_000, 'the active time charged to the run is reported')
+  t.end()
+})
+
+// A run that printed no total (the normal shape of a killed run, but also possible on a clean
+// exit) reports undefined tokens rather than a misleading zero.
+test('runCodexReview reports undefined tokens when the run printed no total', async t => {
+  const child = new FakeChild()
+  let outputPath = ''
+  const spawner = ((_bin: string, args: string[]) => {
+    outputPath = args[args.indexOf('--output-last-message') + 1]
+    return child
+  }) as unknown as Spawner
+  const clock = fakeClock()
+
+  const run = runCodexReview(runOptions(), spawner, clock.deps)
+  await settle()
+  fs.writeFileSync(
+    outputPath,
+    JSON.stringify({
+      results: [{ url: 'https://github.com/o/r/pull/1', status: 'passed', summary: '', pushedTestCommits: false, reviewUrl: '' }],
+    })
+  )
+  child.emit('close', 0)
+  const outcome = await run
+  t.equal(outcome.tokensUsed, undefined, 'no total printed means no figure, not zero')
+  t.end()
+})
+
+// A run that finished and printed a token total but wrote a malformed final message must not
+// erase what it cost: it throws CodexOutputError carrying the tokens and active time. Regression
+// for the usage gap where a parse failure on the success path dropped usage entirely.
+test('runCodexReview throws CodexOutputError with usage when the final message is malformed', async t => {
+  const child = new FakeChild()
+  let outputPath = ''
+  const spawner = ((_bin: string, args: string[]) => {
+    outputPath = args[args.indexOf('--output-last-message') + 1]
+    return child
+  }) as unknown as Spawner
+  const clock = fakeClock()
+
+  const run = runCodexReview(runOptions(), spawner, clock.deps).then(
+    () => undefined,
+    (error: unknown) => error
+  )
+  await settle()
+  clock.tick(10_000)
+  child.stdout.write('tokens used\n250,000\n')
+  await settle()
+  fs.writeFileSync(outputPath, 'this is not json') // finished, but unparseable output
+  child.emit('close', 0)
+
+  const error = await run
+  t.ok(error instanceof CodexOutputError, 'a malformed final message is a CodexOutputError')
+  if (error instanceof CodexOutputError) {
+    t.equal(error.tokensUsed, 250_000, 'the token total the run printed is carried')
+    t.equal(error.activeMs, 10_000, 'the active time the run spent is carried')
+  }
+  t.end()
+})
+
+// The same when the run wrote no final message at all: usage still rides on the error rather
+// than the run being reported as free.
+test('runCodexReview throws CodexOutputError with usage when no final message is written', async t => {
+  const child = new FakeChild()
+  const spawner = (() => child) as unknown as Spawner
+  const clock = fakeClock()
+
+  const run = runCodexReview(runOptions(), spawner, clock.deps).then(
+    () => undefined,
+    (error: unknown) => error
+  )
+  await settle()
+  clock.tick(10_000)
+  child.stdout.write('tokens used\n80,000\n')
+  await settle()
+  child.emit('close', 1) // closes without ever writing the output file
+
+  const error = await run
+  t.ok(error instanceof CodexOutputError, 'no final message is a CodexOutputError')
+  if (error instanceof CodexOutputError) {
+    t.equal(error.tokensUsed, 80_000, 'usage rides on the error even with no output file')
+    t.ok(String(error).includes('produced no final message'), String(error))
+  }
   t.end()
 })
 

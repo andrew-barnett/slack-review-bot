@@ -23,6 +23,7 @@ import { fetchHistorySince, replayMissed, type ReplaySummary } from './replay'
 import { makeReviewRunner } from './review'
 import { decideTrigger, isHelpRequest, isStatusRequest, makeSlackEffects, type SlackMessageEvent } from './slack'
 import { createStats, renderStatus } from './status'
+import type { RunUsage } from './usage'
 
 function log(event: string, fields: Record<string, unknown> = {}): void {
   // Structured single-line JSON so `runs/*.log` and the launchd stdout stay greppable.
@@ -243,7 +244,19 @@ async function main(): Promise<void> {
     // instead of leaving a message acknowledged with :eyes: and never answered.
     cursors.begin(request.message.channel, request.message.ts)
 
-    const deps: JobDeps = { ...makeSlackEffects(client), ...makeGitHubEffects(), runReview, log }
+    // Captured by the recordUsage dep below and read once the job settles, so the token totals
+    // land in stats.record alongside the outcome. Safe as a per-message closure var: deps is
+    // built fresh for each triggering message.
+    let usage: RunUsage | undefined
+    const deps: JobDeps = {
+      ...makeSlackEffects(client),
+      ...makeGitHubEffects(),
+      runReview,
+      recordUsage: u => {
+        usage = u
+      },
+      log,
+    }
 
     // Track this request for the live status. Enqueued now (as waiting), promoted to active
     // when its slot is taken, and forgotten when it settles. Short `repo#number` labels, since
@@ -299,14 +312,14 @@ async function main(): Promise<void> {
             removeAckOnComplete: config.removeAckOnComplete,
           },
           deps,
-          { queued: queuedReaction }
+          { queued: queuedReaction, postUsage: config.usageReplyEnabled }
         )
       })
-      .then(outcome => stats.record(outcome, request.prs.length, Date.now()))
+      .then(outcome => stats.record(outcome, request.prs.length, Date.now(), usage?.tokensUsed))
       .catch(error => {
         // A crash never reaches runJob's own reporting, so count it as an error outcome
         // rather than letting the status reply claim nothing went wrong.
-        stats.record('error', request.prs.length, Date.now())
+        stats.record('error', request.prs.length, Date.now(), usage?.tokensUsed)
         log('job.crashed', { key, error: String(error) })
       })
       .finally(() => {

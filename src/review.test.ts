@@ -1,8 +1,15 @@
 import test from 'tape'
-import { CodexStalledError, type CodexRunOutcome, type runCodexReview } from './codex'
+import {
+  CodexOutputError,
+  CodexStalledError,
+  CodexTimeoutError,
+  type CodexRunOutcome,
+  type runCodexReview,
+} from './codex'
 import { loadReviewConfig, type ReviewConfig } from './config'
 import type { ReviewRequest } from './job'
 import { makeReviewRunner } from './review'
+import { ReviewFailedError } from './usage'
 
 const request: ReviewRequest = {
   message: { channel: 'C1', ts: '1.1' },
@@ -19,11 +26,25 @@ function passed(): CodexRunOutcome {
       ],
     },
     rawFinalMessage: '{}',
+    tokensUsed: 12345,
+    activeMs: 90_000,
   }
 }
 
 function stall(stallMs: number | undefined): CodexStalledError {
-  return new CodexStalledError('stalled', stallMs ?? 0, { activeMs: 0, wallMs: 0, frozenMs: 0 })
+  // A non-zero active time so tests can assert it survives onto the failure usage. Every stalled
+  // attempt here reports 5s of active time.
+  return new CodexStalledError('stalled', stallMs ?? 0, { activeMs: 5000, wallMs: 5000, frozenMs: 0 })
+}
+
+/** A timed-out run that spent `activeMs` of active time before it was killed. */
+function timeout(activeMs: number): CodexTimeoutError {
+  return new CodexTimeoutError('timed out', { activeMs, wallMs: activeMs, frozenMs: 0 })
+}
+
+/** A run that finished but whose final message was unusable, having cost the given usage. */
+function badOutput(tokensUsed: number | undefined, activeMs: number): CodexOutputError {
+  return new CodexOutputError('malformed final message', tokensUsed, activeMs)
 }
 
 /** Defaults with a controlled stall schedule; the graces here are the shape, not real minutes. */
@@ -47,11 +68,20 @@ test('makeReviewRunner retries a stall with the next longer grace and returns on
   const events: string[] = []
   const runner = makeReviewRunner(config([1000, 2000, 3000, 4000]), e => events.push(e), fakeRun)
 
-  const result = await runner(request)
-  t.equal(result.results[0].status, 'passed', 'the succeeding attempt is returned')
+  const outcome = await runner(request)
+  t.equal(outcome.result.results[0].status, 'passed', 'the succeeding attempt is returned')
   t.deepEqual(graces, [1000, 2000, 3000], 'each attempt waited longer for output than the last')
   t.deepEqual(runIds, ['C1-11', 'C1-11.retry1', 'C1-11.retry2'], 'each retry logs to its own runId')
   t.equal(events.filter(e => e === 'review.retry').length, 2, 'the two retries were logged')
+  // Usage rides along with the winning attempt: Codex's token total, its active time, and the
+  // attempt number it succeeded on (3, after two retries) — so a retried review reports honestly.
+  t.equal(outcome.usage.tokensUsed, 12345, 'the token total from the successful run is carried')
+  t.equal(
+    outcome.usage.activeMs,
+    100_000,
+    'active time is summed across both stalled attempts (5s each) and the successful run (90s)'
+  )
+  t.equal(outcome.usage.attempts, 3, 'the attempt count reflects the two retries before success')
   t.end()
 })
 
@@ -71,6 +101,14 @@ test('makeReviewRunner gives up and throws once the final grace also stalls', as
     t.fail('a run that stalls on every attempt must reject')
   } catch (error) {
     t.ok(String(error).includes('stalled on every attempt (2)'), String(error))
+    // The permanent failure still carries what the run cost, so the status totals and the error
+    // thread can account for a run that burned time without producing a verdict.
+    t.ok(error instanceof ReviewFailedError, 'a give-up throws a ReviewFailedError carrying usage')
+    if (error instanceof ReviewFailedError) {
+      t.equal(error.usage.attempts, 2, 'usage records both attempts were spent')
+      t.equal(error.usage.activeMs, 10_000, 'active time is summed across both stalled attempts (5s each)')
+      t.equal(error.usage.tokensUsed, undefined, 'a killed run reported no token total')
+    }
   }
   t.equal(calls, 2, 'exactly the scheduled number of attempts were made')
   t.equal(events.filter(e => e === 'review.retry').length, 1, 'one retry between the two attempts')
@@ -93,8 +131,86 @@ test('makeReviewRunner does not retry a non-stall failure', async t => {
     t.fail('a crash must reject')
   } catch (error) {
     t.ok(String(error).includes('codex crashed'), String(error))
+    // A crash is wrapped too, so the failure path always has a usage to report — here just the
+    // single attempt, since a crash produces no token total or active-time snapshot.
+    t.ok(error instanceof ReviewFailedError, 'a crash is wrapped in a ReviewFailedError')
+    if (error instanceof ReviewFailedError) {
+      t.equal(error.usage.attempts, 1, 'usage records the single attempt')
+      t.equal(error.usage.tokensUsed, undefined, 'a crash reported no token total')
+    }
   }
   t.equal(calls, 1, 'a non-stall failure is terminal — no retry')
+  t.end()
+})
+
+// A timeout is terminal and never retried, but it spent its whole budget of active time before
+// the kill. Regression for the usage gap where the timeout path fell through to `{ attempts }`
+// with no activeMs at all, so a timed-out review reported as having cost no time.
+test('makeReviewRunner reports the active time a timed-out run spent', async t => {
+  const fakeRun: typeof runCodexReview = async () => {
+    throw timeout(3_600_000)
+  }
+  const runner = makeReviewRunner(config([1000, 2000, 3000]), () => {}, fakeRun)
+
+  try {
+    await runner(request)
+    t.fail('a timeout must reject')
+  } catch (error) {
+    t.ok(error instanceof ReviewFailedError, 'a timeout is wrapped in a ReviewFailedError')
+    if (error instanceof ReviewFailedError) {
+      t.equal(error.usage.attempts, 1, 'a timeout is terminal — one attempt, no retry')
+      t.equal(error.usage.activeMs, 3_600_000, "the timeout's active time is carried onto the failure")
+      t.equal(error.usage.tokensUsed, undefined, 'a killed run reported no token total')
+    }
+  }
+  t.end()
+})
+
+// A stalled attempt that is retried and THEN times out must charge both spans — the accumulator
+// must not reset between attempts. Regression for reporting only the final attempt's time.
+test('makeReviewRunner sums a stalled attempt and a later timeout', async t => {
+  let calls = 0
+  const fakeRun: typeof runCodexReview = async () => {
+    calls += 1
+    throw calls === 1 ? stall(1000) : timeout(120_000)
+  }
+  const runner = makeReviewRunner(config([1000, 2000]), () => {}, fakeRun)
+
+  try {
+    await runner(request)
+    t.fail('must reject once the retry also fails')
+  } catch (error) {
+    t.ok(error instanceof ReviewFailedError, 'wrapped in a ReviewFailedError')
+    if (error instanceof ReviewFailedError) {
+      t.equal(error.usage.activeMs, 125_000, 'the 5s stall and the 120s timeout are both charged')
+      t.equal(error.usage.attempts, 2, 'the retry that then timed out is the second attempt')
+    }
+  }
+  t.equal(calls, 2, 'the stall was retried, then the retry timed out')
+  t.end()
+})
+
+// A completed run with unusable output is terminal, but it cost tokens and time. The failure
+// must preserve BOTH — not report `tokens n/a` — or a run that consumed tokens vanishes from
+// the status totals. Regression for the round-2 finding where a parse failure on the success
+// path erased usage.
+test('makeReviewRunner preserves tokens and active time from a bad-output failure', async t => {
+  const fakeRun: typeof runCodexReview = async () => {
+    throw badOutput(250_000, 60_000)
+  }
+  const runner = makeReviewRunner(config([1000, 2000]), () => {}, fakeRun)
+
+  try {
+    await runner(request)
+    t.fail('bad output must reject')
+  } catch (error) {
+    t.ok(error instanceof ReviewFailedError, 'wrapped in a ReviewFailedError')
+    if (error instanceof ReviewFailedError) {
+      t.equal(error.usage.tokensUsed, 250_000, 'the token total the run printed is preserved')
+      t.equal(error.usage.activeMs, 60_000, 'the active time is preserved')
+      t.equal(error.usage.attempts, 1, 'bad output is terminal — one attempt, no retry')
+    }
+  }
   t.end()
 })
 

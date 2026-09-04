@@ -64,6 +64,20 @@ test('CATCHUP_INTERVAL_MS treats 0 as off but still rejects nonsense', t => {
   t.end()
 })
 
+// The per-review usage reply defaults on — the feature is only useful if it appears without
+// configuration — but an operator who finds it noisy has to be able to switch it off, while the
+// status totals it feeds keep accruing regardless.
+test('USAGE_REPLY_ENABLED defaults on and can be turned off', t => {
+  t.equal(loadConfig({ ...credentials }).usageReplyEnabled, true, 'default on')
+  t.equal(
+    loadConfig({ ...credentials, USAGE_REPLY_ENABLED: 'false' }).usageReplyEnabled,
+    false,
+    'explicitly disabled'
+  )
+  t.equal(loadConfig({ ...credentials, USAGE_REPLY_ENABLED: 'off' }).usageReplyEnabled, false, 'off is honoured too')
+  t.end()
+})
+
 // The catch-up is the thing that makes a missed message recoverable without a restart, so
 // both triggers default to on: an install that sets neither variable has to end up with the
 // safe behaviour, since the failure mode of the old default was silence.

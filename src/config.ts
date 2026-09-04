@@ -93,6 +93,12 @@ export interface Config extends ReviewConfig {
   catchUpIntervalMs: number
   /** Catch up the moment the socket reconnects, rather than waiting for the timer. */
   catchUpOnReconnect: boolean
+  /**
+   * Post a per-review usage line (tokens, active time, attempts) as a thread reply on every
+   * completed review. Off silences that reply without affecting the token totals the status
+   * command reports, which are always kept.
+   */
+  usageReplyEnabled: boolean
 }
 
 /** Environment keys holding secrets. Never passed down to the Codex child process. */
@@ -236,5 +242,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // interval — the reason not to go much lower is log volume, not rate limits.
     catchUpIntervalMs: parseNonNegativeInt(env.CATCHUP_INTERVAL_MS, 5 * 60 * 1000),
     catchUpOnReconnect: parseBool(env.CATCHUP_ON_RECONNECT, true),
+    usageReplyEnabled: parseBool(env.USAGE_REPLY_ENABLED, true),
   }
 }
