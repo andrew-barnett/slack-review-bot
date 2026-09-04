@@ -189,6 +189,84 @@ export function createFreezeDetector(deps: FreezeDetectorDeps): { check(): void 
   }
 }
 
+/**
+ * Fail-open ceiling for the live-event gate: how long live dispatch may be held waiting for a
+ * recovery catch-up before it is released regardless.
+ *
+ * A healthy catch-up is one `conversations.history` per channel and finishes in well under a
+ * second, so this is far outside normal. It exists only so a wedged catch-up — the
+ * no-HTTP-timeout hazard `WebClient` ships with — can never hold live events forever; a run
+ * that hits it re-opens the small cursor race for one pass, which is strictly better than a
+ * daemon that has silently stopped answering.
+ */
+export const LIVE_GATE_FAILOPEN_MS = 60_000
+
+export interface ReadyGateDeps {
+  log(event: string, fields?: Record<string, unknown>): void
+  /** How long an armed gate may stay shut before it opens itself. */
+  failOpenMs: number
+  /** Injected so a test can drive the fail-open without real time. */
+  setTimer(fn: () => void, ms: number): ReturnType<typeof setTimeout>
+  clearTimer(handle: ReturnType<typeof setTimeout>): void
+}
+
+/**
+ * A re-armable latch that holds live-event processing while a catch-up is recovering a gap.
+ *
+ * The daemon must not let a live message advance a channel's cursor past messages that a
+ * pending catch-up has not read yet — that silently drops whatever was missed during a
+ * disconnect (see the startup gate in app.ts, which is the same idea for the *first* gap). A
+ * one-shot promise covered startup; this generalises it so every reconnect gap is covered too:
+ * `arm()` on disconnect, `open()` when the recovery catch-up has read history.
+ *
+ * `arm()` while already armed is a no-op, so a reconnect storm holds the gate once rather than
+ * replacing the promise its waiters are parked on. `open()` is idempotent. Arming starts a
+ * fail-open timer so a catch-up that never completes cannot wedge live processing forever.
+ */
+export interface ReadyGate {
+  /** Resolves when the gate is open. Live dispatch awaits this before touching the cursor. */
+  wait(): Promise<void>
+  /** Hold live events. `reason` is for the fail-open log line. No-op if already armed. */
+  arm(reason: string): void
+  /** Release live events, and cancel the fail-open timer. No-op if already open. */
+  open(): void
+}
+
+export function createReadyGate(deps: ReadyGateDeps): ReadyGate {
+  // Starts open: a daemon with no gap to recover should not hold its first live event.
+  let promise: Promise<void> = Promise.resolve()
+  let resolveFn: (() => void) | undefined
+  let timer: ReturnType<typeof setTimeout> | undefined
+
+  const open = (): void => {
+    if (!resolveFn) return
+    if (timer !== undefined) {
+      deps.clearTimer(timer)
+      timer = undefined
+    }
+    const resolve = resolveFn
+    resolveFn = undefined
+    resolve()
+  }
+
+  const arm = (reason: string): void => {
+    if (resolveFn) return // already armed: keep the promise waiters are parked on
+    promise = new Promise<void>(resolve => {
+      resolveFn = resolve
+    })
+    timer = deps.setTimer(() => {
+      deps.log('livegate.failopen', {
+        reason,
+        failOpenMs: deps.failOpenMs,
+        hint: 'catch-up did not complete in time; releasing live events so the bot cannot hang',
+      })
+      open()
+    }, deps.failOpenMs)
+  }
+
+  return { wait: () => promise, arm, open }
+}
+
 /** What the socket has been doing lately. Owned by app.ts, rendered by status.ts. */
 export interface ConnectionState {
   connected: boolean
@@ -199,12 +277,23 @@ export interface ConnectionState {
 }
 
 export interface ConnectionDeps {
-  /** Ask for a catch-up. Called on every reconnect, never on the first connection. */
-  catchUp(reason: CatchUpReason): void
+  /**
+   * Ask for a catch-up. Called on every reconnect, never on the first connection. May return
+   * the catch-up's completion promise; when a `liveGate` is supplied it is used to open the
+   * gate once the recovery pass has read history.
+   */
+  catchUp(reason: CatchUpReason): void | Promise<void>
   log(event: string, fields?: Record<string, unknown>): void
   now(): number
   /** False to track the socket for the status reply but not act on a reconnect. */
   catchUpOnReconnect: boolean
+  /**
+   * The live-event gate. Armed on disconnect and opened when the reconnect catch-up finishes,
+   * so a live message cannot carry the cursor past the gap before the catch-up reads it.
+   * Optional: without a reconnect catch-up to open it there is nothing to gate, so it is only
+   * armed when {@link catchUpOnReconnect} is set.
+   */
+  liveGate?: ReadyGate
 }
 
 /**
@@ -242,11 +331,20 @@ export function createConnectionTracker(deps: ConnectionDeps): {
         })
         return
       }
-      deps.catchUp('reconnect')
+      // Open the live gate once this catch-up has read history, so live events held since the
+      // disconnect resume — and only then, so none of them advanced the cursor over the gap.
+      // `Promise.resolve` tolerates a void-returning `catchUp` (the tests use one); the runner
+      // never rejects, so no rejection can escape here.
+      const done = Promise.resolve(deps.catchUp('reconnect'))
+      if (deps.liveGate) void done.finally(() => deps.liveGate!.open())
     },
     onDisconnected(): void {
       state.connected = false
       state.lastDisconnectedAt = deps.now()
+      // Hold live events until the reconnect catch-up has read the gap, so a live message
+      // arriving right after reconnect cannot advance the cursor past the missed backlog. Only
+      // when a reconnect catch-up will actually run to re-open it — otherwise nothing would.
+      if (deps.catchUpOnReconnect) deps.liveGate?.arm('reconnect')
       // Worth a line at info level: this is the event whose aftermath used to be invisible,
       // and pairing it with the socket.connected that follows gives the length of the gap
       // the next catch-up is responsible for.
@@ -254,6 +352,12 @@ export function createConnectionTracker(deps: ConnectionDeps): {
     },
     onReconnecting(): void {
       state.connected = false
+      // Arm here too, not only in onDisconnected: Socket Mode's normal auto-reconnect emits
+      // `reconnecting` on a websocket close and never `disconnected` (which is reserved for
+      // shutdown / reconnect-disabled). Arming only on `disconnected` would leave the common
+      // reconnect path ungated, so a live message could still race the recovery catch-up — the
+      // exact bug this gate exists to close. `arm` is idempotent, so both paths are safe.
+      if (deps.catchUpOnReconnect) deps.liveGate?.arm('reconnect')
       deps.log('socket.reconnecting', { reconnects: state.reconnects })
     },
   }

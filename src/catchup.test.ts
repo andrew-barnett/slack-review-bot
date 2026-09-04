@@ -3,7 +3,9 @@ import {
   CatchUpRunner,
   createConnectionTracker,
   createFreezeDetector,
+  createReadyGate,
   type CatchUpReason,
+  type ReadyGate,
 } from './catchup'
 import type { ReplaySummary } from './replay'
 
@@ -154,7 +156,9 @@ test('a catch-up that throws is recorded and does not wedge the runner', async t
 test('the first connection is not a reconnect and does not trigger a catch-up', t => {
   const asked: CatchUpReason[] = []
   const tracker = createConnectionTracker({
-    catchUp: reason => asked.push(reason),
+    catchUp: reason => {
+      asked.push(reason)
+    },
     log: () => {},
     now: () => 5,
     catchUpOnReconnect: true,
@@ -180,7 +184,9 @@ test('CATCHUP_ON_RECONNECT off still tracks the socket', t => {
   const asked: CatchUpReason[] = []
   const events: string[] = []
   const tracker = createConnectionTracker({
-    catchUp: reason => asked.push(reason),
+    catchUp: reason => {
+      asked.push(reason)
+    },
     log: event => events.push(event),
     now: () => 0,
     catchUpOnReconnect: false,
@@ -256,5 +262,209 @@ test('the freeze detector tells a suspended process from a merely busy one', t =
   clock += 30_000
   detector.check()
   t.equal(frozen.length, 1, 'the baseline resets, so the next tick is ordinary again')
+  t.end()
+})
+
+// --- ReadyGate: the re-armable latch that holds live events over a catch-up gap (issue #5). ---
+
+/** Injected timers so the fail-open can be driven without real time. */
+function fakeTimers() {
+  let seq = 0
+  const timers = new Map<number, () => void>()
+  return {
+    setTimer: (fn: () => void) => {
+      const id = ++seq
+      timers.set(id, fn)
+      return id as unknown as ReturnType<typeof setTimeout>
+    },
+    clearTimer: (h: ReturnType<typeof setTimeout>) => {
+      timers.delete(h as unknown as number)
+    },
+    fire: () => {
+      for (const fn of [...timers.values()]) fn()
+    },
+    active: () => timers.size,
+  }
+}
+
+/** True iff the promise is already resolved (settles a microtask ahead of a macrotask). */
+const isResolved = (p: Promise<void>): Promise<boolean> =>
+  Promise.race([p.then(() => true), new Promise<boolean>(r => setImmediate(() => r(false)))])
+
+function gateDeps(timers = fakeTimers(), events: string[] = []) {
+  return {
+    timers,
+    events,
+    deps: {
+      log: (e: string) => events.push(e),
+      failOpenMs: 60_000,
+      setTimer: timers.setTimer,
+      clearTimer: timers.clearTimer,
+    },
+  }
+}
+
+// A daemon with no gap to recover must not hold its first live event: an unarmed gate is open.
+test('createReadyGate is open until armed', async t => {
+  const gate = createReadyGate(gateDeps().deps)
+  t.equal(await isResolved(gate.wait()), true, 'an unarmed gate does not hold')
+  t.end()
+})
+
+// The core of the fix: while armed, live dispatch waits; opening it (a completed catch-up)
+// releases it. This is what stops a live message advancing the cursor over the backlog.
+test('createReadyGate holds while armed and releases on open', async t => {
+  const gate = createReadyGate(gateDeps().deps)
+  gate.arm('reconnect')
+  const waited = gate.wait()
+  t.equal(await isResolved(waited), false, 'armed: live events wait')
+  gate.open()
+  t.equal(await isResolved(waited), true, 'open: the same waiter is released')
+  t.end()
+})
+
+// A reconnect storm arms repeatedly; the gate must keep the one promise its waiters are parked
+// on rather than swap in a fresh one that the first waiters never see resolved.
+test('createReadyGate re-arm while armed keeps the same waiter', async t => {
+  const h = gateDeps()
+  const gate = createReadyGate(h.deps)
+  gate.arm('reconnect')
+  const first = gate.wait()
+  gate.arm('reconnect')
+  t.equal(gate.wait(), first, 're-arming does not replace the pending promise')
+  t.equal(h.timers.active(), 1, 'and does not stack a second fail-open timer')
+  gate.open()
+  t.equal(await isResolved(first), true, 'a single open releases it')
+  t.end()
+})
+
+// The safety valve: a catch-up that never completes (the no-HTTP-timeout hazard, #6) must not
+// wedge live processing forever — the fail-open timer opens the gate and says why.
+test('createReadyGate fails open if the catch-up never completes', async t => {
+  const h = gateDeps()
+  const gate = createReadyGate(h.deps)
+  gate.arm('reconnect')
+  const waited = gate.wait()
+  t.equal(await isResolved(waited), false, 'still held before the fail-open fires')
+  h.timers.fire()
+  t.equal(await isResolved(waited), true, 'fail-open releases live events')
+  t.ok(h.events.includes('livegate.failopen'), 'and logs that it did')
+  t.end()
+})
+
+// Opening normally must cancel the fail-open timer, or a later re-arm could be torn open early
+// by a stale timer from the previous cycle.
+test('createReadyGate open cancels the fail-open timer', async t => {
+  const h = gateDeps()
+  const gate = createReadyGate(h.deps)
+  gate.arm('reconnect')
+  gate.open()
+  t.equal(h.timers.active(), 0, 'the fail-open timer is cleared on open')
+  // Re-arm for the next gap: a fresh, independent pending promise.
+  gate.arm('reconnect')
+  const second = gate.wait()
+  t.equal(await isResolved(second), false, 'a new gap holds again')
+  gate.open()
+  t.equal(await isResolved(second), true)
+  t.end()
+})
+
+// --- Connection tracker wiring: disconnect arms the gate, the reconnect catch-up opens it. ---
+
+/** A ReadyGate double that records the calls the tracker makes. */
+function recordingGate(): ReadyGate & { armed: string[]; opened: number } {
+  const armed: string[] = []
+  let opened = 0
+  return {
+    armed,
+    get opened() {
+      return opened
+    },
+    wait: () => Promise.resolve(),
+    arm: (reason: string) => {
+      armed.push(reason)
+    },
+    open: () => {
+      opened += 1
+    },
+  }
+}
+
+// The fix's wiring: a drop arms the gate, and it opens only once the reconnect catch-up has
+// actually read history — never before, or a live message could still race past the backlog.
+test('a disconnect arms the live gate and the reconnect catch-up opens it', async t => {
+  const gate = recordingGate()
+  const catchUp = deferred<void>()
+  const tracker = createConnectionTracker({
+    catchUp: () => catchUp.promise,
+    log: () => {},
+    now: () => 0,
+    catchUpOnReconnect: true,
+    liveGate: gate,
+  })
+
+  tracker.onConnected() // first connection: startup owns its own gate/catch-up
+  t.deepEqual(gate.armed, [], 'the first connect neither arms nor opens')
+  t.equal(gate.opened, 0)
+
+  tracker.onDisconnected()
+  t.deepEqual(gate.armed, ['reconnect'], 'a drop holds live events')
+
+  tracker.onConnected() // reconnect: catch-up requested, gate still shut
+  await drain()
+  t.equal(gate.opened, 0, 'the gate stays shut until the catch-up has read history')
+
+  catchUp.resolve()
+  await drain()
+  t.equal(gate.opened, 1, 'and opens once the catch-up completes')
+  t.end()
+})
+
+// With the reconnect catch-up turned off there is nothing to reopen the gate, so arming it on a
+// drop would hold live events until the fail-open — the tracker must not arm in that mode.
+test('the live gate is not armed when the reconnect catch-up is off', t => {
+  const gate = recordingGate()
+  const tracker = createConnectionTracker({
+    catchUp: () => {},
+    log: () => {},
+    now: () => 0,
+    catchUpOnReconnect: false,
+    liveGate: gate,
+  })
+
+  tracker.onConnected()
+  tracker.onDisconnected()
+  tracker.onConnected()
+  t.deepEqual(gate.armed, [], 'no reconnect catch-up means the gate is left alone')
+  t.equal(gate.opened, 0)
+  t.end()
+})
+
+// Socket Mode's normal auto-reconnect emits `reconnecting` on a websocket close and never
+// `disconnected` (reserved for shutdown / reconnect-disabled). The gate must arm on that path
+// too, or the common reconnect leaves the cursor race wide open. Regression for round-1's
+// finding on the fix itself.
+test('the reconnecting path also arms the gate until the catch-up completes', async t => {
+  const gate = recordingGate()
+  const catchUp = deferred<void>()
+  const tracker = createConnectionTracker({
+    catchUp: () => catchUp.promise,
+    log: () => {},
+    now: () => 0,
+    catchUpOnReconnect: true,
+    liveGate: gate,
+  })
+
+  tracker.onConnected() // first connection
+  tracker.onReconnecting() // websocket closed; no `disconnected` on this path
+  t.deepEqual(gate.armed, ['reconnect'], 'reconnecting holds live events')
+
+  tracker.onConnected() // reconnect: catch-up requested
+  await drain()
+  t.equal(gate.opened, 0, 'the gate stays shut until the catch-up has read history')
+
+  catchUp.resolve()
+  await drain()
+  t.equal(gate.opened, 1, 'and opens once the reconnect catch-up completes')
   t.end()
 })
