@@ -7,7 +7,9 @@ import {
   CatchUpRunner,
   createConnectionTracker,
   createFreezeDetector,
+  createReadyGate,
   FREEZE_CHECK_MS,
+  LIVE_GATE_FAILOPEN_MS,
   type CatchUpReason,
   type ConnectionState,
 } from './catchup'
@@ -333,15 +335,28 @@ async function main(): Promise<void> {
     return true
   }
 
-  // Live events wait for the startup catch-up. Without this, a message arriving in the second
-  // between connecting and reading history would record its own position first and carry the
-  // cursor straight over the backlog: the bot would come back, answer the one new message,
-  // and forget everything posted while it was down. The wait is a history call or two, and a
-  // redelivery caused by the delayed ack lands on the dedupe set like any other retry.
-  let caughtUp!: () => void
-  const ready = new Promise<void>(resolve => {
-    caughtUp = resolve
+  // Live events wait for a catch-up before they can touch the cursor. Without this, a message
+  // arriving in the second between connecting and reading history would record its own position
+  // first and carry the cursor straight over the backlog: the bot would come back, answer the
+  // one new message, and forget everything posted while it was down. The wait is a history call
+  // or two, and a redelivery caused by the delayed ack lands on the dedupe set like any other
+  // retry.
+  //
+  // Re-armable, not one-shot: the same hazard recurs on every reconnect gap, not just at
+  // startup. The gate is armed here for the startup catch-up, re-armed on each disconnect (by
+  // the connection tracker), and opened when the covering catch-up has read history. A bounded
+  // fail-open means a wedged catch-up can never hold live events forever.
+  const liveGate = createReadyGate({
+    log,
+    failOpenMs: LIVE_GATE_FAILOPEN_MS,
+    setTimer: (fn, ms) => {
+      const t = setTimeout(fn, ms)
+      t.unref?.()
+      return t
+    },
+    clearTimer: t => clearTimeout(t),
   })
+  liveGate.arm('startup')
 
   /**
    * One pass of the catch-up: read every channel back to its cursor and dispatch whatever
@@ -380,10 +395,12 @@ async function main(): Promise<void> {
   // The socket's state, and the reconnect trigger. These event names are the values of
   // socket-mode's internal `State` enum, which the package does not export — hence literals.
   const socket = createConnectionTracker({
-    catchUp: reason => void catchUps.request(reason),
+    catchUp: reason => catchUps.request(reason),
     log,
     now: Date.now,
     catchUpOnReconnect: catchUpEnabled && config.catchUpOnReconnect,
+    // Armed on disconnect and opened when the reconnect catch-up finishes reading history.
+    liveGate,
   })
   connection = socket.state
   receiver.client.on('connected', () => socket.onConnected())
@@ -391,7 +408,7 @@ async function main(): Promise<void> {
   receiver.client.on('reconnecting', () => socket.onReconnecting())
 
   app.event('message', async ({ event, client }) => {
-    await ready
+    await liveGate.wait()
     await dispatch(event as SlackMessageEvent, client, 'live')
   })
 
@@ -431,13 +448,13 @@ async function main(): Promise<void> {
           : 'REPLAY_ENABLED is off; the cursor is still recorded but never acted on',
       })
     } else {
-      // Awaited, unlike the reconnect and timer passes: this is the one that the `ready` gate
-      // is holding live events for. CatchUpRunner never rejects, so there is nothing to catch.
+      // Awaited, unlike the reconnect and timer passes: this is the one the live gate is
+      // holding events for at startup. CatchUpRunner never rejects, so there is nothing to catch.
       await catchUps.request('startup')
     }
   } finally {
-    // Always, or the gate above would hold every live message for the life of the process.
-    caughtUp()
+    // Always, or the gate would hold every live message for the life of the process.
+    liveGate.open()
   }
 
   // The backstop, and the reason a missed message no longer needs a human to notice it.
