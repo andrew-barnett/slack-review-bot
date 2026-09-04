@@ -301,19 +301,20 @@ async function main(): Promise<void> {
     })
 
     // A message waiting behind another review used to get nothing until its own run started
-    // — two hours, once — which reads exactly like a missed message. The ack is the job's to
-    // add, so the wait gets its own reaction here. Awaited on purpose: the job removes it
-    // as it starts, and if a slot frees during this call the job must not race ahead of the
-    // reaction it is meant to take off.
-    let queuedReaction = false
-    if (waiting) {
-      try {
-        await deps.addReaction(request.message, config.queuedEmoji)
-        queuedReaction = true
-      } catch (error) {
-        log('reaction.queued.failed', { key, error: String(error) })
-      }
-    }
+    // — two hours, once — which reads exactly like a missed message, so a waiting message gets
+    // its own reaction here. NOT awaited before enqueueing: a slow or wedged reactions.add must
+    // never gate the job entering the queue (issue #16). The add runs concurrently and the job
+    // awaits this promise before removing the reaction, keeping the add strictly before the
+    // remove so no stale hourglass can be left behind.
+    const queuedReaction: Promise<boolean> | undefined = waiting
+      ? deps
+          .addReaction(request.message, config.queuedEmoji)
+          .then(() => true)
+          .catch(error => {
+            log('reaction.queued.failed', { key, error: String(error) })
+            return false
+          })
+      : undefined
 
     // Deliberately not awaited: Bolt acks the event when this handler returns, and a
     // review takes far longer than Slack's ack window. The queue, not the handler,

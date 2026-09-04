@@ -151,7 +151,7 @@ test('runJob removes the ack reaction when configured to', async t => {
 // one of them claiming it is still waiting.
 test('runJob swaps the queued reaction for the ack when told the message waited', async t => {
   const rec = recorder(async () => result(pr('passed')))
-  await runJob(request, emoji, rec.deps, { queued: true })
+  await runJob(request, emoji, rec.deps, { queued: Promise.resolve(true) })
   t.deepEqual(rec.added, ['eyes', 'approved_stamp'])
   t.deepEqual(rec.removed, ['hourglass_flowing_sand'], 'the queued reaction comes off once the ack is on')
   t.end()
@@ -166,6 +166,16 @@ test('runJob leaves reactions alone when the message never waited', async t => {
   t.end()
 })
 
+// #16: the dispatcher hands the queued reaction to the job as a promise (so a slow reactions.add
+// never gates enqueueing). When that promise resolves false — the add failed — the job must not
+// try to remove a reaction that was never placed.
+test('runJob does not remove the queued reaction when the add never landed', async t => {
+  const rec = recorder(async () => result(pr('passed')))
+  await runJob(request, emoji, rec.deps, { queued: Promise.resolve(false) })
+  t.deepEqual(rec.removed, [], 'no removal when the queued reaction was never added')
+  t.end()
+})
+
 // Removing the queued reaction is a status nicety, not a precondition. Slack rejecting it
 // (no_reaction, say, because a human already removed it) must not cost the review.
 test('runJob still reviews when removing the queued reaction fails', async t => {
@@ -174,7 +184,7 @@ test('runJob still reviews when removing the queued reaction fails', async t => 
     async () => { reviewed = true; return result(pr('passed')) },
     { async removeReaction() { throw new Error('no_reaction') } }
   )
-  const outcome = await runJob(request, emoji, rec.deps, { queued: true })
+  const outcome = await runJob(request, emoji, rec.deps, { queued: Promise.resolve(true) })
   t.equal(reviewed, true)
   t.equal(outcome, 'pass')
   t.end()
@@ -349,9 +359,52 @@ test('runJob reviews the other PRs when one is gated', async t => {
     }
   )
   const outcome = await runJob(mixed, emoji, rec.deps)
-  t.equal(outcome, 'pass', 'the reviewable PR was reviewed')
+  // #11: a partial review — one PR reviewed, one handed to a human — must NOT earn the pass
+  // stamp, or the message reads as fully cleared when a sensitive PR was never reviewed.
+  t.equal(outcome, 'skipped', 'a partial review is not reported as a clean pass')
+  t.notOk(rec.added.includes('approved_stamp'), 'the message is not stamped pass when a PR was gated')
+  t.ok(rec.added.includes('raising_hand'), 'the human-review reaction stands as the terminal signal')
   t.deepEqual(reviewedUrls, ['https://github.com/o/r/pull/1'], 'only the non-gated PR reached the review')
   t.deepEqual(comments, [{ url: 'https://github.com/trade-platform/deployments/pull/5' }], 'the gated PR was commented on')
+  t.end()
+})
+
+// #12: GitHub resolves repo names case-insensitively, so a capitalized `Deployments` values PR
+// must still be gated — otherwise the guard is bypassed by a trivial URL change.
+test('runJob gates a capitalized Deployments values PR', async t => {
+  const req: ReviewRequest = {
+    message: { channel: 'C1', ts: '4.4' },
+    prs: [
+      {
+        owner: 'trade-platform',
+        repo: 'Deployments',
+        number: 5,
+        url: 'https://github.com/trade-platform/Deployments/pull/5',
+      },
+    ],
+    instructions: '',
+  }
+  let reviewed = false
+  const comments: unknown[] = []
+  const rec = recorder(
+    async () => {
+      reviewed = true
+      return result(pr('passed'))
+    },
+    {
+      async listChangedFiles() {
+        return ['values.yaml']
+      },
+      async postPrComment() {
+        comments.push(1)
+      },
+    }
+  )
+  const outcome = await runJob(req, emoji, rec.deps)
+  t.equal(outcome, 'skipped', 'the capitalized-repo values PR is handed to a human, not reviewed')
+  t.notOk(reviewed, 'the bot never reviewed it')
+  t.equal(comments.length, 1, 'it was commented on')
+  t.ok(rec.added.includes('raising_hand'), 'and flagged for human review')
   t.end()
 })
 

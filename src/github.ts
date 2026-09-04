@@ -16,10 +16,34 @@ const execFileAsync = promisify(execFile)
 /** Runs `gh` with the given args and returns stdout. Swapped out in tests. */
 export type GhRunner = (args: string[]) => Promise<string>
 
-function defaultRunner(bin: string): GhRunner {
+/**
+ * Per-call timeout for `gh`. The gate runs inside the concurrency slot, so a `gh` that hangs on
+ * a network/API stall would pin the slot and stop the whole queue draining. A finite timeout
+ * turns a hang into a rejection, which the gate already handles by failing safe (treating the
+ * PR as needing a human) — see applyHumanReviewGate.
+ */
+export const GH_COMMAND_TIMEOUT_MS = 30_000
+
+/** The execFile shape the runner needs; injectable so a test can assert the options passed. */
+type ExecFn = (
+  bin: string,
+  args: string[],
+  opts: { maxBuffer: number; timeout: number; killSignal: NodeJS.Signals }
+) => Promise<{ stdout: string }>
+
+export function defaultRunner(
+  bin: string,
+  timeoutMs: number = GH_COMMAND_TIMEOUT_MS,
+  exec: ExecFn = execFileAsync as unknown as ExecFn
+): GhRunner {
   return async args => {
     // A large PR can list many files; 10 MB of names is far more than any real PR reaches.
-    const { stdout } = await execFileAsync(bin, args, { maxBuffer: 10 * 1024 * 1024 })
+    // The timeout kills a wedged `gh` (SIGKILL) so it cannot hold the review slot forever.
+    const { stdout } = await exec(bin, args, {
+      maxBuffer: 10 * 1024 * 1024,
+      timeout: timeoutMs,
+      killSignal: 'SIGKILL',
+    })
     return stdout
   }
 }

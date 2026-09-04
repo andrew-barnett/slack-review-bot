@@ -28,7 +28,9 @@ export function isDeploymentsValuesFile(path: string): boolean {
  * some other repo from being gated.
  */
 export function protectedDeploymentsFiles(pr: Pick<PullRequestRef, 'repo'>, changedFiles: string[]): string[] {
-  if (pr.repo !== 'deployments') return []
+  // Case-insensitive: GitHub resolves repo names case-insensitively, so `Deployments` is the
+  // same protected repo as `deployments` and must not slip the gate.
+  if (pr.repo.toLowerCase() !== 'deployments') return []
   return changedFiles.filter(isDeploymentsValuesFile)
 }
 
