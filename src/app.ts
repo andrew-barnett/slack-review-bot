@@ -13,7 +13,7 @@ import {
   type CatchUpReason,
   type ConnectionState,
 } from './catchup'
-import { runCodexReview } from './codex'
+import { createChildRegistry, runCodexReview } from './codex'
 import { loadConfig, looksLikeUserId } from './config'
 import { openCursorStore, openNullCursorStore } from './cursor'
 import { makeGitHubEffects } from './github'
@@ -115,7 +115,9 @@ async function main(): Promise<void> {
   const reviews = createActiveReviews()
   // Number of attempts a stalled run gets, mirrored into the status so a retry is visible.
   const reviewAttempts = config.stallBackoffMs.length > 0 ? config.stallBackoffMs.length : 1
-  const runReview = makeReviewRunner(config, log, runCodexReview, reviews)
+  // Tracks live `codex exec` children so shutdown can signal them instead of orphaning them.
+  const childRegistry = createChildRegistry()
+  const runReview = makeReviewRunner(config, log, runCodexReview, reviews, childRegistry)
   // How far each channel has been processed, on disk. This is what makes a restart able to
   // pick up messages posted while the socket was down — Slack never redelivers them.
   const cursors = config.cursorFile
@@ -502,10 +504,22 @@ async function main(): Promise<void> {
   })
   setInterval(() => freeze.check(), FREEZE_CHECK_MS)
 
+  let stopping = false
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     process.on(signal, () => {
-      log('bot.stopping', { signal })
-      app.stop().finally(() => process.exit(0))
+      // A second signal while already shutting down should not restart the sequence.
+      if (stopping) return
+      stopping = true
+      // Signal every in-flight `codex exec` process group before exiting. They are detached
+      // (their own groups, so a timeout can take a tree down), which also means the parent
+      // exiting would leave them running with nothing to report a verdict or settle a cursor —
+      // the interrupted review is meant to replay on the next start instead.
+      const killed = childRegistry.killAll('SIGTERM')
+      log('bot.stopping', { signal, codexRunsSignalled: killed })
+      // Give a signalled group a moment to exit before the parent goes, so it is not reparented
+      // to init and left lingering; skip the wait entirely when nothing was running.
+      const graceMs = killed > 0 ? 2000 : 0
+      app.stop().finally(() => setTimeout(() => process.exit(0), graceMs))
     })
   }
 }

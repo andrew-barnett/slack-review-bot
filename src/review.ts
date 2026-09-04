@@ -2,7 +2,13 @@
 // both drive exactly the same prompt, profile, and output contract — a review that
 // reproduces from the terminal is a review you can debug.
 
-import { CodexOutputError, CodexStalledError, CodexTimeoutError, runCodexReview } from './codex'
+import {
+  CodexOutputError,
+  CodexStalledError,
+  CodexTimeoutError,
+  runCodexReview,
+  type ChildRegistry,
+} from './codex'
 import type { ReviewConfig } from './config'
 import type { ReviewRequest } from './job'
 import type { ActiveReviews } from './progress'
@@ -27,7 +33,9 @@ export function makeReviewRunner(
   /** Injection seam so the retry loop is testable without spawning Codex. */
   runCodex: typeof runCodexReview = runCodexReview,
   /** Live-status registry, updated per attempt and per output chunk. The CLI passes nothing. */
-  reviews?: ActiveReviews
+  reviews?: ActiveReviews,
+  /** Registry of live Codex children, so a shutdown can signal them. The CLI passes nothing. */
+  registry?: ChildRegistry
 ): (request: ReviewRequest) => Promise<ReviewOutcome> {
   return async request => {
     const key = progressKey(request)
@@ -71,6 +79,7 @@ export function makeReviewRunner(
           stallTimeoutMs,
           disableGitSigning: config.disableGitSigning,
           envPassthrough: config.codexEnvPassthrough,
+          registry,
           logDir: config.runLogDir,
           runId,
           log,

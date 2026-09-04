@@ -1,3 +1,4 @@
+import type { ChildProcess } from 'child_process'
 import { EventEmitter } from 'events'
 import * as fs from 'fs'
 import * as os from 'os'
@@ -5,17 +6,21 @@ import * as path from 'path'
 import { PassThrough } from 'stream'
 import test from 'tape'
 import {
+  appendBoundedTail,
   buildChildEnv,
   buildCodexArgs,
   CodexOutputError,
   CodexStalledError,
   CodexTimeoutError,
+  createChildRegistry,
   describeStall,
   describeTimeout,
   runCodexReview,
+  TRANSCRIPT_TAIL_LIMIT,
   withGitSigningDisabled,
   type Spawner,
 } from './codex'
+import { parseTokensUsed } from './usage'
 
 function argValue(args: string[], flag: string): string | undefined {
   const index = args.indexOf(flag)
@@ -524,5 +529,119 @@ test('describeTimeout spells out the discounted sleep only when there was one', 
     describeTimeout(3 * H, { activeMs: 3 * H, wallMs: 5 * H, frozenMs: 2 * H }),
     'Codex run exceeded the 180 minute timeout and was killed (300 minutes by the wall clock, of which 120 minutes with the machine asleep were not counted)'
   )
+  t.end()
+})
+
+// --- Batch: process-lifecycle hardening (issues #9, #10, #18) ---
+
+// #18: the in-memory transcript is a bounded tail, not an unbounded array. It must cap growth
+// yet still retain the end of the stream — where the token footer and the error tail live.
+test('appendBoundedTail caps the buffer and keeps the most recent output', t => {
+  let buf = ''
+  buf = appendBoundedTail(buf, 'x'.repeat(500), 100)
+  t.equal(buf.length, 100, 'a chunk larger than the limit is truncated to the limit')
+  buf = appendBoundedTail(buf, 'ABCDE', 100)
+  t.equal(buf.length, 100, 'stays at the limit as more arrives')
+  t.ok(buf.endsWith('ABCDE'), 'the newest output is what is kept')
+  t.equal(TRANSCRIPT_TAIL_LIMIT, 64 * 1024, 'the production limit is a 64KB tail')
+  t.end()
+})
+
+// #18: the point of keeping the tail is that Codex's "tokens used" footer, printed last, still
+// parses even after a huge, noisy run has pushed everything earlier out of the buffer.
+test('a bounded transcript still yields the token footer', t => {
+  let buf = ''
+  buf = appendBoundedTail(buf, 'noise '.repeat(1000), 100) // far past the limit
+  buf = appendBoundedTail(buf, '\ntokens used\n300,448\n', 100)
+  t.ok(buf.length <= 100, 'still bounded')
+  t.equal(parseTokensUsed(buf), 300_448, 'the footer in the retained tail is parsed')
+  t.end()
+})
+
+// #9: a registry signals every live child's process group, so shutdown can stop detached runs.
+test('createChildRegistry signals every registered child and tracks size', t => {
+  const reg = createChildRegistry()
+  const a = new FakeChild()
+  const b = new FakeChild()
+  reg.add(a as unknown as ChildProcess)
+  reg.add(b as unknown as ChildProcess)
+  t.equal(reg.size(), 2, 'both children are tracked')
+  const n = reg.killAll('SIGTERM')
+  t.equal(n, 2, 'killAll reports how many it signalled')
+  t.deepEqual(a.signals, ['SIGTERM'], 'the first child was signalled')
+  t.deepEqual(b.signals, ['SIGTERM'], 'the second child was signalled')
+  reg.remove(a as unknown as ChildProcess)
+  t.equal(reg.size(), 1, 'a removed child is no longer tracked')
+  t.end()
+})
+
+// #9: a run registers its child for the life of the run and deregisters it once the child exits,
+// so a completed review does not linger in the shutdown set.
+test('runCodexReview registers its child and deregisters on exit', async t => {
+  const child = new FakeChild()
+  let outputPath = ''
+  const spawner = ((_bin: string, args: string[]) => {
+    outputPath = args[args.indexOf('--output-last-message') + 1]
+    return child
+  }) as unknown as Spawner
+  const clock = fakeClock()
+  const registry = createChildRegistry()
+
+  const run = runCodexReview({ ...runOptions(), registry }, spawner, clock.deps)
+  await settle()
+  t.equal(registry.size(), 1, 'registered while the run is in flight')
+
+  fs.writeFileSync(
+    outputPath,
+    JSON.stringify({
+      results: [{ url: 'https://github.com/o/r/pull/1', status: 'passed', summary: '', pushedTestCommits: false, reviewUrl: '' }],
+    })
+  )
+  child.emit('close', 0)
+  await run
+  t.equal(registry.size(), 0, 'deregistered once the child exits')
+  t.end()
+})
+
+// #10: when a timed-out child exits after SIGTERM, the 10s SIGKILL escalation timer must be
+// cancelled — an untracked timer would later fire SIGKILL at a pid/pgid the OS may have reused.
+test('runCodexReview cancels the SIGKILL escalation once the child exits', async t => {
+  const child = new FakeChild()
+  const spawner = (() => child) as unknown as Spawner
+  const clock = fakeClock()
+
+  const realSet = global.setTimeout
+  const realClear = global.clearTimeout
+  const created: unknown[] = []
+  const cleared: unknown[] = []
+  // Spy on the escalation timer (the only global timer this path schedules).
+  ;(global as unknown as { setTimeout: typeof setTimeout }).setTimeout = ((fn: () => void, ms?: number) => {
+    const h = realSet(fn, ms)
+    created.push(h)
+    return h
+  }) as typeof setTimeout
+  ;(global as unknown as { clearTimeout: typeof clearTimeout }).clearTimeout = ((h: Parameters<typeof clearTimeout>[0]) => {
+    cleared.push(h)
+    return realClear(h)
+  }) as typeof clearTimeout
+
+  try {
+    const run = runCodexReview(runOptions(), spawner, clock.deps).then(
+      () => undefined,
+      () => undefined
+    )
+    await settle()
+    // Spend the budget so the deadline fires: killTree sends SIGTERM, and FakeChild.kill emits
+    // 'close' synchronously, which must clear the escalation timer.
+    for (let i = 0; i < 7; i += 1) clock.tick(10_000)
+    await settle()
+    await run
+    t.equal(created.length, 1, 'exactly the SIGKILL escalation timer was scheduled')
+    t.ok(cleared.includes(created[0]), 'and it was cleared when the child exited')
+    t.deepEqual(child.signals, ['SIGTERM'], 'only SIGTERM was sent — no late SIGKILL')
+  } finally {
+    global.setTimeout = realSet
+    global.clearTimeout = realClear
+  }
   t.end()
 })
