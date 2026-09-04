@@ -13,7 +13,13 @@ import {
   type CatchUpReason,
   type ConnectionState,
 } from './catchup'
-import { createChildRegistry, runCodexReview } from './codex'
+import {
+  createChildRegistry,
+  drainChildRegistry,
+  runCodexReview,
+  SHUTDOWN_GRACE_MS,
+  SHUTDOWN_POLL_MS,
+} from './codex'
 import { loadConfig, looksLikeUserId } from './config'
 import { openCursorStore, openNullCursorStore } from './cursor'
 import { makeGitHubEffects } from './github'
@@ -510,16 +516,23 @@ async function main(): Promise<void> {
       // A second signal while already shutting down should not restart the sequence.
       if (stopping) return
       stopping = true
-      // Signal every in-flight `codex exec` process group before exiting. They are detached
-      // (their own groups, so a timeout can take a tree down), which also means the parent
-      // exiting would leave them running with nothing to report a verdict or settle a cursor —
-      // the interrupted review is meant to replay on the next start instead.
-      const killed = childRegistry.killAll('SIGTERM')
-      log('bot.stopping', { signal, codexRunsSignalled: killed })
-      // Give a signalled group a moment to exit before the parent goes, so it is not reparented
-      // to init and left lingering; skip the wait entirely when nothing was running.
-      const graceMs = killed > 0 ? 2000 : 0
-      app.stop().finally(() => setTimeout(() => process.exit(0), graceMs))
+      log('bot.stopping', { signal, codexRuns: childRegistry.size() })
+      // Stop the socket and drain the detached `codex exec` children concurrently, then exit.
+      // draining SIGTERMs every live child's process group, waits for them to exit, and escalates
+      // to SIGKILL for any that cling past the grace — so shutdown never leaves a wedged review
+      // reparented to init. An interrupted review replays on the next start, as designed.
+      const drained = drainChildRegistry(childRegistry, {
+        now: Date.now,
+        setTimer: (fn, ms) => {
+          const t = setTimeout(fn, ms)
+          t.unref?.()
+          return t
+        },
+        graceMs: SHUTDOWN_GRACE_MS,
+        pollMs: SHUTDOWN_POLL_MS,
+        log,
+      })
+      void Promise.allSettled([app.stop(), drained]).finally(() => process.exit(0))
     })
   }
 }

@@ -13,6 +13,7 @@ import {
   CodexStalledError,
   CodexTimeoutError,
   createChildRegistry,
+  drainChildRegistry,
   describeStall,
   describeTimeout,
   runCodexReview,
@@ -643,5 +644,78 @@ test('runCodexReview cancels the SIGKILL escalation once the child exits', async
     global.setTimeout = realSet
     global.clearTimeout = realClear
   }
+  t.end()
+})
+
+// --- #9 shutdown drain: SIGTERM, wait for exit, escalate to SIGKILL for stragglers ---
+
+/** A hand-driven timer: drain schedules one poll at a time, so a single pending slot suffices. */
+function timerDriver() {
+  let now = 0
+  let pending: (() => void) | undefined
+  return {
+    now: () => now,
+    setTimer: ((fn: () => void) => {
+      pending = fn
+      return 0 as unknown as ReturnType<typeof setTimeout>
+    }) as (fn: () => void, ms: number) => ReturnType<typeof setTimeout>,
+    step(ms: number) {
+      now += ms
+      const fn = pending
+      pending = undefined
+      fn?.()
+    },
+    hasPending: () => pending !== undefined,
+  }
+}
+
+// A child that exits within the grace is not escalated: SIGTERM, it deregisters, drain resolves.
+test('drainChildRegistry waits for a child that exits within the grace, without SIGKILL', async t => {
+  const d = timerDriver()
+  const reg = createChildRegistry()
+  const child = new FakeChild()
+  reg.add(child as unknown as ChildProcess)
+
+  const drained = drainChildRegistry(reg, { now: d.now, setTimer: d.setTimer, graceMs: 1_000, pollMs: 200 })
+  t.deepEqual(child.signals, ['SIGTERM'], 'every live child is SIGTERMed up front')
+  t.ok(d.hasPending(), 'a poll is scheduled while a child remains')
+
+  reg.remove(child as unknown as ChildProcess) // the child exited and deregistered
+  d.step(200) // the next poll sees an empty registry
+  await drained
+  t.deepEqual(child.signals, ['SIGTERM'], 'no SIGKILL — it exited in time')
+  t.end()
+})
+
+// A child that ignores SIGTERM past the grace is SIGKILLed before the daemon exits, so it is
+// never left reparented to init. Regression for the round-2 finding on the fixed-timer shutdown.
+test('drainChildRegistry escalates to SIGKILL for a child that clings past the grace', async t => {
+  const d = timerDriver()
+  const events: string[] = []
+  const reg = createChildRegistry()
+  const child = new FakeChild()
+  reg.add(child as unknown as ChildProcess)
+
+  const drained = drainChildRegistry(reg, {
+    now: d.now,
+    setTimer: d.setTimer,
+    graceMs: 1_000,
+    pollMs: 200,
+    log: e => events.push(e),
+  })
+  // The child never deregisters; drive polls until the 1s grace elapses.
+  for (let i = 0; i < 5; i += 1) d.step(200) // now reaches 1000 = the deadline
+  await drained
+  t.deepEqual(child.signals, ['SIGTERM', 'SIGKILL'], 'clinging child is SIGKILLed before exit')
+  t.ok(events.includes('shutdown.sigkill'), 'and the escalation is logged')
+  t.end()
+})
+
+// Nothing running: drain is a no-op that resolves immediately, so a quiet daemon exits at once.
+test('drainChildRegistry resolves immediately when nothing is registered', async t => {
+  const d = timerDriver()
+  const reg = createChildRegistry()
+  await drainChildRegistry(reg, { now: d.now, setTimer: d.setTimer, graceMs: 1_000, pollMs: 200 })
+  t.notOk(d.hasPending(), 'no poll scheduled when there is nothing to drain')
   t.end()
 })

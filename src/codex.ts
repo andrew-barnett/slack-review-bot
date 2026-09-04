@@ -112,6 +112,50 @@ export function createChildRegistry(): ChildRegistry {
   }
 }
 
+/** How long shutdown waits for SIGTERM'd children to exit before escalating to SIGKILL. */
+export const SHUTDOWN_GRACE_MS = 10_000
+/** How often shutdown re-checks whether the children have exited. */
+export const SHUTDOWN_POLL_MS = 200
+
+export interface DrainDeps {
+  now(): number
+  setTimer(fn: () => void, ms: number): ReturnType<typeof setTimeout>
+  graceMs: number
+  pollMs: number
+  log?(event: string, fields?: Record<string, unknown>): void
+}
+
+/**
+ * Stop every registered child before the daemon exits.
+ *
+ * SIGTERM the lot, then wait for them to deregister as they exit (via the run's own close
+ * handler) and SIGKILL any that cling past the grace — the same escalation the per-run kill path
+ * uses — rather than exiting on a fixed timer and leaving a wedged `codex exec` tree reparented
+ * to init. Resolves once the registry is empty or the stragglers have been SIGKILLed, so the
+ * caller can exit knowing nothing was orphaned.
+ */
+export async function drainChildRegistry(registry: ChildRegistry, deps: DrainDeps): Promise<void> {
+  const signalled = registry.killAll('SIGTERM')
+  if (signalled === 0 || registry.size() === 0) return
+  const deadline = deps.now() + deps.graceMs
+  await new Promise<void>(resolve => {
+    const poll = (): void => {
+      if (registry.size() === 0) {
+        resolve()
+        return
+      }
+      if (deps.now() >= deadline) {
+        const remaining = registry.killAll('SIGKILL')
+        deps.log?.('shutdown.sigkill', { remaining })
+        resolve()
+        return
+      }
+      deps.setTimer(poll, deps.pollMs)
+    }
+    deps.setTimer(poll, deps.pollMs)
+  })
+}
+
 /**
  * Build the Codex child's environment from an allowlist of the daemon's own.
  *
