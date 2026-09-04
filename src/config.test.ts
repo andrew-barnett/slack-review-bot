@@ -64,6 +64,19 @@ test('CATCHUP_INTERVAL_MS treats 0 as off but still rejects nonsense', t => {
   t.end()
 })
 
+// The Codex env allowlist is the mechanism; CODEX_ENV_PASSTHROUGH is the operator escape hatch.
+// It defaults to nothing (deny-by-default) and parses the same comma/whitespace list form as the
+// other list vars.
+test('CODEX_ENV_PASSTHROUGH defaults empty and parses a list', t => {
+  t.deepEqual(loadConfig({ ...credentials }).codexEnvPassthrough, [], 'nothing passed through by default')
+  t.deepEqual(
+    loadConfig({ ...credentials, CODEX_ENV_PASSTHROUGH: 'FOO, BAR BAZ' }).codexEnvPassthrough,
+    ['FOO', 'BAR', 'BAZ'],
+    'commas and whitespace separate names'
+  )
+  t.end()
+})
+
 // The Slack request timeout defaults to a finite value so a wedged call can never hang the
 // catch-up (issue #6), and is tunable for a slow network. A typo falls back rather than
 // silently disabling the timeout.

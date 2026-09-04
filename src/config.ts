@@ -1,8 +1,11 @@
 // Runtime configuration, read once at startup from the environment.
 //
-// Secrets (the two Slack tokens) are read here and nowhere else, so the set of
-// environment keys that must be scrubbed before spawning Codex is a single list —
-// see SECRET_ENV_KEYS below and stripSecretsFromEnv in codex.ts.
+// The Codex child process is built from an ALLOWLIST, not a denylist: it inherits only the
+// variables the review toolchain needs (see CODEX_ENV_ALLOWLIST below and buildChildEnv in
+// codex.ts), so a secret in the daemon's environment — cloud keys, registry tokens, the Slack
+// tokens read here — is never handed to model-directed shell commands or untrusted PR test code
+// unless it is explicitly named. CODEX_ENV_PASSTHROUGH is the escape hatch for a var a
+// particular install needs.
 
 import * as os from 'os'
 import * as path from 'path'
@@ -51,6 +54,13 @@ export interface ReviewConfig {
   disableGitSigning: boolean
   /** Directory for per-run logs and raw Codex output. Empty disables run logging. */
   runLogDir: string
+  /**
+   * Extra environment variable names to pass through to the Codex child, on top of
+   * {@link CODEX_ENV_ALLOWLIST}. The escape hatch for an install whose reviews need a variable
+   * the allowlist does not cover; keep it minimal, since anything added here reaches
+   * model-directed commands and untrusted PR code.
+   */
+  codexEnvPassthrough: string[]
 }
 
 export interface Config extends ReviewConfig {
@@ -107,8 +117,51 @@ export interface Config extends ReviewConfig {
   slackRequestTimeoutMs: number
 }
 
-/** Environment keys holding secrets. Never passed down to the Codex child process. */
-export const SECRET_ENV_KEYS = ['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN'] as const
+/**
+ * The only environment variables the Codex child process inherits, by exact name.
+ *
+ * Everything else — every secret in the daemon's environment — is dropped. The list covers what
+ * the review toolchain genuinely needs: the shell/OS basics, the on-disk config locations for
+ * Codex/gh/git/npm (so file-based auth in $HOME keeps working), and the few credentials the
+ * tools legitimately use (gh's token, a private-registry npm token). NODE_ENV is deliberately
+ * absent: inheriting `production` would make `npm ci` skip devDependencies and break test runs.
+ */
+export const CODEX_ENV_ALLOWLIST = [
+  // Shell / OS basics — the toolchain cannot run without these.
+  'PATH',
+  'HOME',
+  'USER',
+  'LOGNAME',
+  'SHELL',
+  'PWD',
+  'TMPDIR',
+  'TMP',
+  'TEMP',
+  'TERM',
+  'COLORTERM',
+  'TZ',
+  'LANG',
+  // Where Codex, gh, git and npm keep their config and credentials on disk.
+  'CODEX_HOME',
+  'XDG_CONFIG_HOME',
+  'XDG_CACHE_HOME',
+  'XDG_DATA_HOME',
+  // Credentials the review toolchain genuinely needs: gh (clone, PR review) and private npm.
+  'GH_TOKEN',
+  'GITHUB_TOKEN',
+  'GH_HOST',
+  'GH_ENTERPRISE_TOKEN',
+  'NPM_TOKEN',
+  // TLS trust for a corporate proxy, when configured.
+  'NODE_EXTRA_CA_CERTS',
+] as const
+
+/**
+ * Variable-name prefixes also allowed through, for families that carry needed config: locale
+ * (`LC_*`) and npm's own configuration (`npm_config_*`, which is how a private-registry auth
+ * token commonly reaches `npm ci`).
+ */
+export const CODEX_ENV_ALLOWLIST_PREFIXES = ['LC_', 'npm_config_'] as const
 
 function required(env: NodeJS.ProcessEnv, key: string): string {
   const value = env[key]
@@ -220,6 +273,7 @@ export function loadReviewConfig(env: NodeJS.ProcessEnv = process.env): ReviewCo
     concurrency: parsePositiveInt(env.CONCURRENCY, 1),
     disableGitSigning: parseBool(env.DISABLE_GIT_SIGNING, true),
     runLogDir: env.RUN_LOG_DIR ?? path.join(home, 'src', 'slack-review-bot', 'runs'),
+    codexEnvPassthrough: parseList(env.CODEX_ENV_PASSTHROUGH),
   }
 }
 

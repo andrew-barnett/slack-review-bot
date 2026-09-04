@@ -41,7 +41,7 @@ startup to make that a delay rather than a loss, but a closed laptop still revie
 | `src/parse-message.ts` | Slack markup -> PR list + leftover instructions. |
 | `src/prompt.ts` | Builds the Codex prompt, including the unattended policy. |
 | `src/schema.ts` | The JSON output contract and its validator. |
-| `src/codex.ts` | Spawns `codex exec`, scrubs secrets, enforces the timeout and the stall grace. |
+| `src/codex.ts` | Spawns `codex exec`, builds its env from an allowlist, enforces the timeout and the stall grace. |
 | `src/deadline.ts` | The run timeout and the stall grace as budgets of *active* time — sleep is not charged. |
 | `src/review.ts` | Ties a request to a Codex run and retries a stalled one with a longer grace. |
 | `src/job.ts` | The react -> review -> react -> thread sequence, as a pure function. |
@@ -587,6 +587,7 @@ All optional except the two tokens.
 | `CATCHUP_ON_RECONNECT` | `true` | Catch up as soon as the socket reconnects. |
 | `USAGE_REPLY_ENABLED` | `true` | Post a per-review usage line (tokens, active time, attempts) as a thread reply on every completed review. Off silences the reply; the `status` token totals are kept either way. |
 | `SLACK_REQUEST_TIMEOUT_MS` | `30000` | Per-request timeout for the bot's Slack Web API calls. The WebClient defaults to no timeout, so a wedged `conversations.history` could hang the catch-up forever; this caps it, paired with a five-minute bounded retry policy. |
+| `CODEX_ENV_PASSTHROUGH` | *(none)* | Extra environment variable names (comma/space separated) to pass through to the Codex child on top of the built-in allowlist. Keep minimal — anything added is visible to model-generated commands and untrusted PR code. |
 
 Booleans accept `1`, `true`, `yes` or `on`, case-insensitively; any other non-empty value
 is false, and an empty one falls back to the default rather than to false.
@@ -850,7 +851,13 @@ review that misbehaves in Slack reproduces from the terminal.
   a review, which is where to look when a thread says something surprising.
 - **The daemon never logs message text**, only channel, ts, and PR URLs, so a request
   quoting customer data does not end up in the log.
-- **Slack tokens are stripped from Codex's environment** before spawn. The profile sets
-  `shell_environment_policy.inherit = "all"` so the toolchain works, which means
-  everything left in the daemon's environment is visible to model-generated shell
-  commands.
+- **Codex's environment is built from an allowlist, not the daemon's whole environment.**
+  The profile sets `shell_environment_policy.inherit = "all"`, so whatever the child is
+  given is visible to model-generated shell commands and untrusted PR test code. Rather
+  than inherit everything and strip known secrets out — a denylist that misses the next new
+  credential — the child starts from nothing and receives only `CODEX_ENV_ALLOWLIST`: the
+  shell/OS basics, the on-disk config locations (so file-based `gh`/`git`/`npm` auth in
+  `$HOME` still works), and the few credentials reviews genuinely need (`GH_TOKEN` /
+  `GITHUB_TOKEN`, `NPM_TOKEN`, plus `LC_*` and `npm_config_*` by prefix). Cloud keys, the
+  Slack tokens, and every other secret are dropped. `CODEX_ENV_PASSTHROUGH` adds names an
+  install needs (keep it minimal — anything added reaches untrusted code).
