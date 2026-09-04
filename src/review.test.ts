@@ -1,5 +1,11 @@
 import test from 'tape'
-import { CodexStalledError, CodexTimeoutError, type CodexRunOutcome, type runCodexReview } from './codex'
+import {
+  CodexOutputError,
+  CodexStalledError,
+  CodexTimeoutError,
+  type CodexRunOutcome,
+  type runCodexReview,
+} from './codex'
 import { loadReviewConfig, type ReviewConfig } from './config'
 import type { ReviewRequest } from './job'
 import { makeReviewRunner } from './review'
@@ -34,6 +40,11 @@ function stall(stallMs: number | undefined): CodexStalledError {
 /** A timed-out run that spent `activeMs` of active time before it was killed. */
 function timeout(activeMs: number): CodexTimeoutError {
   return new CodexTimeoutError('timed out', { activeMs, wallMs: activeMs, frozenMs: 0 })
+}
+
+/** A run that finished but whose final message was unusable, having cost the given usage. */
+function badOutput(tokensUsed: number | undefined, activeMs: number): CodexOutputError {
+  return new CodexOutputError('malformed final message', tokensUsed, activeMs)
 }
 
 /** Defaults with a controlled stall schedule; the graces here are the shape, not real minutes. */
@@ -176,6 +187,30 @@ test('makeReviewRunner sums a stalled attempt and a later timeout', async t => {
     }
   }
   t.equal(calls, 2, 'the stall was retried, then the retry timed out')
+  t.end()
+})
+
+// A completed run with unusable output is terminal, but it cost tokens and time. The failure
+// must preserve BOTH — not report `tokens n/a` — or a run that consumed tokens vanishes from
+// the status totals. Regression for the round-2 finding where a parse failure on the success
+// path erased usage.
+test('makeReviewRunner preserves tokens and active time from a bad-output failure', async t => {
+  const fakeRun: typeof runCodexReview = async () => {
+    throw badOutput(250_000, 60_000)
+  }
+  const runner = makeReviewRunner(config([1000, 2000]), () => {}, fakeRun)
+
+  try {
+    await runner(request)
+    t.fail('bad output must reject')
+  } catch (error) {
+    t.ok(error instanceof ReviewFailedError, 'wrapped in a ReviewFailedError')
+    if (error instanceof ReviewFailedError) {
+      t.equal(error.usage.tokensUsed, 250_000, 'the token total the run printed is preserved')
+      t.equal(error.usage.activeMs, 60_000, 'the active time is preserved')
+      t.equal(error.usage.attempts, 1, 'bad output is terminal — one attempt, no retry')
+    }
+  }
   t.end()
 })
 

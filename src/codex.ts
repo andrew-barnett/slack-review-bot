@@ -284,6 +284,12 @@ export async function runCodexReview(
       )
     }
 
+    // Measure usage before anything that can throw on the final message: a run that printed a
+    // token total and spent active time still cost that much even if its output is unusable, so
+    // the bad-output failures below carry the usage rather than dropping it.
+    const tokensUsed = parseTokensUsed(transcript.join(''))
+    const activeMs = exit.activeMs
+
     // A non-zero exit with a well-formed final message still tells us what happened to
     // each PR, so the message is read first and the exit code only matters if it is
     // missing. Reversing that would throw away a complete review over a stray failure
@@ -291,17 +297,24 @@ export async function runCodexReview(
     const rawFinalMessage = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf8') : ''
     if (!rawFinalMessage.trim()) {
       const tail = transcript.join('').slice(-1500).trim()
-      throw new Error(
-        `Codex exited with code ${exit.code} and produced no final message` + (tail ? `:\n${tail}` : '')
+      throw new CodexOutputError(
+        `Codex exited with code ${exit.code} and produced no final message` + (tail ? `:\n${tail}` : ''),
+        tokensUsed,
+        activeMs
       )
     }
 
-    return {
-      result: parseReviewResult(rawFinalMessage),
-      rawFinalMessage,
-      tokensUsed: parseTokensUsed(transcript.join('')),
-      activeMs: exit.activeMs,
+    let result: ReviewRunResult
+    try {
+      result = parseReviewResult(rawFinalMessage)
+    } catch (error) {
+      // The run finished and cost tokens/time, but its final message is malformed or
+      // schema-invalid. Surface it as an output failure that still carries the usage, rather
+      // than letting the parse throw a bare error that erases what the run spent.
+      throw new CodexOutputError(error instanceof Error ? error.message : String(error), tokensUsed, activeMs)
     }
+
+    return { result, rawFinalMessage, tokensUsed, activeMs }
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true })
   }
@@ -339,6 +352,25 @@ export class CodexTimeoutError extends Error {
   ) {
     super(message)
     this.name = 'CodexTimeoutError'
+  }
+}
+
+/**
+ * Thrown when a run finished but its final message is missing, empty, or unparseable.
+ *
+ * Distinct from a spawn crash: the process ran to completion and may well have printed a token
+ * total and spent real active time — it is only the *output* that is unusable. Carrying the
+ * measured usage lets the caller report what the run cost instead of erasing it, which a bare
+ * parse error thrown from the success path would do.
+ */
+export class CodexOutputError extends Error {
+  constructor(
+    message: string,
+    readonly tokensUsed: number | undefined,
+    readonly activeMs: number
+  ) {
+    super(message)
+    this.name = 'CodexOutputError'
   }
 }
 

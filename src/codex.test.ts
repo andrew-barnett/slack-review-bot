@@ -6,6 +6,7 @@ import { PassThrough } from 'stream'
 import test from 'tape'
 import {
   buildCodexArgs,
+  CodexOutputError,
   CodexStalledError,
   CodexTimeoutError,
   describeStall,
@@ -293,6 +294,64 @@ test('runCodexReview reports undefined tokens when the run printed no total', as
   child.emit('close', 0)
   const outcome = await run
   t.equal(outcome.tokensUsed, undefined, 'no total printed means no figure, not zero')
+  t.end()
+})
+
+// A run that finished and printed a token total but wrote a malformed final message must not
+// erase what it cost: it throws CodexOutputError carrying the tokens and active time. Regression
+// for the usage gap where a parse failure on the success path dropped usage entirely.
+test('runCodexReview throws CodexOutputError with usage when the final message is malformed', async t => {
+  const child = new FakeChild()
+  let outputPath = ''
+  const spawner = ((_bin: string, args: string[]) => {
+    outputPath = args[args.indexOf('--output-last-message') + 1]
+    return child
+  }) as unknown as Spawner
+  const clock = fakeClock()
+
+  const run = runCodexReview(runOptions(), spawner, clock.deps).then(
+    () => undefined,
+    (error: unknown) => error
+  )
+  await settle()
+  clock.tick(10_000)
+  child.stdout.write('tokens used\n250,000\n')
+  await settle()
+  fs.writeFileSync(outputPath, 'this is not json') // finished, but unparseable output
+  child.emit('close', 0)
+
+  const error = await run
+  t.ok(error instanceof CodexOutputError, 'a malformed final message is a CodexOutputError')
+  if (error instanceof CodexOutputError) {
+    t.equal(error.tokensUsed, 250_000, 'the token total the run printed is carried')
+    t.equal(error.activeMs, 10_000, 'the active time the run spent is carried')
+  }
+  t.end()
+})
+
+// The same when the run wrote no final message at all: usage still rides on the error rather
+// than the run being reported as free.
+test('runCodexReview throws CodexOutputError with usage when no final message is written', async t => {
+  const child = new FakeChild()
+  const spawner = (() => child) as unknown as Spawner
+  const clock = fakeClock()
+
+  const run = runCodexReview(runOptions(), spawner, clock.deps).then(
+    () => undefined,
+    (error: unknown) => error
+  )
+  await settle()
+  clock.tick(10_000)
+  child.stdout.write('tokens used\n80,000\n')
+  await settle()
+  child.emit('close', 1) // closes without ever writing the output file
+
+  const error = await run
+  t.ok(error instanceof CodexOutputError, 'no final message is a CodexOutputError')
+  if (error instanceof CodexOutputError) {
+    t.equal(error.tokensUsed, 80_000, 'usage rides on the error even with no output file')
+    t.ok(String(error).includes('produced no final message'), String(error))
+  }
   t.end()
 })
 

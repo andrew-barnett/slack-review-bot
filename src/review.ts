@@ -2,7 +2,7 @@
 // both drive exactly the same prompt, profile, and output contract — a review that
 // reproduces from the terminal is a review you can debug.
 
-import { CodexStalledError, CodexTimeoutError, runCodexReview } from './codex'
+import { CodexOutputError, CodexStalledError, CodexTimeoutError, runCodexReview } from './codex'
 import type { ReviewConfig } from './config'
 import type { ReviewRequest } from './job'
 import type { ActiveReviews } from './progress'
@@ -117,6 +117,15 @@ export function makeReviewRunner(
         if (error instanceof CodexTimeoutError) {
           chargedActiveMs += error.snapshot.activeMs
           throw new ReviewFailedError({ activeMs: chargedActiveMs, attempts: attempt + 1 }, error)
+        }
+        // The run completed but its output is unusable. It still printed a token total and spent
+        // active time — carry both so a bad-output failure is accounted for, not reported as free.
+        if (error instanceof CodexOutputError) {
+          chargedActiveMs += error.activeMs
+          throw new ReviewFailedError(
+            { tokensUsed: error.tokensUsed, activeMs: chargedActiveMs, attempts: attempt + 1 },
+            error
+          )
         }
         // A crash has no snapshot for this attempt, but any earlier stalled attempts still ran;
         // report their accumulated time when there is some, and undefined when there is none.
