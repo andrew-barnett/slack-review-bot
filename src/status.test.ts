@@ -50,6 +50,31 @@ test('renderStatus reports queue depth and the last outcome', t => {
   t.end()
 })
 
+// The token line sums only the reviews that reported a count, and the average's denominator is
+// those same reviews — so a run that reported none (a killed run, recorded with no tokens) does
+// not drag the average toward zero. Figures are compact: total, last, and the mean per review.
+test('renderStatus reports token totals, average, and the last review only over reviews that reported', t => {
+  const stats = createStats(0)
+  stats.record('pass', 1, 5 * MINUTE, 200_000)
+  stats.record('findings', 1, 10 * MINUTE, 300_000)
+  stats.record('error', 1, 12 * MINUTE) // a killed run reported no tokens
+  const text = renderStatus(stats.snapshot(15 * MINUTE, 0, 0, config))
+  // total 500K over the two reporting reviews -> 250K average; the error is excluded from both.
+  t.ok(text.includes('*Tokens* 500K total · 300K last · 250K avg'), text)
+  t.end()
+})
+
+// Before any review has reported a count the line is omitted entirely: a "0 tokens" line on a
+// fresh daemon would read as a malfunction rather than a clean slate.
+test('renderStatus omits the token line until a review reports a count', t => {
+  const stats = createStats(0)
+  t.notOk(renderStatus(stats.snapshot(MINUTE, 0, 0, config)).includes('*Tokens*'), 'nothing recorded yet')
+  // A review that ran but reported no tokens still leaves the line off — there is no figure to show.
+  stats.record('error', 1, 2 * MINUTE)
+  t.notOk(renderStatus(stats.snapshot(3 * MINUTE, 0, 0, config)).includes('*Tokens*'), 'no count means no line')
+  t.end()
+})
+
 // Counters describe this process only. Sharing the object between snapshots would let a
 // later snapshot mutate an earlier one, which matters because snapshot() is what the
 // message handler hands to the renderer while reviews are still finishing.

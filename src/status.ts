@@ -6,6 +6,7 @@
 import type { CatchUpRecord, ConnectionState } from './catchup'
 import type { JobOutcome } from './job'
 import type { ActivitySnapshot } from './progress'
+import { formatTokensCompact } from './usage'
 
 export interface StatusConfigSummary {
   codexProfile: string
@@ -55,11 +56,18 @@ export interface StatusSnapshot {
   queued: number
   counts: Record<JobOutcome, number>
   lastReview?: { outcome: JobOutcome; finishedAt: number; prs: number }
+  /**
+   * Codex token spend for this process's life. `total` sums every review that reported a count;
+   * `reviews` is how many did (the average's denominator, and why runs that reported none — most
+   * failures — never skew it); `last` is the most recent reported count, or undefined if none yet.
+   */
+  tokens: { total: number; reviews: number; last?: number }
   config: StatusConfigSummary
 }
 
 export interface Stats {
-  record(outcome: JobOutcome, prs: number, finishedAt: number): void
+  /** `tokensUsed` is omitted for a run that reported none (e.g. a killed run); it is not counted then. */
+  record(outcome: JobOutcome, prs: number, finishedAt: number, tokensUsed?: number): void
   snapshot(
     now: number,
     active: number,
@@ -73,13 +81,30 @@ export interface Stats {
 export function createStats(startedAt: number): Stats {
   const counts: Record<JobOutcome, number> = { pass: 0, findings: 0, error: 0, skipped: 0 }
   let lastReview: StatusSnapshot['lastReview']
+  let tokenTotal = 0
+  let tokenReviews = 0
+  let lastTokens: number | undefined
   return {
-    record(outcome, prs, finishedAt) {
+    record(outcome, prs, finishedAt, tokensUsed) {
       counts[outcome] += 1
       lastReview = { outcome, finishedAt, prs }
+      if (tokensUsed !== undefined) {
+        tokenTotal += tokensUsed
+        tokenReviews += 1
+        lastTokens = tokensUsed
+      }
     },
     snapshot(now, active, queued, config) {
-      return { startedAt, now, active, queued, counts: { ...counts }, lastReview, config }
+      return {
+        startedAt,
+        now,
+        active,
+        queued,
+        counts: { ...counts },
+        lastReview,
+        tokens: { total: tokenTotal, reviews: tokenReviews, last: lastTokens },
+        config,
+      }
     },
   }
 }
@@ -219,6 +244,14 @@ export function renderStatus(
       ? '*Reviews* none since start'
       : `*Reviews* ${counts.pass} passed, ${counts.findings} with findings, ${counts.error} errored${skipped}`
   )
+  // Only once something has reported a count: before that the total, average and "last" are all
+  // meaningless, and a "0 tokens" line would read as a bug rather than a fresh start.
+  const { tokens } = snapshot
+  if (tokens.reviews > 0) {
+    const avg = Math.round(tokens.total / tokens.reviews)
+    const last = tokens.last !== undefined ? ` · ${formatTokensCompact(tokens.last)} last` : ''
+    lines.push(`*Tokens* ${formatTokensCompact(tokens.total)} total${last} · ${formatTokensCompact(avg)} avg`)
+  }
   if (connection) lines.push(renderConnection(connection, snapshot.now))
   if (catchUp) lines.push(renderCatchUp(catchUp, snapshot.now))
   if (lastReview) {

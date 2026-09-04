@@ -553,6 +553,7 @@ All optional except the two tokens.
 | `REPLAY_MAX_MESSAGES` | `1000` | Cap on history read per channel while looking for them. |
 | `CATCHUP_INTERVAL_MS` | `300000` | Catch up on a timer as well (5m). `0` disables the timer. |
 | `CATCHUP_ON_RECONNECT` | `true` | Catch up as soon as the socket reconnects. |
+| `USAGE_REPLY_ENABLED` | `true` | Post a per-review usage line (tokens, active time, attempts) as a thread reply on every completed review. Off silences the reply; the `status` token totals are kept either way. |
 
 Booleans accept `1`, `true`, `yes` or `on`, case-insensitively; any other non-empty value
 is false, and an empty one falls back to the default rather than to false.
@@ -648,11 +649,36 @@ replies in a thread:
 _last update 12s ago:_ `running jest in libs/orders`
 *Waiting* aix-ui#5460, deployments#1230
 *Reviews* 4 passed, 2 with findings, 1 errored
+*Tokens* 1.5M total · 210K last · 246K avg
 *Link* connected for 22m, 20 reconnects
 *Catch-up* 2 requeued, 1 skipped — 4m ago (reconnect) · every 5m
 *Last* findings — 2 PRs, 12m ago
 *Config* profile `review-bot`, concurrency 1, timeout 3h 0m, 1 channel, 1 ignored user
 ```
+
+The `*Tokens*` line is Codex spend for this process's life: the running total, the last
+review's count, and the mean per review. It counts only reviews that reported a total (a run
+killed before it printed one is left out of both the sum and the average, so a timeout does not
+drag the mean toward zero), and the line is omitted entirely until the first review reports —
+a fresh daemon shows no token line rather than a misleading `0`. The figures are compact; the
+exact per-review count is in each review's own usage reply, described next.
+
+### Per-review usage reply
+
+When `USAGE_REPLY_ENABLED` is on (the default), every completed review posts a short usage
+line as a thread reply — on a pass, a findings review, and a failed run alike:
+
+```
+🧮 210,482 tokens · 4m12s active · 1 attempt
+```
+
+It reports Codex's exact token total for the run, the *active* time it took (sleep discounted,
+the same clock the timeout uses), and how many attempts it ran — more than one means a stall
+was retried. A run that was killed before Codex printed a total shows `tokens n/a` with the
+time and attempts it still cost, so a failure is accounted for rather than silent. This is the
+one message a passing review posts (it otherwise only reacts `:approved_stamp:`), so setting
+`USAGE_REPLY_ENABLED=false` returns passes to being reaction-only; the `*Tokens*` totals in the
+`status` reply are kept regardless of this switch.
 
 The `*Reviewing*` and `*Waiting*` lines are the live view of what the bot is doing *right now*:
 the PRs under review, how long the run has taken (and how much of that was active rather than

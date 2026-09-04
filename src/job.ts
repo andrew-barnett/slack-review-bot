@@ -5,7 +5,7 @@
 import { protectedDeploymentsFiles, renderHumanReviewComment, renderHumanReviewThread } from './gate'
 import type { PullRequestRef } from './parse-message'
 import { renderError, renderThread, verdictFor } from './render'
-import type { ReviewRunResult } from './schema'
+import { ReviewFailedError, renderUsageLine, type ReviewOutcome, type RunUsage } from './usage'
 
 export interface MessageRef {
   channel: string
@@ -24,7 +24,13 @@ export interface JobDeps {
   addReaction(message: MessageRef, name: string): Promise<void>
   removeReaction(message: MessageRef, name: string): Promise<void>
   postThreadReply(message: MessageRef, text: string): Promise<void>
-  runReview(request: ReviewRequest): Promise<ReviewRunResult>
+  runReview(request: ReviewRequest): Promise<ReviewOutcome>
+  /**
+   * Record what a settled review cost, for the process-lifetime status totals. Called on every
+   * terminal outcome that actually ran Codex (pass, findings, error) — never for a skipped
+   * request, which ran nothing. Optional: the CLI keeps no running totals.
+   */
+  recordUsage?(usage: RunUsage): void
   /**
    * Whether the triggering message still exists. Optional: the CLI has no Slack to ask. When
    * present, the job checks it the moment a slot frees — a request can sit in the queue for
@@ -62,6 +68,12 @@ export interface JobOptions {
    * reaction and never has two.
    */
   queued?: boolean
+  /**
+   * Post a per-review usage line (tokens, active time, attempts) as a thread reply. The status
+   * totals are recorded regardless via {@link JobDeps.recordUsage}; this only controls the
+   * visible reply, so an operator can silence the channel noise without losing the counters.
+   */
+  postUsage?: boolean
 }
 
 export type JobOutcome = 'pass' | 'findings' | 'error' | 'skipped'
@@ -130,9 +142,9 @@ export async function runJob(
   const reviewRequest = toReview.length === request.prs.length ? request : { ...request, prs: toReview }
   const reviewUrls = reviewRequest.prs.map(pr => pr.url)
 
-  let result: ReviewRunResult
+  let outcome: ReviewOutcome
   try {
-    result = await deps.runReview(reviewRequest)
+    outcome = await deps.runReview(reviewRequest)
   } catch (error) {
     deps.log('review.failed', { prs: reviewUrls, error: String(error) })
     await finishAck(deps, emoji, request.message)
@@ -140,20 +152,27 @@ export async function runJob(
     await swallow(deps, 'thread.error.failed', () =>
       deps.postThreadReply(request.message, renderError(reviewUrls, error))
     )
+    // A failed run may still have cost real active time; report what the runner salvaged, or a
+    // single-attempt best guess when the error carried nothing.
+    await reportUsage(deps, options, request.message, usageForError(error))
     return 'error'
   }
 
+  const { result, usage } = outcome
   const verdict = verdictFor(result)
   deps.log('review.done', {
     prs: reviewUrls,
     verdict,
     statuses: result.results.map(r => `${r.url}=${r.status}`),
+    tokensUsed: usage.tokensUsed,
+    attempts: usage.attempts,
   })
 
   await finishAck(deps, emoji, request.message)
 
   if (verdict === 'pass') {
     await swallow(deps, 'reaction.pass.failed', () => deps.addReaction(request.message, emoji.pass))
+    await reportUsage(deps, options, request.message, usage)
     return 'pass'
   }
 
@@ -165,7 +184,31 @@ export async function runJob(
   await swallow(deps, 'thread.failed', () =>
     deps.postThreadReply(request.message, renderThread(result))
   )
+  await reportUsage(deps, options, request.message, usage)
   return 'findings'
+}
+
+/** The usage a failed run managed to report, or a single-attempt placeholder when it carried none. */
+function usageForError(error: unknown): RunUsage {
+  return error instanceof ReviewFailedError ? error.usage : { attempts: 1 }
+}
+
+/**
+ * Record a settled review's cost and, when enabled, post it as a thread reply.
+ *
+ * Recording always happens so the status totals stay accurate; the visible reply is gated on
+ * `options.postUsage`. A failure to post the line is swallowed like every other status effect —
+ * a usage note is not worth failing a review that has already reported its verdict.
+ */
+async function reportUsage(
+  deps: JobDeps,
+  options: JobOptions,
+  message: MessageRef,
+  usage: RunUsage
+): Promise<void> {
+  deps.recordUsage?.(usage)
+  if (!options.postUsage) return
+  await swallow(deps, 'thread.usage.failed', () => deps.postThreadReply(message, renderUsageLine(usage)))
 }
 
 /**

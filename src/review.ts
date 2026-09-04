@@ -7,7 +7,8 @@ import type { ReviewConfig } from './config'
 import type { ReviewRequest } from './job'
 import type { ActiveReviews } from './progress'
 import { buildPrompt } from './prompt'
-import { reconcileResults, type ReviewRunResult } from './schema'
+import { reconcileResults } from './schema'
+import { ReviewFailedError, type ReviewOutcome } from './usage'
 
 /** Stable id for a run's log file: one per triggering message. */
 export function runIdFor(request: ReviewRequest): string {
@@ -27,7 +28,7 @@ export function makeReviewRunner(
   runCodex: typeof runCodexReview = runCodexReview,
   /** Live-status registry, updated per attempt and per output chunk. The CLI passes nothing. */
   reviews?: ActiveReviews
-): (request: ReviewRequest) => Promise<ReviewRunResult> {
+): (request: ReviewRequest) => Promise<ReviewOutcome> {
   return async request => {
     const key = progressKey(request)
     const prompt = buildPrompt({
@@ -70,7 +71,14 @@ export function makeReviewRunner(
           onProgress: reviews ? (line, activeMs) => reviews.output(key, line, activeMs) : undefined,
         })
         // Never trust the run to have covered everything it was asked to cover.
-        return reconcileResults(urls, outcome.result)
+        return {
+          result: reconcileResults(urls, outcome.result),
+          usage: {
+            tokensUsed: outcome.tokensUsed,
+            activeMs: outcome.activeMs,
+            attempts: attempt + 1,
+          },
+        }
       } catch (error) {
         // Only a stall is retryable: a timeout has already spent the whole budget, and a crash
         // or bad output will not fix itself on a re-run.
@@ -87,11 +95,17 @@ export function makeReviewRunner(
             continue
           }
           log?.('review.gave-up', { runId: baseRunId, prs: urls, attempts })
-          throw new Error(
-            `Codex stalled on every attempt (${attempts}) and was killed for good — ${error.message}`
+          // The run is over, but it still spent this much active time across its attempts; carry
+          // that so the failure thread and the status totals can account for it. A killed run
+          // printed no token total, so tokensUsed stays undefined.
+          throw new ReviewFailedError(
+            { activeMs: error.snapshot.activeMs, attempts },
+            new Error(`Codex stalled on every attempt (${attempts}) and was killed for good — ${error.message}`)
           )
         }
-        throw error
+        // A timeout or a crash: no token total, and no active-time snapshot to hand back, but the
+        // attempt count is still worth reporting.
+        throw new ReviewFailedError({ attempts: attempt + 1 }, error)
       }
     }
 

@@ -1,6 +1,7 @@
 import test from 'tape'
 import { runJob, type JobDeps, type JobEmoji, type ReviewRequest } from './job'
 import type { PullRequestResult, ReviewRunResult } from './schema'
+import { ReviewFailedError, renderUsageLine, type RunUsage } from './usage'
 
 const emoji: JobEmoji = {
   ack: 'eyes',
@@ -23,24 +24,39 @@ interface Recorder {
   added: string[]
   removed: string[]
   threads: string[]
+  usages: RunUsage[]
 }
 
+/** The token/time figures a successful fake run reports, unless a test overrides them. */
+const defaultUsage: RunUsage = { tokensUsed: 210_482, activeMs: 252_000, attempts: 1 }
+
+/**
+ * A JobDeps that records the effects each test cares about.
+ *
+ * `runReview` here still returns a bare {@link ReviewRunResult} (or throws) so the existing
+ * cases read unchanged; it is wrapped into the {@link import('./usage').ReviewOutcome} the real
+ * dep returns, pairing the result with `usage`. A thrown error propagates as-is, so the failure
+ * path is exercised exactly as before.
+ */
 function recorder(
   runReview: (request: ReviewRequest) => Promise<ReviewRunResult>,
-  overrides: Partial<JobDeps> = {}
+  overrides: Partial<JobDeps> = {},
+  usage: RunUsage = defaultUsage
 ): Recorder {
   const added: string[] = []
   const removed: string[] = []
   const threads: string[] = []
+  const usages: RunUsage[] = []
   const deps: JobDeps = {
     async addReaction(_m, name) { added.push(name) },
     async removeReaction(_m, name) { removed.push(name) },
     async postThreadReply(_m, text) { threads.push(text) },
-    runReview,
+    async runReview(req) { return { result: await runReview(req), usage } },
+    recordUsage(u) { usages.push(u) },
     log() {},
     ...overrides,
   }
-  return { deps, added, removed, threads }
+  return { deps, added, removed, threads, usages }
 }
 
 function result(...results: PullRequestResult[]): ReviewRunResult {
@@ -350,5 +366,83 @@ test('runJob leaves the gate inert when no GitHub client is wired', async t => {
   const outcome = await runJob(deployRequest, emoji, rec.deps)
   t.equal(outcome, 'pass', 'reviewed, since the gate needs a GitHub client')
   t.ok(reviewed)
+  t.end()
+})
+
+// --- Usage reporting: tokens/time recorded for the status totals, and optionally shown. ---
+
+// A passing review otherwise posts no thread. With the usage reply on, it gets exactly one
+// message — the usage line — and the cost is recorded for the status totals.
+test('runJob posts a usage reply and records usage on a pass when postUsage is on', async t => {
+  const rec = recorder(async () => result(pr('passed')))
+  const outcome = await runJob(request, emoji, rec.deps, { postUsage: true })
+  t.equal(outcome, 'pass')
+  t.deepEqual(rec.added, ['eyes', 'approved_stamp'])
+  t.deepEqual(rec.threads, [renderUsageLine(defaultUsage)], 'the only thread message is the usage line')
+  t.deepEqual(rec.usages, [defaultUsage], 'usage is recorded for the status totals')
+  t.end()
+})
+
+// On a findings review the usage line is a second reply, after the findings thread — the detail
+// comes first, the cost after it.
+test('runJob appends the usage reply after the findings thread when postUsage is on', async t => {
+  const rec = recorder(async () => result(pr('findings', 'Bug.')))
+  const outcome = await runJob(request, emoji, rec.deps, { postUsage: true })
+  t.equal(outcome, 'findings')
+  t.equal(rec.threads.length, 2, 'findings thread, then usage line')
+  t.ok(rec.threads[0].includes('Bug.'), 'the findings detail is first')
+  t.equal(rec.threads[1], renderUsageLine(defaultUsage), 'the usage line is last')
+  t.deepEqual(rec.usages, [defaultUsage])
+  t.end()
+})
+
+// The status totals must stay accurate even when the reply is silenced: usage is still recorded,
+// but no extra message reaches the channel.
+test('runJob records usage but posts no usage reply when postUsage is off', async t => {
+  const rec = recorder(async () => result(pr('passed')))
+  const outcome = await runJob(request, emoji, rec.deps) // postUsage defaults off
+  t.equal(outcome, 'pass')
+  t.deepEqual(rec.threads, [], 'a clean review stays out of the thread when the reply is off')
+  t.deepEqual(rec.usages, [defaultUsage], 'but the cost is still recorded')
+  t.end()
+})
+
+// A failed run still cost time; the reply reports what the failure carried (attempts and active
+// time, no token total), and it is recorded so the status totals account for the spend.
+test('runJob reports the usage a failed run carried', async t => {
+  const failure = new ReviewFailedError(
+    { attempts: 2, activeMs: 5000 },
+    new Error('Codex stalled on every attempt (2) and was killed for good')
+  )
+  const rec = recorder(async () => { throw failure }, {}, defaultUsage)
+  const outcome = await runJob(request, emoji, rec.deps, { postUsage: true })
+  t.equal(outcome, 'error')
+  t.deepEqual(rec.added, ['eyes', 'warning'])
+  t.ok(rec.threads[0].includes('*not* reviewed'), 'the error thread comes first')
+  t.equal(rec.threads[1], renderUsageLine({ attempts: 2, activeMs: 5000 }), 'then the usage the failure carried')
+  t.ok(rec.threads[1].includes('tokens n/a'), 'a killed run shows no token total')
+  t.deepEqual(rec.usages, [{ attempts: 2, activeMs: 5000 }], 'the failure usage is recorded')
+  t.end()
+})
+
+// A crash that carried no usage (a plain Error, not a ReviewFailedError) still gets an honest
+// one-attempt usage line rather than nothing — the failure path always reports something.
+test('runJob falls back to a single-attempt usage when the failure carried none', async t => {
+  const rec = recorder(async () => { throw new Error('codex crashed') })
+  const outcome = await runJob(request, emoji, rec.deps, { postUsage: true })
+  t.equal(outcome, 'error')
+  t.deepEqual(rec.usages, [{ attempts: 1 }], 'a bare crash is recorded as a single attempt, no tokens')
+  t.equal(rec.threads[1], renderUsageLine({ attempts: 1 }), 'and the reply says as much')
+  t.end()
+})
+
+// A skipped request ran no review, so there is nothing to charge: no usage is recorded and no
+// usage line is posted, even with the reply enabled.
+test('runJob reports no usage for a skipped request', async t => {
+  const rec = recorder(async () => result(pr('passed')), { async messageExists() { return false } })
+  const outcome = await runJob(request, emoji, rec.deps, { postUsage: true })
+  t.equal(outcome, 'skipped')
+  t.deepEqual(rec.usages, [], 'nothing ran, so nothing is recorded')
+  t.deepEqual(rec.threads, [], 'and no usage line is posted')
   t.end()
 })

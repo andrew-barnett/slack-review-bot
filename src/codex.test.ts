@@ -233,6 +233,62 @@ test('runCodexReview returns the parsed final message and stops the deadline on 
   t.end()
 })
 
+// The run has to surface what it cost: Codex's "tokens used" total, parsed out of the
+// transcript, and the active time the deadline charged. This is what the status totals and the
+// per-review thread line are built from.
+test('runCodexReview reports the token total and active time on a completed run', async t => {
+  const child = new FakeChild()
+  let outputPath = ''
+  const spawner = ((_bin: string, args: string[]) => {
+    outputPath = args[args.indexOf('--output-last-message') + 1]
+    return child
+  }) as unknown as Spawner
+  const clock = fakeClock()
+
+  const run = runCodexReview(runOptions(), spawner, clock.deps)
+  await settle()
+  clock.tick(10_000) // one heartbeat of active time
+  // Codex prints its running total to the transcript; the two-line form is what `codex exec` emits.
+  child.stdout.write('reviewing...\ntokens used\n300,448\n')
+  await settle()
+  fs.writeFileSync(
+    outputPath,
+    JSON.stringify({
+      results: [{ url: 'https://github.com/o/r/pull/1', status: 'passed', summary: '', pushedTestCommits: false, reviewUrl: '' }],
+    })
+  )
+  child.emit('close', 0)
+  const outcome = await run
+  t.equal(outcome.tokensUsed, 300_448, 'the token total is parsed from the transcript')
+  t.equal(outcome.activeMs, 10_000, 'the active time charged to the run is reported')
+  t.end()
+})
+
+// A run that printed no total (the normal shape of a killed run, but also possible on a clean
+// exit) reports undefined tokens rather than a misleading zero.
+test('runCodexReview reports undefined tokens when the run printed no total', async t => {
+  const child = new FakeChild()
+  let outputPath = ''
+  const spawner = ((_bin: string, args: string[]) => {
+    outputPath = args[args.indexOf('--output-last-message') + 1]
+    return child
+  }) as unknown as Spawner
+  const clock = fakeClock()
+
+  const run = runCodexReview(runOptions(), spawner, clock.deps)
+  await settle()
+  fs.writeFileSync(
+    outputPath,
+    JSON.stringify({
+      results: [{ url: 'https://github.com/o/r/pull/1', status: 'passed', summary: '', pushedTestCommits: false, reviewUrl: '' }],
+    })
+  )
+  child.emit('close', 0)
+  const outcome = await run
+  t.equal(outcome.tokensUsed, undefined, 'no total printed means no figure, not zero')
+  t.end()
+})
+
 // A run that has printed nothing for its whole grace is wedged, not slow. It must be killed
 // and rejected with the typed error the runner retries on — and, like the timeout, measured in
 // active time so a closed lid is never mistaken for silence.

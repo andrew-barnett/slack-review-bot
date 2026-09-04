@@ -7,6 +7,7 @@ import * as path from 'path'
 import { SECRET_ENV_KEYS } from './config'
 import { startActiveDeadline, type DeadlineDeps, type DeadlineSnapshot } from './deadline'
 import { REVIEW_OUTPUT_SCHEMA, parseReviewResult, type ReviewRunResult } from './schema'
+import { parseTokensUsed } from './usage'
 
 export interface CodexRunOptions {
   prompt: string
@@ -48,6 +49,10 @@ export interface CodexRunOutcome {
   result: ReviewRunResult
   /** Raw final message, kept for the run log. */
   rawFinalMessage: string
+  /** Codex's reported "tokens used" total, or undefined when it printed none. */
+  tokensUsed?: number
+  /** Active time charged to the run, in ms (suspension discounted); 0 for a run too short to tick. */
+  activeMs: number
 }
 
 /** Injection seam so the tests can drive the process lifecycle without running Codex. */
@@ -175,6 +180,7 @@ export async function runCodexReview(
       code: number | null
       timedOut?: DeadlineSnapshot
       stalled?: DeadlineSnapshot
+      activeMs: number
     }>((resolve, reject) => {
       const child = spawner(options.codexBin, args, {
         cwd: options.workspaceRoot,
@@ -257,8 +263,11 @@ export async function runCodexReview(
         reject(error)
       })
       child.on('close', code => {
+        // Snapshot before stop so the active-time figure reflects the whole run; snapshot()
+        // keeps working after stop, but reading it here keeps the intent obvious.
+        const activeMs = deadline.snapshot().activeMs
         deadline.stop()
-        resolve({ code, timedOut, stalled })
+        resolve({ code, timedOut, stalled, activeMs })
       })
     })
 
@@ -285,7 +294,12 @@ export async function runCodexReview(
       )
     }
 
-    return { result: parseReviewResult(rawFinalMessage), rawFinalMessage }
+    return {
+      result: parseReviewResult(rawFinalMessage),
+      rawFinalMessage,
+      tokensUsed: parseTokensUsed(transcript.join('')),
+      activeMs: exit.activeMs,
+    }
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true })
   }
