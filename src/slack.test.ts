@@ -1,6 +1,13 @@
-import type { WebClient } from '@slack/web-api'
+import { retryPolicies, type WebClient } from '@slack/web-api'
 import test from 'tape'
-import { decideTrigger, isHelpRequest, isStatusRequest, makeSlackEffects, type SlackMessageEvent } from './slack'
+import {
+  decideTrigger,
+  isHelpRequest,
+  isStatusRequest,
+  makeSlackEffects,
+  slackClientOptions,
+  type SlackMessageEvent,
+} from './slack'
 
 const base: SlackMessageEvent = {
   type: 'message',
@@ -289,5 +296,28 @@ test('isStatusRequest does not guess an ambiguous word as status', t => {
 // A word nothing like a command is still not a status request (it becomes a help fallback).
 test('isStatusRequest ignores a mention with no command-like word', t => {
   t.equal(isStatusRequest({ ...statusBase, text: '<@U0BOT> deploy please' }, statusOptions), false)
+  t.end()
+})
+
+// The fix for issue #6: the bot's WebClient must carry a finite request timeout so a wedged
+// Slack call (the catch-up's conversations.history) cannot hang forever.
+test('slackClientOptions sets the configured finite timeout', t => {
+  const opts = slackClientOptions(30_000)
+  t.equal(opts.timeout, 30_000, 'the per-request timeout comes from config')
+  t.ok(Number.isFinite(opts.timeout) && (opts.timeout as number) > 0, 'and is finite and positive')
+  t.end()
+})
+
+// The retry policy must be bounded, not the ~30-minute default — otherwise a stuck call still
+// spans half an hour of retries. Five-in-five-minutes bounds it; the catch-up timer is the
+// backstop for a longer outage.
+test('slackClientOptions bounds retries to the five-minute policy', t => {
+  const opts = slackClientOptions(30_000)
+  t.equal(opts.retryConfig, retryPolicies.fiveRetriesInFiveMinutes, 'bounded retry policy')
+  t.notEqual(
+    opts.retryConfig,
+    retryPolicies.tenRetriesInAboutThirtyMinutes,
+    'not the ~30-minute default that lets a call retry for half an hour'
+  )
   t.end()
 })

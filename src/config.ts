@@ -99,6 +99,12 @@ export interface Config extends ReviewConfig {
    * command reports, which are always kept.
    */
   usageReplyEnabled: boolean
+  /**
+   * Per-request timeout, in ms, for the bot's Slack Web API calls. The WebClient defaults to no
+   * timeout, so a wedged call (notably the catch-up's `conversations.history`) can hang forever;
+   * a finite value caps it. Paired with a bounded retry policy in `slackClientOptions`.
+   */
+  slackRequestTimeoutMs: number
 }
 
 /** Environment keys holding secrets. Never passed down to the Codex child process. */
@@ -243,5 +249,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     catchUpIntervalMs: parseNonNegativeInt(env.CATCHUP_INTERVAL_MS, 5 * 60 * 1000),
     catchUpOnReconnect: parseBool(env.CATCHUP_ON_RECONNECT, true),
     usageReplyEnabled: parseBool(env.USAGE_REPLY_ENABLED, true),
+    // 30s: a healthy conversations.history / postMessage / reactions call returns in well under
+    // a second, so this only ever fires on a genuinely stuck request.
+    slackRequestTimeoutMs: parsePositiveInt(env.SLACK_REQUEST_TIMEOUT_MS, 30_000),
   }
 }

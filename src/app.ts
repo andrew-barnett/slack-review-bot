@@ -2,7 +2,7 @@
 // carrying GitHub PR URLs, and runs the Codex $review-pr skill against them.
 
 import { App, LogLevel, SocketModeReceiver } from '@slack/bolt'
-import type { WebClient } from '@slack/web-api'
+import { WebClient } from '@slack/web-api'
 import {
   CatchUpRunner,
   createConnectionTracker,
@@ -23,7 +23,14 @@ import { createActiveReviews } from './progress'
 import { TaskQueue } from './queue'
 import { fetchHistorySince, replayMissed, type ReplaySummary } from './replay'
 import { makeReviewRunner } from './review'
-import { decideTrigger, isHelpRequest, isStatusRequest, makeSlackEffects, type SlackMessageEvent } from './slack'
+import {
+  decideTrigger,
+  isHelpRequest,
+  isStatusRequest,
+  makeSlackEffects,
+  slackClientOptions,
+  type SlackMessageEvent,
+} from './slack'
 import { createStats, renderStatus } from './status'
 import type { RunUsage } from './usage'
 
@@ -78,6 +85,13 @@ async function main(): Promise<void> {
     logLevel: LogLevel.INFO,
   })
 
+  // Every Web API call the bot makes goes through this client, not Bolt's `app.client`. Bolt's
+  // App only lets `slackApiUrl` through its clientOptions, so a request timeout — the fix for a
+  // catch-up that hangs forever on a wedged conversations.history (issue #6) — cannot be set on
+  // it. A dedicated WebClient on the same bot token can carry a finite timeout and a bounded
+  // retry policy, so no Slack call the daemon makes can hang indefinitely.
+  const slackClient = new WebClient(config.botToken, slackClientOptions(config.slackRequestTimeoutMs))
+
   // Validate the bot token before connecting. Socket Mode only proves the app-level
   // token: a bad or mismatched xoxb- would let the daemon receive messages and start
   // reviews it can never react to or report on, which looks exactly like being idle.
@@ -85,7 +99,7 @@ async function main(): Promise<void> {
   // the log, rather than the bot appearing to run while doing nothing visible.
   let botUserId: string
   try {
-    const auth = await app.client.auth.test({ token: config.botToken })
+    const auth = await slackClient.auth.test()
     botUserId = String(auth.user_id)
     log('auth.ok', { user: auth.user, userId: botUserId, team: auth.team })
   } catch (error) {
@@ -376,8 +390,8 @@ async function main(): Promise<void> {
     log('catchup.start', { reason, channels: channels.length })
     return replayMissed(channels, {
       fetch: (channel, oldest, maxMessages) =>
-        fetchHistorySince(app.client, channel, oldest, maxMessages),
-      dispatch: message => dispatch(message, app.client, 'replay'),
+        fetchHistorySince(slackClient, channel, oldest, maxMessages),
+      dispatch: message => dispatch(message, slackClient, 'replay'),
       cursors,
       isRequest,
       limits: {
@@ -407,9 +421,11 @@ async function main(): Promise<void> {
   receiver.client.on('disconnected', () => socket.onDisconnected())
   receiver.client.on('reconnecting', () => socket.onReconnecting())
 
-  app.event('message', async ({ event, client }) => {
+  app.event('message', async ({ event }) => {
     await liveGate.wait()
-    await dispatch(event as SlackMessageEvent, client, 'live')
+    // Route through the timeout-bounded slackClient rather than the event's unbounded app.client,
+    // so a wedged reaction or thread post cannot hang a live dispatch either.
+    await dispatch(event as SlackMessageEvent, slackClient, 'live')
   })
 
   // An ignore entry that is not a user ID can never match an event, and this daemon's
@@ -434,6 +450,7 @@ async function main(): Promise<void> {
     cursorFile: config.cursorFile || '<disabled>',
     catchUpIntervalMs: catchUpEnabled ? config.catchUpIntervalMs : 0,
     catchUpOnReconnect: catchUpEnabled && config.catchUpOnReconnect,
+    slackRequestTimeoutMs: config.slackRequestTimeoutMs,
   })
 
   // After app.start(), not before: Slack does not redeliver events missed while the socket
