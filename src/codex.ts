@@ -33,6 +33,11 @@ export interface CodexRunOptions {
   disableGitSigning: boolean
   /** Extra env var names to pass to the Codex child on top of the built-in allowlist. */
   envPassthrough?: string[]
+  /**
+   * Registry the spawned child registers into for its lifetime, so a daemon shutdown can signal
+   * every in-flight `codex exec` process group instead of orphaning it. Optional: the CLI has none.
+   */
+  registry?: ChildRegistry
   /** Directory to write the raw stdout/stderr transcript to. Empty disables it. */
   logDir?: string
   /** Identifier used to name the log files. */
@@ -59,6 +64,97 @@ export interface CodexRunOutcome {
 
 /** Injection seam so the tests can drive the process lifecycle without running Codex. */
 export type Spawner = typeof spawn
+
+/**
+ * The most transcript retained in memory. The whole transcript is streamed to the run log on
+ * disk; in memory only a bounded tail is kept, which is all the token footer and the error-tail
+ * ever read. Without this a long, noisy review grows an unbounded buffer for the life of the run.
+ */
+export const TRANSCRIPT_TAIL_LIMIT = 64 * 1024
+
+/** Append to a rolling buffer, keeping only the last `limit` characters. */
+export function appendBoundedTail(buffer: string, text: string, limit: number): string {
+  const combined = buffer + text
+  return combined.length > limit ? combined.slice(combined.length - limit) : combined
+}
+
+/**
+ * A set of live `codex exec` children, so a shutdown can signal them all.
+ *
+ * The children are spawned `detached`, in their own process groups, precisely so a timeout can
+ * take a whole tree down — but that also means the parent exiting does not stop them. On
+ * shutdown the daemon signals every registered child's group through here, rather than leaving
+ * a review running with nothing left to report its verdict or settle its cursor.
+ */
+export interface ChildRegistry {
+  add(child: ChildProcess): void
+  remove(child: ChildProcess): void
+  /** Signal every registered child's process group; returns how many were signalled. */
+  killAll(signal: NodeJS.Signals): number
+  size(): number
+}
+
+export function createChildRegistry(): ChildRegistry {
+  const children = new Set<ChildProcess>()
+  return {
+    add: child => {
+      children.add(child)
+    },
+    remove: child => {
+      children.delete(child)
+    },
+    killAll: signal => {
+      const count = children.size
+      for (const child of children) killProcessTree(child, signal)
+      return count
+    },
+    size: () => children.size,
+  }
+}
+
+/** How long shutdown waits for SIGTERM'd children to exit before escalating to SIGKILL. */
+export const SHUTDOWN_GRACE_MS = 10_000
+/** How often shutdown re-checks whether the children have exited. */
+export const SHUTDOWN_POLL_MS = 200
+
+export interface DrainDeps {
+  now(): number
+  setTimer(fn: () => void, ms: number): ReturnType<typeof setTimeout>
+  graceMs: number
+  pollMs: number
+  log?(event: string, fields?: Record<string, unknown>): void
+}
+
+/**
+ * Stop every registered child before the daemon exits.
+ *
+ * SIGTERM the lot, then wait for them to deregister as they exit (via the run's own close
+ * handler) and SIGKILL any that cling past the grace — the same escalation the per-run kill path
+ * uses — rather than exiting on a fixed timer and leaving a wedged `codex exec` tree reparented
+ * to init. Resolves once the registry is empty or the stragglers have been SIGKILLed, so the
+ * caller can exit knowing nothing was orphaned.
+ */
+export async function drainChildRegistry(registry: ChildRegistry, deps: DrainDeps): Promise<void> {
+  const signalled = registry.killAll('SIGTERM')
+  if (signalled === 0 || registry.size() === 0) return
+  const deadline = deps.now() + deps.graceMs
+  await new Promise<void>(resolve => {
+    const poll = (): void => {
+      if (registry.size() === 0) {
+        resolve()
+        return
+      }
+      if (deps.now() >= deadline) {
+        const remaining = registry.killAll('SIGKILL')
+        deps.log?.('shutdown.sigkill', { remaining })
+        resolve()
+        return
+      }
+      deps.setTimer(poll, deps.pollMs)
+    }
+    deps.setTimer(poll, deps.pollMs)
+  })
+}
 
 /**
  * Build the Codex child's environment from an allowlist of the daemon's own.
@@ -186,7 +282,8 @@ export async function runCodexReview(
 
   fs.mkdirSync(options.worktreeRoot, { recursive: true })
 
-  const transcript: string[] = []
+  // A bounded in-memory tail; the full transcript goes to the run log via appendLog.
+  let transcript = ''
   const appendLog = makeLogAppender(options.logDir, options.runId)
 
   try {
@@ -204,11 +301,29 @@ export async function runCodexReview(
         stdio: ['ignore', 'pipe', 'pipe'],
       })
 
+      // Registered for the life of the run so a shutdown can signal this process group.
+      options.registry?.add(child)
+
       // SIGTERM the whole tree, then escalate to SIGKILL if it clings on — a wedged npm or
-      // git can ignore the first signal. Shared by the timeout and the stall path.
+      // git can ignore the first signal. Shared by the timeout and the stall path. The
+      // escalation timer is tracked and cancelled the instant the child exits: an untracked
+      // timer fires SIGKILL ~10s later at a pid/pgid the OS may have reused by then.
+      let killTimer: ReturnType<typeof setTimeout> | undefined
       const killTree = (): void => {
+        // Schedule the escalation BEFORE sending SIGTERM: a child that exits synchronously in
+        // response would otherwise run cleanupChild() before killTimer is assigned, leaving the
+        // timer to fire SIGKILL later at a possibly-reused pgid.
+        killTimer = setTimeout(() => killProcessTree(child, 'SIGKILL'), 10_000)
+        killTimer.unref()
         killProcessTree(child, 'SIGTERM')
-        setTimeout(() => killProcessTree(child, 'SIGKILL'), 10_000).unref()
+      }
+      // Called once the child is gone: cancel a pending SIGKILL and drop it from the registry.
+      const cleanupChild = (): void => {
+        if (killTimer) {
+          clearTimeout(killTimer)
+          killTimer = undefined
+        }
+        options.registry?.remove(child)
       }
 
       // Not a plain setTimeout: that counts wall-clock time, and a run in flight when the lid
@@ -255,7 +370,7 @@ export async function runCodexReview(
 
       const capture = (chunk: Buffer) => {
         const text = chunk.toString('utf8')
-        transcript.push(text)
+        transcript = appendBoundedTail(transcript, text, TRANSCRIPT_TAIL_LIMIT)
         appendLog(text)
         // Any output is progress: reset the stall clock so only genuine silence trips it.
         deadline.markActivity()
@@ -273,10 +388,13 @@ export async function runCodexReview(
       child.stderr?.on('data', capture)
 
       child.on('error', error => {
+        cleanupChild()
         deadline.stop()
         reject(error)
       })
       child.on('close', code => {
+        // Cancel any pending SIGKILL and deregister now that the child is gone.
+        cleanupChild()
         // Snapshot before stop so the active-time figure reflects the whole run; snapshot()
         // keeps working after stop, but reading it here keeps the intent obvious.
         const activeMs = deadline.snapshot().activeMs
@@ -301,7 +419,7 @@ export async function runCodexReview(
     // Measure usage before anything that can throw on the final message: a run that printed a
     // token total and spent active time still cost that much even if its output is unusable, so
     // the bad-output failures below carry the usage rather than dropping it.
-    const tokensUsed = parseTokensUsed(transcript.join(''))
+    const tokensUsed = parseTokensUsed(transcript)
     const activeMs = exit.activeMs
 
     // A non-zero exit with a well-formed final message still tells us what happened to
@@ -310,7 +428,7 @@ export async function runCodexReview(
     // in Codex's own teardown.
     const rawFinalMessage = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf8') : ''
     if (!rawFinalMessage.trim()) {
-      const tail = transcript.join('').slice(-1500).trim()
+      const tail = transcript.slice(-1500).trim()
       throw new CodexOutputError(
         `Codex exited with code ${exit.code} and produced no final message` + (tail ? `:\n${tail}` : ''),
         tokensUsed,

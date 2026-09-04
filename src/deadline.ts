@@ -101,12 +101,9 @@ export function startActiveDeadline(
     handle = undefined
   }
 
-  const markActivity = (): void => {
-    lastActivityMs = activeMs
-  }
-
-  const tick = (): void => {
-    if (handle === undefined) return
+  // Bring active time up to now(), discounting any stretch the process was suspended. Shared by
+  // the heartbeat and by markActivity so both measure against the same clock.
+  const advance = (): void => {
     const at = deps.now()
     const elapsed = at - last
     last = at
@@ -119,6 +116,23 @@ export function startActiveDeadline(
     } else {
       activeMs += elapsed
     }
+  }
+
+  const markActivity = (): void => {
+    // Same stopped-guard as tick(): once stopped, the deadline must not mutate its accounting or
+    // fire a callback (advance() can invoke onFreeze). Output can still arrive between a kill and
+    // the child's close, and that must not resurrect a stopped deadline.
+    if (handle === undefined) return
+    // Advance to now() before recording, so "last output" is the active time through this
+    // moment — not the previous heartbeat's, which could be up to a whole interval stale and
+    // would make the next ticks count silence that started before the output actually arrived.
+    advance()
+    lastActivityMs = activeMs
+  }
+
+  const tick = (): void => {
+    if (handle === undefined) return
+    advance()
     // The budget is the hard cap and takes precedence: a run that both stalled and ran out in
     // the same tick has, either way, ended — and a timeout is the more accurate description of
     // a run that used all its time.

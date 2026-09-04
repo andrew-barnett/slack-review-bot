@@ -184,6 +184,73 @@ test('markActivity resets the stall clock so a talkative run is never flagged', 
   t.end()
 })
 
+// Issue #8: output that arrives between heartbeats must reset the grace from the moment it
+// arrived, not from the previous tick. markActivity now advances active time to now() before
+// recording, so a run that spoke mid-interval gets the full grace from then — the old code
+// recorded the previous tick's activeMs and would flag the stall a whole interval early.
+test('markActivity credits silence from the output moment, not the previous tick', t => {
+  let now = 1_000_000
+  let cb: (() => void) | undefined
+  const stalls: number[] = []
+  const deadline = startActiveDeadline(10 * 60_000, () => t.fail('no expiry'), {
+    now: () => now,
+    setInterval: (fn: () => void) => {
+      cb = fn
+      return 1 as unknown as ReturnType<typeof setInterval>
+    },
+    clearInterval: () => {},
+    checkMs: CHECK,
+    toleranceMs: TOLERANCE,
+    stallMs: STALL, // 40s = four CHECK intervals
+    onStall: idle => stalls.push(idle),
+  })
+
+  // Output arrives 9s into the first interval, before any heartbeat has fired.
+  now += CHECK - 1_000
+  deadline.markActivity() // fix: active time advances to 9s and that is recorded as last output
+
+  // Active time at the output was 9s. The grace (40s) is measured from there, so the stall
+  // must land when active time reaches 49s — the fourth silent 10s tick (19s, 29s, 39s, 49s).
+  for (let i = 0; i < 3; i += 1) {
+    now += CHECK
+    cb!()
+  }
+  t.equal(stalls.length, 0, '30s of silence since the 9s output is under the 40s grace')
+
+  now += CHECK
+  cb!() // active time now 49s: 40s since the output
+  t.equal(stalls.length, 1, 'flagged once the grace elapses from the actual last output')
+  t.end()
+})
+
+// stop() promises neither callback fires afterward. markActivity must honour that too: output
+// can arrive between a kill and the child's close, and it must not resurrect a stopped deadline
+// by advancing its accounting or firing onFreeze on the long gap. (Regression for round-1 of #8.)
+test('markActivity after stop does not advance accounting or fire onFreeze', t => {
+  const clock = fakeClock()
+  const freezes: number[] = []
+  const deadline = startActiveDeadline(60_000, () => t.fail('no expiry after stop'), {
+    ...clock.deps,
+    checkMs: CHECK,
+    toleranceMs: TOLERANCE,
+    stallMs: STALL,
+    onStall: () => t.fail('no stall after stop'),
+    onFreeze: frozenForMs => freezes.push(frozenForMs),
+  })
+
+  clock.tick(CHECK)
+  const activeBefore = deadline.snapshot().activeMs
+  deadline.stop()
+
+  // A long gap (the post-stop tick no-ops) then late output arrives.
+  clock.tick(4 * 60 * 60 * 1000)
+  deadline.markActivity()
+
+  t.deepEqual(freezes, [], 'markActivity after stop fires no onFreeze')
+  t.equal(deadline.snapshot().activeMs, activeBefore, 'and does not advance the stopped accounting')
+  t.end()
+})
+
 // The regression this shares with the budget: a machine asleep is not a run gone silent. A
 // four-hour suspension is charged as one interval of idle, so it cannot trip the grace.
 test('startActiveDeadline does not count a suspension as idle toward a stall', t => {

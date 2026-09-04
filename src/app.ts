@@ -13,7 +13,13 @@ import {
   type CatchUpReason,
   type ConnectionState,
 } from './catchup'
-import { runCodexReview } from './codex'
+import {
+  createChildRegistry,
+  drainChildRegistry,
+  runCodexReview,
+  SHUTDOWN_GRACE_MS,
+  SHUTDOWN_POLL_MS,
+} from './codex'
 import { loadConfig, looksLikeUserId } from './config'
 import { openCursorStore, openNullCursorStore } from './cursor'
 import { makeGitHubEffects } from './github'
@@ -115,7 +121,9 @@ async function main(): Promise<void> {
   const reviews = createActiveReviews()
   // Number of attempts a stalled run gets, mirrored into the status so a retry is visible.
   const reviewAttempts = config.stallBackoffMs.length > 0 ? config.stallBackoffMs.length : 1
-  const runReview = makeReviewRunner(config, log, runCodexReview, reviews)
+  // Tracks live `codex exec` children so shutdown can signal them instead of orphaning them.
+  const childRegistry = createChildRegistry()
+  const runReview = makeReviewRunner(config, log, runCodexReview, reviews, childRegistry)
   // How far each channel has been processed, on disk. This is what makes a restart able to
   // pick up messages posted while the socket was down — Slack never redelivers them.
   const cursors = config.cursorFile
@@ -502,10 +510,29 @@ async function main(): Promise<void> {
   })
   setInterval(() => freeze.check(), FREEZE_CHECK_MS)
 
+  let stopping = false
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     process.on(signal, () => {
-      log('bot.stopping', { signal })
-      app.stop().finally(() => process.exit(0))
+      // A second signal while already shutting down should not restart the sequence.
+      if (stopping) return
+      stopping = true
+      log('bot.stopping', { signal, codexRuns: childRegistry.size() })
+      // Stop the socket and drain the detached `codex exec` children concurrently, then exit.
+      // draining SIGTERMs every live child's process group, waits for them to exit, and escalates
+      // to SIGKILL for any that cling past the grace — so shutdown never leaves a wedged review
+      // reparented to init. An interrupted review replays on the next start, as designed.
+      const drained = drainChildRegistry(childRegistry, {
+        now: Date.now,
+        setTimer: (fn, ms) => {
+          const t = setTimeout(fn, ms)
+          t.unref?.()
+          return t
+        },
+        graceMs: SHUTDOWN_GRACE_MS,
+        pollMs: SHUTDOWN_POLL_MS,
+        log,
+      })
+      void Promise.allSettled([app.stop(), drained]).finally(() => process.exit(0))
     })
   }
 }
