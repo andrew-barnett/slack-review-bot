@@ -48,6 +48,30 @@ test('parseReviewResult throws rather than degrading to a pass', t => {
   t.end()
 })
 
+// #14: every field is `required` in the output schema, so a payload missing one did not match
+// the contract (a truncated/malformed result). The parser must reject it, not default it —
+// coercing a missing `pushedTestCommits` to false could claim no test commits when the real
+// result was lost. An empty string for summary/reviewUrl is fine; a missing key is not.
+test('parseReviewResult enforces the required fields instead of defaulting them', t => {
+  const base = '{"results":[{"url":"u","status":"passed"'
+  t.throws(() => parseReviewResult(`${base}}]}`), /summary is missing/, 'no summary')
+  t.throws(() => parseReviewResult(`${base},"summary":""}]}`), /pushedTestCommits is missing/, 'no pushedTestCommits')
+  t.throws(
+    () => parseReviewResult(`${base},"summary":"","pushedTestCommits":false}]}`),
+    /reviewUrl is missing/,
+    'no reviewUrl'
+  )
+  t.throws(
+    () => parseReviewResult(`${base},"summary":"","pushedTestCommits":"no","reviewUrl":""}]}`),
+    /pushedTestCommits is missing or not a boolean/,
+    'wrong type is rejected too'
+  )
+  // A complete entry with empty summary/reviewUrl is valid — the schema permits those.
+  const ok = parseReviewResult(`${base},"summary":"","pushedTestCommits":false,"reviewUrl":""}]}`)
+  t.equal(ok.results[0].pushedTestCommits, false, 'a complete entry still parses')
+  t.end()
+})
+
 // The dangerous case: Codex reviews two PRs, reports only one, and that one passed.
 // Without reconciliation the run reads as all-passed and the message gets
 // :approved_stamp: — claiming a clean review of a PR that was never looked at.

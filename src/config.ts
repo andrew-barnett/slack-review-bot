@@ -201,11 +201,17 @@ export function parseList(raw: string | undefined): string[] {
 
 /**
  * Parse a list of positive integers (milliseconds), keeping only the well-formed ones and
- * capping each at `max`. Empty or all-invalid input falls back to `fallback`, so a mistyped
- * override degrades to the built-in schedule rather than silently disabling stall handling.
+ * capping each at `max`.
+ *
+ * Three cases, deliberately distinct: `undefined` (the variable is unset) uses `fallback`; an
+ * explicitly **empty** value (`STALL_BACKOFF_MS=`) returns `[]`, which is how the operator turns
+ * stall detection and retries OFF — the README documents exactly that; and a non-empty but
+ * all-invalid value (a typo like `abc`) falls back to `fallback`, so a mistake degrades to the
+ * built-in schedule rather than silently disabling stall handling.
  */
 export function parseMsList(raw: string | undefined, fallback: number[], max: number): number[] {
   if (raw === undefined) return fallback.map(ms => Math.min(ms, max))
+  if (raw.trim() === '') return [] // explicitly empty: disabled, not defaulted
   const parsed = parseList(raw)
     .map(Number)
     .filter(n => Number.isFinite(n) && n > 0)
