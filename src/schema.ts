@@ -114,13 +114,23 @@ function validateResult(entry: unknown, index: number): PullRequestResult {
   if (typeof item.status !== 'string' || !STATUSES.has(item.status)) {
     throw new Error(`${where}.status is not one of passed/findings/blocked (got ${JSON.stringify(item.status)})`)
   }
+  // Every field is `required` in REVIEW_OUTPUT_SCHEMA, so a missing one means the output did not
+  // match the contract — a truncated or malformed result. Enforce the required fields rather than
+  // defaulting them: coercing a missing `pushedTestCommits` to false, say, could quietly claim no
+  // test commits were pushed when the run's real result was lost. (An empty `summary`/`reviewUrl`
+  // string is allowed — the schema permits those — but the key must be present and the right type.)
+  if (typeof item.summary !== 'string') throw new Error(`${where}.summary is missing or not a string`)
+  if (typeof item.pushedTestCommits !== 'boolean') {
+    throw new Error(`${where}.pushedTestCommits is missing or not a boolean`)
+  }
+  if (typeof item.reviewUrl !== 'string') throw new Error(`${where}.reviewUrl is missing or not a string`)
 
   return {
     url: item.url,
     status: item.status as ReviewStatus,
-    summary: typeof item.summary === 'string' ? item.summary.trim() : '',
-    pushedTestCommits: item.pushedTestCommits === true,
-    reviewUrl: typeof item.reviewUrl === 'string' ? item.reviewUrl : '',
+    summary: item.summary.trim(),
+    pushedTestCommits: item.pushedTestCommits,
+    reviewUrl: item.reviewUrl,
   }
 }
 
