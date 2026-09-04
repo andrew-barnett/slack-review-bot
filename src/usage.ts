@@ -63,13 +63,30 @@ export class ReviewFailedError extends Error {
  * case for a run killed before it finished.
  */
 export function parseTokensUsed(transcript: string): number | undefined {
-  const re = /tokens used[:\s]*([\d,]+)/gi
-  let match: RegExpExecArray | null
-  let last: string | undefined
-  while ((match = re.exec(transcript)) !== null) last = match[1]
-  if (last === undefined) return undefined
-  const n = Number(last.replace(/,/g, ''))
-  return Number.isFinite(n) ? n : undefined
+  // Match only a "tokens used" footer that stands on its OWN line — Codex's actual usage line —
+  // rather than scanning the whole transcript for the substring. The transcript also contains
+  // the diffs and command output Codex reviewed, which can themselves contain "tokens used N"
+  // (this very file does); a loose substring scan could pick one of those up as a fabricated
+  // total. Anchoring to a standalone line rejects text embedded in reviewed content, which
+  // always carries a diff marker, code, or prose around it. Two forms are accepted: the label
+  // and number on one line, or the label alone with the number on the next line.
+  const lines = transcript.split(/\r?\n/)
+  let found: number | undefined
+  for (let i = 0; i < lines.length; i += 1) {
+    const label = /^[ \t]*tokens used[ \t]*:?[ \t]*([\d,]*)[ \t]*$/i.exec(lines[i])
+    if (!label) continue
+    let digits = label[1]
+    // Two-line form: the label is alone on its line, the total on the next non-blank line.
+    if (!digits) {
+      const next = (lines[i + 1] ?? '').trim()
+      const number = /^([\d,]+)$/.exec(next)
+      if (!number) continue
+      digits = number[1]
+    }
+    const n = Number(digits.replace(/,/g, ''))
+    if (Number.isFinite(n)) found = n
+  }
+  return found
 }
 
 /** Group digits with commas: 210482 -> "210,482". Exact figure for the thread line. */

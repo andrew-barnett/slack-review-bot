@@ -36,6 +36,29 @@ test('parseTokensUsed returns undefined when no total was printed', t => {
   t.end()
 })
 
+// The transcript also carries the diffs and command output Codex reviewed, which can contain
+// the string "tokens used N" (this file does). Only a standalone footer line counts — text
+// embedded in a reviewed line must never be mistaken for the run's real total.
+test('parseTokensUsed ignores "tokens used" embedded in reviewed content', t => {
+  // A diff/comment line mentioning the phrase is not a footer.
+  t.equal(parseTokensUsed('+  const re = /tokens used 999/  // tokens used 12345 here'), undefined)
+  t.equal(parseTokensUsed('-    assert(parseTokensUsed("tokens used 999"))'), undefined)
+  t.end()
+})
+
+// When reviewed content contains a fake "tokens used N" AND the run then prints its real footer,
+// the real footer (a standalone line, and the last one) wins — not the embedded fake.
+test('parseTokensUsed takes the real footer over embedded fakes', t => {
+  const transcript = [
+    '+  // tokens used 999999 in the diff under review',
+    'diff --git a/x b/x',
+    'tokens used',
+    '300,448',
+  ].join('\n')
+  t.equal(parseTokensUsed(transcript), 300_448)
+  t.end()
+})
+
 test('formatTokensExact groups digits with commas', t => {
   t.equal(formatTokensExact(210_482), '210,482')
   t.equal(formatTokensExact(842), '842')
