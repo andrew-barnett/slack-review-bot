@@ -547,12 +547,10 @@ developer's own PRs do not start a review — the bot cannot approve a PR author
 account it runs as, so reviewing it only burns machine time (see
 [Ignoring your own messages](#ignoring-your-own-messages)).
 
-**What is deliberately not here yet:** a shared work queue that hands each PR to exactly one
-reviewer and re-queues it if that machine drops. Distributing reviews by dispatching PRs onto
-a queue (an SQS FIFO, one consumer claiming each) is a separate design — the "peer-review
-dispatch" work — and **nothing in this bot consumes a queue today**; it only reads Slack. If
-you were expecting an SQS client here, that is the piece that does not exist yet. Until it
-does, use the shared-app arrangement for casual load-sharing and accept its limits.
+**No shared work queue.** There is no mechanism that hands each PR to exactly one reviewer and
+re-queues it if that machine drops — **this bot only reads Slack**, and does not consume any
+queue. Coordination between machines is limited to the shared-app arrangement above (Slack
+handing each event to one connection); use it for casual load-sharing and accept its limits.
 
 ## Configuration
 
