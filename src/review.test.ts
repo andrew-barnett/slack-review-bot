@@ -1,5 +1,5 @@
 import test from 'tape'
-import { CodexStalledError, type CodexRunOutcome, type runCodexReview } from './codex'
+import { CodexStalledError, CodexTimeoutError, type CodexRunOutcome, type runCodexReview } from './codex'
 import { loadReviewConfig, type ReviewConfig } from './config'
 import type { ReviewRequest } from './job'
 import { makeReviewRunner } from './review'
@@ -26,8 +26,14 @@ function passed(): CodexRunOutcome {
 }
 
 function stall(stallMs: number | undefined): CodexStalledError {
-  // A non-zero active time so tests can assert it survives onto the failure usage.
+  // A non-zero active time so tests can assert it survives onto the failure usage. Every stalled
+  // attempt here reports 5s of active time.
   return new CodexStalledError('stalled', stallMs ?? 0, { activeMs: 5000, wallMs: 5000, frozenMs: 0 })
+}
+
+/** A timed-out run that spent `activeMs` of active time before it was killed. */
+function timeout(activeMs: number): CodexTimeoutError {
+  return new CodexTimeoutError('timed out', { activeMs, wallMs: activeMs, frozenMs: 0 })
 }
 
 /** Defaults with a controlled stall schedule; the graces here are the shape, not real minutes. */
@@ -59,7 +65,11 @@ test('makeReviewRunner retries a stall with the next longer grace and returns on
   // Usage rides along with the winning attempt: Codex's token total, its active time, and the
   // attempt number it succeeded on (3, after two retries) — so a retried review reports honestly.
   t.equal(outcome.usage.tokensUsed, 12345, 'the token total from the successful run is carried')
-  t.equal(outcome.usage.activeMs, 90_000, 'the active time from the successful run is carried')
+  t.equal(
+    outcome.usage.activeMs,
+    100_000,
+    'active time is summed across both stalled attempts (5s each) and the successful run (90s)'
+  )
   t.equal(outcome.usage.attempts, 3, 'the attempt count reflects the two retries before success')
   t.end()
 })
@@ -85,7 +95,7 @@ test('makeReviewRunner gives up and throws once the final grace also stalls', as
     t.ok(error instanceof ReviewFailedError, 'a give-up throws a ReviewFailedError carrying usage')
     if (error instanceof ReviewFailedError) {
       t.equal(error.usage.attempts, 2, 'usage records both attempts were spent')
-      t.equal(error.usage.activeMs, 5000, "the last stall's active time is carried onto the failure")
+      t.equal(error.usage.activeMs, 10_000, 'active time is summed across both stalled attempts (5s each)')
       t.equal(error.usage.tokensUsed, undefined, 'a killed run reported no token total')
     }
   }
@@ -119,6 +129,53 @@ test('makeReviewRunner does not retry a non-stall failure', async t => {
     }
   }
   t.equal(calls, 1, 'a non-stall failure is terminal — no retry')
+  t.end()
+})
+
+// A timeout is terminal and never retried, but it spent its whole budget of active time before
+// the kill. Regression for the usage gap where the timeout path fell through to `{ attempts }`
+// with no activeMs at all, so a timed-out review reported as having cost no time.
+test('makeReviewRunner reports the active time a timed-out run spent', async t => {
+  const fakeRun: typeof runCodexReview = async () => {
+    throw timeout(3_600_000)
+  }
+  const runner = makeReviewRunner(config([1000, 2000, 3000]), () => {}, fakeRun)
+
+  try {
+    await runner(request)
+    t.fail('a timeout must reject')
+  } catch (error) {
+    t.ok(error instanceof ReviewFailedError, 'a timeout is wrapped in a ReviewFailedError')
+    if (error instanceof ReviewFailedError) {
+      t.equal(error.usage.attempts, 1, 'a timeout is terminal — one attempt, no retry')
+      t.equal(error.usage.activeMs, 3_600_000, "the timeout's active time is carried onto the failure")
+      t.equal(error.usage.tokensUsed, undefined, 'a killed run reported no token total')
+    }
+  }
+  t.end()
+})
+
+// A stalled attempt that is retried and THEN times out must charge both spans — the accumulator
+// must not reset between attempts. Regression for reporting only the final attempt's time.
+test('makeReviewRunner sums a stalled attempt and a later timeout', async t => {
+  let calls = 0
+  const fakeRun: typeof runCodexReview = async () => {
+    calls += 1
+    throw calls === 1 ? stall(1000) : timeout(120_000)
+  }
+  const runner = makeReviewRunner(config([1000, 2000]), () => {}, fakeRun)
+
+  try {
+    await runner(request)
+    t.fail('must reject once the retry also fails')
+  } catch (error) {
+    t.ok(error instanceof ReviewFailedError, 'wrapped in a ReviewFailedError')
+    if (error instanceof ReviewFailedError) {
+      t.equal(error.usage.activeMs, 125_000, 'the 5s stall and the 120s timeout are both charged')
+      t.equal(error.usage.attempts, 2, 'the retry that then timed out is the second attempt')
+    }
+  }
+  t.equal(calls, 2, 'the stall was retried, then the retry timed out')
   t.end()
 })
 

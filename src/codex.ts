@@ -272,7 +272,9 @@ export async function runCodexReview(
     })
 
     if (exit.timedOut) {
-      throw new Error(describeTimeout(options.timeoutMs, exit.timedOut))
+      // Carry the snapshot, not just a message: the run spent this much active time before it
+      // was killed, and the caller accounts for it in the usage it reports.
+      throw new CodexTimeoutError(describeTimeout(options.timeoutMs, exit.timedOut), exit.timedOut)
     }
     if (exit.stalled) {
       throw new CodexStalledError(
@@ -320,6 +322,23 @@ export class CodexStalledError extends Error {
   ) {
     super(message)
     this.name = 'CodexStalledError'
+  }
+}
+
+/**
+ * Thrown when a run is killed for exhausting its active-time budget.
+ *
+ * A distinct type from {@link CodexStalledError} — a timeout is terminal and not retried — but
+ * it carries the same {@link DeadlineSnapshot} so the caller can charge the active time the run
+ * spent before the kill, rather than reporting a timed-out run as having cost nothing.
+ */
+export class CodexTimeoutError extends Error {
+  constructor(
+    message: string,
+    readonly snapshot: DeadlineSnapshot
+  ) {
+    super(message)
+    this.name = 'CodexTimeoutError'
   }
 }
 

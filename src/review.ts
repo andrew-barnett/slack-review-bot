@@ -2,7 +2,7 @@
 // both drive exactly the same prompt, profile, and output contract — a review that
 // reproduces from the terminal is a review you can debug.
 
-import { CodexStalledError, runCodexReview } from './codex'
+import { CodexStalledError, CodexTimeoutError, runCodexReview } from './codex'
 import type { ReviewConfig } from './config'
 import type { ReviewRequest } from './job'
 import type { ActiveReviews } from './progress'
@@ -44,6 +44,11 @@ export function makeReviewRunner(
     const schedule = config.stallBackoffMs
     const attempts = schedule.length > 0 ? schedule.length : 1
 
+    // Active time charged across every attempt, not just the last. A stalled attempt still ran
+    // for real before it was killed, so a stall-then-success or a give-up must report the sum —
+    // reporting only the winning (or final) attempt would understate what the review cost.
+    let chargedActiveMs = 0
+
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       // undefined when the schedule is empty, which disables stall detection in the run.
       const stallTimeoutMs = schedule[attempt]
@@ -71,11 +76,12 @@ export function makeReviewRunner(
           onProgress: reviews ? (line, activeMs) => reviews.output(key, line, activeMs) : undefined,
         })
         // Never trust the run to have covered everything it was asked to cover.
+        chargedActiveMs += outcome.activeMs
         return {
           result: reconcileResults(urls, outcome.result),
           usage: {
             tokensUsed: outcome.tokensUsed,
-            activeMs: outcome.activeMs,
+            activeMs: chargedActiveMs,
             attempts: attempt + 1,
           },
         }
@@ -83,6 +89,9 @@ export function makeReviewRunner(
         // Only a stall is retryable: a timeout has already spent the whole budget, and a crash
         // or bad output will not fix itself on a re-run.
         if (error instanceof CodexStalledError) {
+          // Charge this attempt's active time whether or not we retry — a stalled attempt that is
+          // then retried still cost the time it ran before the kill.
+          chargedActiveMs += error.snapshot.activeMs
           if (!isLast) {
             log?.('review.retry', {
               runId: baseRunId,
@@ -95,17 +104,26 @@ export function makeReviewRunner(
             continue
           }
           log?.('review.gave-up', { runId: baseRunId, prs: urls, attempts })
-          // The run is over, but it still spent this much active time across its attempts; carry
-          // that so the failure thread and the status totals can account for it. A killed run
-          // printed no token total, so tokensUsed stays undefined.
+          // The run is over, but it still spent this much active time across ALL its attempts;
+          // carry the sum so the failure thread and the status totals can account for it. A killed
+          // run printed no token total, so tokensUsed stays undefined.
           throw new ReviewFailedError(
-            { activeMs: error.snapshot.activeMs, attempts },
+            { activeMs: chargedActiveMs, attempts },
             new Error(`Codex stalled on every attempt (${attempts}) and was killed for good — ${error.message}`)
           )
         }
-        // A timeout or a crash: no token total, and no active-time snapshot to hand back, but the
-        // attempt count is still worth reporting.
-        throw new ReviewFailedError({ attempts: attempt + 1 }, error)
+        // A timeout is terminal, but it spent its whole budget of active time before the kill —
+        // charge it (plus any earlier stalled attempts) rather than reporting no time at all.
+        if (error instanceof CodexTimeoutError) {
+          chargedActiveMs += error.snapshot.activeMs
+          throw new ReviewFailedError({ activeMs: chargedActiveMs, attempts: attempt + 1 }, error)
+        }
+        // A crash has no snapshot for this attempt, but any earlier stalled attempts still ran;
+        // report their accumulated time when there is some, and undefined when there is none.
+        throw new ReviewFailedError(
+          { activeMs: chargedActiveMs > 0 ? chargedActiveMs : undefined, attempts: attempt + 1 },
+          error
+        )
       }
     }
 

@@ -7,6 +7,7 @@ import test from 'tape'
 import {
   buildCodexArgs,
   CodexStalledError,
+  CodexTimeoutError,
   describeStall,
   describeTimeout,
   runCodexReview,
@@ -178,8 +179,8 @@ test('runCodexReview does not charge a machine-asleep gap against the run timeou
   // The rejection lands on the tick that kills, before this test gets back to await it; a
   // handler attached up front keeps it from surfacing as an unhandled rejection meanwhile.
   const run = runCodexReview(runOptions(log), spawner, clock.deps).then(
-    () => 'resolved',
-    (error: unknown) => String(error)
+    () => undefined,
+    (error: unknown) => error
   )
   await settle()
 
@@ -195,10 +196,16 @@ test('runCodexReview does not charge a machine-asleep gap against the run timeou
   await settle()
   t.deepEqual(child.signals, ['SIGTERM'], 'killed once sixty seconds of active time are spent')
 
-  const message = await run
-  t.notEqual(message, 'resolved', 'a killed run must reject')
-  t.ok(message.includes('exceeded the 1 minute timeout'), message)
-  t.ok(message.includes('asleep were not counted'), 'the error accounts for the discounted time')
+  const error = await run
+  t.ok(error !== undefined, 'a killed run must reject')
+  // A distinct error type carrying the deadline snapshot, so the caller can charge the active time
+  // the run spent before the kill rather than reporting a timed-out run as free.
+  t.ok(error instanceof CodexTimeoutError, 'it rejects with CodexTimeoutError')
+  t.ok(String(error).includes('exceeded the 1 minute timeout'), String(error))
+  t.ok(String(error).includes('asleep were not counted'), 'the error accounts for the discounted time')
+  if (error instanceof CodexTimeoutError) {
+    t.ok(error.snapshot.activeMs >= 60_000, 'the snapshot carries the active time the run spent')
+  }
   t.end()
 })
 
