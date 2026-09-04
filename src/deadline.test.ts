@@ -223,6 +223,34 @@ test('markActivity credits silence from the output moment, not the previous tick
   t.end()
 })
 
+// stop() promises neither callback fires afterward. markActivity must honour that too: output
+// can arrive between a kill and the child's close, and it must not resurrect a stopped deadline
+// by advancing its accounting or firing onFreeze on the long gap. (Regression for round-1 of #8.)
+test('markActivity after stop does not advance accounting or fire onFreeze', t => {
+  const clock = fakeClock()
+  const freezes: number[] = []
+  const deadline = startActiveDeadline(60_000, () => t.fail('no expiry after stop'), {
+    ...clock.deps,
+    checkMs: CHECK,
+    toleranceMs: TOLERANCE,
+    stallMs: STALL,
+    onStall: () => t.fail('no stall after stop'),
+    onFreeze: frozenForMs => freezes.push(frozenForMs),
+  })
+
+  clock.tick(CHECK)
+  const activeBefore = deadline.snapshot().activeMs
+  deadline.stop()
+
+  // A long gap (the post-stop tick no-ops) then late output arrives.
+  clock.tick(4 * 60 * 60 * 1000)
+  deadline.markActivity()
+
+  t.deepEqual(freezes, [], 'markActivity after stop fires no onFreeze')
+  t.equal(deadline.snapshot().activeMs, activeBefore, 'and does not advance the stopped accounting')
+  t.end()
+})
+
 // The regression this shares with the budget: a machine asleep is not a run gone silent. A
 // four-hour suspension is charged as one interval of idle, so it cannot trip the grace.
 test('startActiveDeadline does not count a suspension as idle toward a stall', t => {

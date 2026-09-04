@@ -119,6 +119,10 @@ export function startActiveDeadline(
   }
 
   const markActivity = (): void => {
+    // Same stopped-guard as tick(): once stopped, the deadline must not mutate its accounting or
+    // fire a callback (advance() can invoke onFreeze). Output can still arrive between a kill and
+    // the child's close, and that must not resurrect a stopped deadline.
+    if (handle === undefined) return
     // Advance to now() before recording, so "last output" is the active time through this
     // moment — not the previous heartbeat's, which could be up to a whole interval stale and
     // would make the next ticks count silence that started before the output actually arrived.
