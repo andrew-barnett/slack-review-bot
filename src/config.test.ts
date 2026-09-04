@@ -163,13 +163,28 @@ test('loadConfig clamps the default schedule to a lowered ceiling', t => {
   t.end()
 })
 
-// parseMsList in isolation: keep the well-formed positive values, drop the junk, and fall back
-// to the default when nothing usable survives so a typo cannot silently disable the feature.
-test('parseMsList keeps valid entries, clamps them, and falls back when empty', t => {
+// parseMsList in isolation. Three distinct cases (#13): unset uses the default, an explicitly
+// empty value disables (returns []), and a non-empty typo falls back so a mistake cannot
+// silently disable the feature.
+test('parseMsList keeps valid entries, clamps them, and distinguishes empty from a typo', t => {
   const fallback = [1000, 2000]
   t.deepEqual(parseMsList('100, 200, 300', fallback, 250), [100, 200, 250], 'valid values, clamped')
-  t.deepEqual(parseMsList('nope, -5, 0', fallback, 5000), fallback, 'all-invalid input uses the fallback')
+  t.deepEqual(parseMsList('nope, -5, 0', fallback, 5000), fallback, 'a non-empty typo uses the fallback')
   t.deepEqual(parseMsList(undefined, fallback, 1500), [1000, 1500], 'an absent value uses the clamped fallback')
-  t.deepEqual(parseMsList('', fallback, 5000), fallback, 'an empty string is treated as no usable entries')
+  t.deepEqual(parseMsList('', fallback, 5000), [], 'an explicit empty string disables (returns [])')
+  t.deepEqual(parseMsList('   ', fallback, 5000), [], 'whitespace-only is also explicitly empty')
+  t.end()
+})
+
+// #13: the README documents STALL_BACKOFF_MS= as the way to turn stall detection and retries
+// off. An unset variable keeps the built-in schedule; an explicit empty value disables it.
+test('STALL_BACKOFF_MS empty disables the schedule, unset keeps the default', t => {
+  t.ok(loadConfig({ ...credentials }).stallBackoffMs.length > 0, 'unset uses the built-in schedule')
+  t.deepEqual(loadConfig({ ...credentials, STALL_BACKOFF_MS: '' }).stallBackoffMs, [], 'empty disables it')
+  t.deepEqual(
+    loadConfig({ ...credentials, STALL_BACKOFF_MS: '1000,2000' }).stallBackoffMs,
+    [1000, 2000],
+    'an explicit schedule is honoured'
+  )
   t.end()
 })
