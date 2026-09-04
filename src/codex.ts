@@ -4,7 +4,7 @@ import { spawn, type ChildProcess } from 'child_process'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { SECRET_ENV_KEYS } from './config'
+import { CODEX_ENV_ALLOWLIST, CODEX_ENV_ALLOWLIST_PREFIXES } from './config'
 import { startActiveDeadline, type DeadlineDeps, type DeadlineSnapshot } from './deadline'
 import { REVIEW_OUTPUT_SCHEMA, parseReviewResult, type ReviewRunResult } from './schema'
 import { parseTokensUsed } from './usage'
@@ -31,6 +31,8 @@ export interface CodexRunOptions {
    */
   stallTimeoutMs?: number
   disableGitSigning: boolean
+  /** Extra env var names to pass to the Codex child on top of the built-in allowlist. */
+  envPassthrough?: string[]
   /** Directory to write the raw stdout/stderr transcript to. Empty disables it. */
   logDir?: string
   /** Identifier used to name the log files. */
@@ -59,17 +61,29 @@ export interface CodexRunOutcome {
 export type Spawner = typeof spawn
 
 /**
- * Remove the bot's own credentials from an environment before handing it to Codex.
+ * Build the Codex child's environment from an allowlist of the daemon's own.
  *
- * The Codex profile sets `shell_environment_policy.inherit = "all"` so the skill's
- * `gh`, `git`, `npm` and `pnpm` calls see a real PATH and a working toolchain. That
- * inherits this process's environment wholesale — which is where the Slack tokens
- * live — so they are deleted here rather than relying on Codex-side filtering.
+ * The Codex profile sets `shell_environment_policy.inherit = "all"`, so whatever is passed here
+ * is exactly what the skill's `gh`, `git`, `npm` and `pnpm` calls — and any untrusted PR test
+ * code — get to see. Rather than inherit the whole environment and try to strip the secrets out
+ * (a denylist that silently misses the next new credential), start from nothing and copy across
+ * only {@link CODEX_ENV_ALLOWLIST}, the allowed prefixes, and any operator passthrough names.
+ * Everything else — cloud keys, registry tokens, the Slack tokens, arbitrary secrets — never
+ * reaches the child.
  */
-export function stripSecretsFromEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const copy: NodeJS.ProcessEnv = { ...env }
-  for (const key of SECRET_ENV_KEYS) delete copy[key]
-  return copy
+export function buildChildEnv(
+  env: NodeJS.ProcessEnv,
+  extraNames: readonly string[] = []
+): NodeJS.ProcessEnv {
+  const allowed = new Set<string>([...CODEX_ENV_ALLOWLIST, ...extraNames])
+  const out: NodeJS.ProcessEnv = {}
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) continue
+    if (allowed.has(key) || CODEX_ENV_ALLOWLIST_PREFIXES.some(prefix => key.startsWith(prefix))) {
+      out[key] = value
+    }
+  }
+  return out
 }
 
 /**
@@ -158,7 +172,7 @@ export async function runCodexReview(
   const outputPath = path.join(scratch, 'final-message.json')
   fs.writeFileSync(schemaPath, JSON.stringify(REVIEW_OUTPUT_SCHEMA, null, 2))
 
-  let env = stripSecretsFromEnv(process.env)
+  let env = buildChildEnv(process.env, options.envPassthrough)
   if (options.disableGitSigning) env = withGitSigningDisabled(env)
 
   const args = buildCodexArgs({

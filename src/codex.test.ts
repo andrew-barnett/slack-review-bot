@@ -5,6 +5,7 @@ import * as path from 'path'
 import { PassThrough } from 'stream'
 import test from 'tape'
 import {
+  buildChildEnv,
   buildCodexArgs,
   CodexOutputError,
   CodexStalledError,
@@ -12,7 +13,6 @@ import {
   describeStall,
   describeTimeout,
   runCodexReview,
-  stripSecretsFromEnv,
   withGitSigningDisabled,
   type Spawner,
 } from './codex'
@@ -56,19 +56,64 @@ test('buildCodexArgs skips the git repo check', t => {
 })
 
 // The Codex profile sets shell_environment_policy.inherit = "all", so anything left in
-// the daemon's environment is visible to model-generated shell commands. The bot's
-// Slack tokens must not be among them.
-test('stripSecretsFromEnv removes the Slack credentials and keeps everything else', t => {
-  const env = stripSecretsFromEnv({
-    SLACK_BOT_TOKEN: 'xoxb-secret',
-    SLACK_APP_TOKEN: 'xapp-secret',
+// The whole daemon environment is visible to model-generated shell commands and untrusted PR
+// test code, so the Codex child is built from an ALLOWLIST: the toolchain basics and the
+// credentials it genuinely needs pass through, and every other secret is dropped by default.
+test('buildChildEnv keeps allowlisted toolchain vars and the credentials reviews need', t => {
+  const env = buildChildEnv({
     PATH: '/usr/bin',
     HOME: '/home/u',
+    GITHUB_TOKEN: 'ghp-needed', // gh clones and posts reviews with this
+    NPM_TOKEN: 'npm-needed', // private @trade-platform installs need this
+    LC_ALL: 'en_US.UTF-8', // prefix-allowed locale family
+    npm_config_registry: 'https://npm.example', // prefix-allowed npm config
   })
-  t.equal(env.SLACK_BOT_TOKEN, undefined)
-  t.equal(env.SLACK_APP_TOKEN, undefined)
   t.equal(env.PATH, '/usr/bin', 'PATH survives — gh, git and npm need it')
-  t.equal(env.HOME, '/home/u')
+  t.equal(env.HOME, '/home/u', 'HOME survives — file-based gh/git/npm/codex auth lives here')
+  t.equal(env.GITHUB_TOKEN, 'ghp-needed', 'the gh token is a needed credential')
+  t.equal(env.NPM_TOKEN, 'npm-needed', 'the npm token is a needed credential')
+  t.equal(env.LC_ALL, 'en_US.UTF-8', 'LC_* passes by prefix')
+  t.equal(env.npm_config_registry, 'https://npm.example', 'npm_config_* passes by prefix')
+  t.end()
+})
+
+// The point of the fix (issue #7): secrets the review does not need must NOT reach the child,
+// including the ones an old denylist would have missed.
+test('buildChildEnv drops secrets that are not on the allowlist', t => {
+  const env = buildChildEnv({
+    PATH: '/usr/bin',
+    SLACK_BOT_TOKEN: 'xoxb-secret',
+    SLACK_APP_TOKEN: 'xapp-secret',
+    AWS_ACCESS_KEY_ID: 'AKIA...',
+    AWS_SECRET_ACCESS_KEY: 'aws-secret',
+    STRIPE_SECRET_KEY: 'sk_live_...',
+    SOME_OTHER_TOKEN: 'nope',
+    NODE_ENV: 'production', // deliberately dropped: would make npm ci skip devDependencies
+  })
+  t.equal(env.PATH, '/usr/bin', 'the allowlisted var is kept')
+  for (const dropped of [
+    'SLACK_BOT_TOKEN',
+    'SLACK_APP_TOKEN',
+    'AWS_ACCESS_KEY_ID',
+    'AWS_SECRET_ACCESS_KEY',
+    'STRIPE_SECRET_KEY',
+    'SOME_OTHER_TOKEN',
+    'NODE_ENV',
+  ]) {
+    t.equal(env[dropped], undefined, `${dropped} is not passed to Codex`)
+  }
+  t.end()
+})
+
+// The operator escape hatch: a var an install genuinely needs can be named without a code change.
+test('buildChildEnv passes operator-allowlisted extras and drops undefined values', t => {
+  const env = buildChildEnv(
+    { PATH: '/usr/bin', MY_BUILD_FLAG: 'on', UNSET: undefined, SECRET_X: 'no' },
+    ['MY_BUILD_FLAG']
+  )
+  t.equal(env.MY_BUILD_FLAG, 'on', 'a passthrough name is allowed through')
+  t.equal(env.SECRET_X, undefined, 'but only the named extra, nothing else')
+  t.notOk('UNSET' in env, 'an undefined value is not copied as a key')
   t.end()
 })
 

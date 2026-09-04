@@ -70,6 +70,7 @@ export function makeReviewRunner(
           timeoutMs: config.runTimeoutMs,
           stallTimeoutMs,
           disableGitSigning: config.disableGitSigning,
+          envPassthrough: config.codexEnvPassthrough,
           logDir: config.runLogDir,
           runId,
           log,
