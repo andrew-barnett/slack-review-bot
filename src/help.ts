@@ -20,10 +20,26 @@ export function renderHelp(emoji: HelpEmoji): string {
     '*Slack Review Bot* — automated pull-request code review.',
     '',
     '*What I do*',
-    "Post a GitHub pull-request link in a channel I watch and I'll review it: check out the " +
-      'branch, run its tests, post review comments on GitHub, and report back here with a ' +
-      'reaction and a thread summary. Add plain-text instructions next to the link to steer ' +
-      'the review.',
+    "Post a GitHub pull-request link in a channel I watch and I'll review it: I read the whole " +
+      'PR first — the description, the commit messages, and the full discussion (issue ' +
+      'comments, review comments, and resolved threads) — then check out the branch, review the ' +
+      'diff and the code around it, run its tests, post review comments on GitHub, and report ' +
+      'back here with a reaction and a thread summary.',
+    '',
+    '*Steering what I review*',
+    'Because I read the PR discussion as part of the review, you can shape what I flag without ' +
+      'leaving Slack:',
+    '• Add plain-text instructions next to the link when you post it — a quick note to focus on ' +
+      'or skip something.',
+    "• Comment on the PR itself to tell me a finding is intentional, out of scope, already " +
+      "handled, or should be narrowed or deferred, and I'll honor it after checking it against " +
+      'the code. Notes in the PR description work the same way — mark something "out of scope" ' +
+      'or "follow-up" and I won\'t treat it as a defect.',
+    '• Later comments win, so you can correct course mid-review. I take this guidance from the ' +
+      'PR author, the requester, and repo collaborators — not from other bots or drive-by ' +
+      'comments unless a maintainer endorses them.',
+    "• A genuine correctness or security defect still gets flagged — a scope note won't silence " +
+      'a real bug.',
     '',
     '*Reactions I use*',
     `:${emoji.ack}: reviewing · :${emoji.queued}: queued, waiting for a slot · ` +
