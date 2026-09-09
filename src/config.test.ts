@@ -1,4 +1,5 @@
 import test from 'tape'
+import { SHUTDOWN_GRACE_MS } from './codex'
 import { loadConfig, looksLikeUserId, parseMsList, parseUserIds } from './config'
 
 /** The two required keys, so a test can vary only the knob it cares about. */
@@ -91,6 +92,29 @@ test('SLACK_REQUEST_TIMEOUT_MS defaults finite and is tunable', t => {
     loadConfig({ ...credentials, SLACK_REQUEST_TIMEOUT_MS: 'soon' }).slackRequestTimeoutMs,
     30_000,
     'a typo falls back to the default, not to no timeout'
+  )
+  t.end()
+})
+
+// The shutdown drain deadline (issue #32) defaults finite and is tunable for a longer supervisor
+// grace; a typo falls back rather than silently disabling the wait.
+test('SHUTDOWN_DRAIN_MS defaults finite and is tunable', t => {
+  t.equal(loadConfig({ ...credentials }).shutdownDrainMs, 5_000, 'default 5s')
+  t.equal(loadConfig({ ...credentials, SHUTDOWN_DRAIN_MS: '300000' }).shutdownDrainMs, 300_000, 'override honoured')
+  t.equal(
+    loadConfig({ ...credentials, SHUTDOWN_DRAIN_MS: 'later' }).shutdownDrainMs,
+    5_000,
+    'a typo falls back to the default'
+  )
+  t.end()
+})
+
+test('default shutdown leaves time to reap children within the documented supervisor budget', t => {
+  const supervisorBudgetMs = 20_000
+  const config = loadConfig({ ...credentials })
+  t.ok(
+    config.shutdownDrainMs + SHUTDOWN_GRACE_MS < supervisorBudgetMs,
+    'review drain plus child-kill grace must finish before the supervisor kills the daemon'
   )
   t.end()
 })

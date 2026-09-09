@@ -115,6 +115,16 @@ export interface Config extends ReviewConfig {
    * a finite value caps it. Paired with a bounded retry policy in `slackClientOptions`.
    */
   slackRequestTimeoutMs: number
+  /**
+   * How long, in ms, a shutdown waits for an in-flight review to settle before force-killing it
+   * (issue #32). On SIGINT/SIGTERM the daemon stops accepting work and drains to idle; a review
+   * that has not settled within this deadline is force-killed and left to replay on the next start
+   * (no spurious error thread). Keep it below the supervisor's own kill timeout (launchd's
+   * ExitTimeOut, or the orchestrator's grace period) so the daemon exits — and reaps its children —
+   * before it is SIGKILLed and leaves them orphaned. Raise it, with a matching supervisor grace,
+   * where letting a review finish is preferable to replaying it.
+   */
+  shutdownDrainMs: number
 }
 
 /**
@@ -312,5 +322,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // 30s: a healthy conversations.history / postMessage / reactions call returns in well under
     // a second, so this only ever fires on a genuinely stuck request.
     slackRequestTimeoutMs: parsePositiveInt(env.SLACK_REQUEST_TIMEOUT_MS, 30_000),
+    // 5s: this drain plus the child-kill grace (SHUTDOWN_GRACE_MS, 10s) must finish inside the
+    // supervisor's kill timeout — a typical launchd ExitTimeOut is ~20s — or the daemon is SIGKILLed
+    // mid-drain and orphans a detached child. 5 + 10 = 15s leaves a comfortable margin, while still
+    // letting a review right at the finish line settle. Raise it (with a matching supervisor grace)
+    // to prefer draining over replaying.
+    shutdownDrainMs: parsePositiveInt(env.SHUTDOWN_DRAIN_MS, 5_000),
   }
 }

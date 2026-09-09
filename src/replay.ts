@@ -150,6 +150,8 @@ export interface ReplayCursors {
   settled(channel: string): string[]
   inFlight(channel: string): string[]
   start(channel: string, ts: string): string
+  /** Hold the watermark below a message: used for a request the dispatcher declined (issue #32). */
+  begin(channel: string, ts: string): void
   record(channel: string, ts: string): void
 }
 
@@ -221,7 +223,16 @@ export async function replayMissed(channels: string[], deps: ReplayDeps): Promis
     // the watermark step straight over a review that has not run yet.
     let queued = 0
     for (const message of plan.dispatch) {
-      if (await deps.dispatch(message)) queued += 1
+      if (await deps.dispatch(message)) {
+        queued += 1
+      } else {
+        // The dispatcher took the request but did not queue it — normally a duplicate the dedupe
+        // set already holds, but also a request declined because a shutdown is under way (issue
+        // #32). Hold the watermark below it so recording the newer chatter that follows cannot step
+        // over an un-run review; a duplicate is already accounted for, so this is a harmless no-op
+        // for it, and the request replays on the next start.
+        deps.cursors.begin(channel, message.ts as string)
+      }
     }
     for (const { ts, reason } of plan.skipped) {
       deps.log('replay.skipped', { channel, ts, reason })

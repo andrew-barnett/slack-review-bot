@@ -142,8 +142,9 @@ back to it with `conversations.history` — at startup, on every reconnect, and 
 
 **The cursor tracks finished work, not received work.** `ts` is a watermark: every message at
 or before it is done with. A message being reviewed right now holds the watermark below
-itself until its job settles, so a restart in the middle of a 30-minute review replays that
-message and reviews it again. The alternative — committing on receipt — leaves a message
+itself until its job settles, so a restart that cuts a 30-minute review short (a drain timeout
+or a hard kill — see [Shutting down](#shutting-down)) replays that message and reviews it
+again. The alternative — committing on receipt — leaves a message
 wearing an `:eyes:` reaction that never gets a verdict, which is the worse of the two
 failures. `done` holds messages *above* the watermark that are already finished, which
 happens when `CONCURRENCY > 1` and reviews complete out of order; without it, a restart would
@@ -274,6 +275,35 @@ reason behind instead of a silent gap in the log.
 Setting `CATCHUP_INTERVAL_MS=0` **and** `CATCHUP_ON_RECONNECT=false` restores the old
 startup-only behaviour. `npm run doctor` warns when both are off, since between them they are
 two innocuous-looking knobs that turn the recovery mechanism back into a manual restart.
+
+### Shutting down
+
+A deploy or a `launchctl kickstart` sends SIGTERM, and a review runs 10–30 minutes with side
+effects partway through — GitHub review comments, pushed test commits, a Slack thread. Killing one
+mid-flight the naive way had three possible endings, and two were bad: the message could settle as
+a **spurious error** (an error thread posted for a kill that was our own deploy, and the PR then
+*not* replayed), or be cut off between posting a thread and writing the cursor. The termination
+contract makes the outcome deterministic instead.
+
+**Drain to idle.** On SIGINT/SIGTERM the daemon stops accepting new work (a live message that just
+missed the cutoff is left untouched, so it replays rather than being acknowledged and dropped),
+closes the socket, and waits for the active review to settle — up to `SHUTDOWN_DRAIN_MS` (5s). A
+review that settles in that window commits normally and reports its real outcome.
+
+**Force-kill replays cleanly.** A review that has not settled by the deadline is force-killed. The
+job then posts **no** error reaction or thread (`review.aborted.shutdown`), and its cursor is left
+**unsettled**, so the review replays on the next start instead of being lost or mis-reported. Then
+the child registry is drained — SIGTERM to each `codex exec` process group, escalating to SIGKILL
+past a grace — so shutdown never orphans a review reparented to init.
+
+`SHUTDOWN_DRAIN_MS` is kept **below the supervisor's own kill timeout** (launchd's `ExitTimeOut`, or
+a container orchestrator's grace period) so the daemon force-kills and reaps its children *before*
+it is itself SIGKILLed and leaves them orphaned. Raise it — with a matching supervisor grace — where
+letting a review finish is worth more than a prompt restart. This is a drain, not idempotency: a
+review force-killed *after* it posted a findings thread will post a second one when it replays;
+durable per-PR idempotency (issue #35) is the follow-up that closes that, and a split
+listener/worker (issue #34) is the stronger long-term answer where a listener deploy never touches a
+running review.
 
 ### How a run is judged
 
@@ -588,6 +618,7 @@ All optional except the two tokens.
 | `USAGE_REPLY_ENABLED` | `true` | Post a per-review usage line (tokens, active time, attempts) as a thread reply on every completed review. Off silences the reply; the `status` token totals are kept either way. |
 | `SLACK_REQUEST_TIMEOUT_MS` | `30000` | Per-request timeout for the bot's Slack Web API calls. The WebClient defaults to no timeout, so a wedged `conversations.history` could hang the catch-up forever; this caps it, paired with a five-minute bounded retry policy. |
 | `CODEX_ENV_PASSTHROUGH` | *(none)* | Extra environment variable names (comma/space separated) to pass through to the Codex child on top of the built-in allowlist. Keep minimal — anything added is visible to model-generated commands and untrusted PR code. |
+| `SHUTDOWN_DRAIN_MS` | `5000` | On SIGINT/SIGTERM, how long to wait for an in-flight review to settle before force-killing it (it then replays on the next start, with no error thread). See [Shutting down](#shutting-down). Keep below the supervisor's kill timeout so children are reaped before a SIGKILL orphans them. |
 
 Booleans accept `1`, `true`, `yes` or `on`, case-insensitively; any other non-empty value
 is false, and an empty one falls back to the default rather than to false.
@@ -843,10 +874,15 @@ review that misbehaves in Slack reproduces from the terminal.
   bounded by `REPLAY_MAX_AGE_MS` and `REPLAY_MAX_REQUESTS` — see
   [Catching up after downtime](#catching-up-after-downtime). A wake from sleep is covered by
   the timer, which is overdue the moment the process thaws.
-- **A review interrupted by a restart runs again.** The cursor commits a message only once
-  its job settles, so the work is repeated rather than lost. Reactions are idempotent
-  (`already_reacted` is swallowed); a *second findings thread* is only possible if the
-  process dies between posting the thread and writing the cursor.
+- **A shutdown drains to idle, and a review it has to cut short runs again.** On SIGINT/SIGTERM
+  the daemon stops accepting new work and waits for the active review to settle, up to
+  `SHUTDOWN_DRAIN_MS` (5s) — see [Shutting down](#shutting-down). A review that settles in that
+  window is committed normally. One that does not is force-killed and left **unsettled** so it
+  replays on the next start, with **no error thread** posted for the kill (it was our deploy, not a
+  failure of the PR). The cursor commits a message only once its job settles, so a cut-short review
+  is repeated rather than lost. Reactions are idempotent (`already_reacted` is swallowed); a
+  *second findings thread* is only possible if a replayed review had already posted one before it
+  was cut short — durable per-PR idempotency is the follow-up that closes that (issue #35).
 - **Per-run transcripts** land in `runs/<channel>-<ts>.log` — the full Codex stdout for
   a review, which is where to look when a thread says something surprising.
 - **The daemon never logs message text**, only channel, ts, and PR URLs, so a request

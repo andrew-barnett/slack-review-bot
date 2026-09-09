@@ -46,6 +46,13 @@ export interface JobDeps {
   listChangedFiles?(pr: PullRequestRef): Promise<string[]>
   /** Post a comment on a PR — how the gate tells the author a human review is required. */
   postPrComment?(pr: PullRequestRef, body: string): Promise<void>
+  /**
+   * Whether the daemon is force-killing in-flight reviews during a shutdown (issue #32). When it
+   * is, a review that fails because its child was killed is not a real failure: the job suppresses
+   * the error reaction/thread, and the dispatcher leaves the cursor unsettled so the review replays
+   * on the next start. Optional: the CLI never shuts a daemon down, so it is absent there.
+   */
+  isShuttingDown?(): boolean
   log(event: string, fields: Record<string, unknown>): void
 }
 
@@ -154,6 +161,14 @@ export async function runJob(
   try {
     outcome = await deps.runReview(reviewRequest)
   } catch (error) {
+    // A shutdown force-kill is not a review failure: the child was killed by our own deploy, not by
+    // anything about the PR. Report nothing (no error reaction or thread) and return a non-error
+    // outcome; the dispatcher leaves the cursor unsettled so the review replays on the next start
+    // (issue #32). Without this the operator sees a misleading error and the PR is dropped.
+    if (deps.isShuttingDown?.()) {
+      deps.log('review.aborted.shutdown', { prs: reviewUrls })
+      return 'skipped'
+    }
     deps.log('review.failed', { prs: reviewUrls, error: String(error) })
     await finishAck(deps, emoji, request.message)
     await swallow(deps, 'reaction.error.failed', () => deps.addReaction(request.message, emoji.error))
