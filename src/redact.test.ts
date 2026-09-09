@@ -1,5 +1,5 @@
 import test from 'tape'
-import { redactSecrets } from './redact'
+import { redactSecrets, safeRedactBoundary } from './redact'
 
 // Credential-shaped fixtures are assembled at runtime (join/concat) rather than written as literals,
 // so no contiguous secret pattern sits in the committed source to trip GitHub push protection. The
@@ -91,5 +91,26 @@ test('redactSecrets is idempotent', t => {
 test('redactSecrets leaves ordinary output unchanged', t => {
   const text = 'reading files\nrunning jest\n12 passed, 0 failed\ntokens used\n300,448'
   t.equal(redactSecrets(text, {}), text, 'no false positives on normal output')
+  t.end()
+})
+
+// safeRedactBoundary decides how much of a streaming buffer is safe to redact now — the mechanism
+// that stops a secret split across chunks from being redacted as two unmatched halves.
+test('safeRedactBoundary publishes only complete lines', t => {
+  t.equal(safeRedactBoundary('no newline yet'), 0, 'a partial first line holds entirely')
+  t.equal(safeRedactBoundary('done\npartial'), 'done\n'.length, 'holds back the trailing partial line')
+  t.equal(safeRedactBoundary('a\nb\n'), 4, 'a fully-terminated buffer is entirely safe')
+  t.end()
+})
+
+// A PEM private key spans lines; while its END has not arrived, everything from BEGIN must be held
+// so the block is redacted whole, not leaked line by line.
+test('safeRedactBoundary holds an unterminated PEM block from its BEGIN', t => {
+  const begin = '-----BEGIN RSA ' + 'PRIVATE KEY-----'
+  const open = `safe line\n${begin}\nKEYBODY\n`
+  t.equal(safeRedactBoundary(open), 'safe line\n'.length, 'holds from the BEGIN line, publishing only what precedes it')
+  const end = '-----END RSA ' + 'PRIVATE KEY-----'
+  const closed = `safe line\n${begin}\nKEYBODY\n${end}\ntail\n`
+  t.equal(safeRedactBoundary(closed), closed.length, 'once END arrives the whole block is safe to publish')
   t.end()
 })

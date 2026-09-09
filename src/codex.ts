@@ -8,7 +8,7 @@ import { CODEX_ENV_ALLOWLIST, CODEX_ENV_ALLOWLIST_PREFIXES } from './config'
 import { startActiveDeadline, type DeadlineDeps, type DeadlineSnapshot } from './deadline'
 import { REVIEW_OUTPUT_SCHEMA, parseReviewResult, type ReviewRunResult } from './schema'
 import { parseTokensUsed } from './usage'
-import { redactSecrets } from './redact'
+import { redactSecrets, safeRedactBoundary } from './redact'
 
 export interface CodexRunOptions {
   prompt: string
@@ -72,6 +72,14 @@ export type Spawner = typeof spawn
  * ever read. Without this a long, noisy review grows an unbounded buffer for the life of the run.
  */
 export const TRANSCRIPT_TAIL_LIMIT = 64 * 1024
+
+/**
+ * Cap on the redaction hold buffer. Output is normally published at each line/PEM boundary; this
+ * only forces a flush when a single line (or an unterminated key block) grows past it, so a run
+ * that never emits a newline cannot grow `pending` without limit. A real PEM key is a few KB, well
+ * under this, so a legitimate block always completes and redacts whole before the cap is reached.
+ */
+export const OUTPUT_FLUSH_LIMIT = 64 * 1024
 
 /** Append to a rolling buffer, keeping only the last `limit` characters. */
 export function appendBoundedTail(buffer: string, text: string, limit: number): string {
@@ -285,6 +293,10 @@ export async function runCodexReview(
 
   // A bounded in-memory tail; the full transcript goes to the run log via appendLog.
   let transcript = ''
+  // Raw child output buffered until it reaches a boundary safe to redact (see safeRedactBoundary):
+  // a secret split across two read chunks is whole only once concatenated here, so redacting per
+  // chunk would let it through to the run log and status line. Bounded by OUTPUT_FLUSH_LIMIT.
+  let pending = ''
   const appendLog = makeLogAppender(options.logDir, options.runId)
 
   try {
@@ -369,37 +381,61 @@ export async function runCodexReview(
         }
       )
 
-      const capture = (chunk: Buffer) => {
-        // The single choke point for raw child output. Redact before it is stored or surfaced, so
-        // the transcript, the run log, and the status line all inherit it (issue #31). This masks
-        // a secret printed within one chunk; one split across two chunks is caught later when the
-        // assembled transcript is redacted again for the error thread (see below).
-        const text = redactSecrets(chunk.toString('utf8'))
-        transcript = appendBoundedTail(transcript, text, TRANSCRIPT_TAIL_LIMIT)
-        appendLog(text)
-        // Any output is progress: reset the stall clock so only genuine silence trips it.
-        deadline.markActivity()
-        // Surface the latest line for the status reply. Guarded so a broken progress sink can
-        // never take a review down — reporting what a run is doing is not worth failing it.
+      // Send an already-safe, redacted span of output to every surface that stores or shows it —
+      // the run log, the in-memory transcript, and the status reply — so all three inherit the one
+      // redaction pass (issue #31).
+      const publish = (span: string) => {
+        if (!span) return
+        const redacted = redactSecrets(span)
+        transcript = appendBoundedTail(transcript, redacted, TRANSCRIPT_TAIL_LIMIT)
+        appendLog(redacted)
+        // Guarded so a broken progress sink can never take a review down — reporting what a run is
+        // doing is not worth failing it.
         if (options.onProgress) {
           try {
-            options.onProgress(text, deadline.snapshot().activeMs)
+            options.onProgress(redacted, deadline.snapshot().activeMs)
           } catch {
             // A status-side failure is not the run's problem.
           }
         }
       }
+
+      const capture = (chunk: Buffer) => {
+        // Reset the stall clock on every raw chunk, before buffering: a run slowly writing one long
+        // line is active, not silent. (markActivity must see the chunk even when nothing publishes.)
+        deadline.markActivity()
+        pending += chunk.toString('utf8')
+        let cut = safeRedactBoundary(pending)
+        // If nothing is safe yet but the buffer is growing without bound (a very long line, or a PEM
+        // block that never closes), flush it anyway to cap memory. Redaction still runs on it.
+        if (cut === 0 && pending.length >= OUTPUT_FLUSH_LIMIT) cut = pending.length
+        if (cut > 0) {
+          publish(pending.slice(0, cut))
+          pending = pending.slice(cut)
+        }
+      }
       child.stdout?.on('data', capture)
       child.stderr?.on('data', capture)
 
+      // Flush whatever is still buffered when the stream ends, so the final line (and its token
+      // footer) reaches the transcript, and no held output is dropped.
+      const flushPending = () => {
+        if (pending) {
+          publish(pending)
+          pending = ''
+        }
+      }
+
       child.on('error', error => {
         cleanupChild()
+        flushPending()
         deadline.stop()
         reject(error)
       })
       child.on('close', code => {
         // Cancel any pending SIGKILL and deregister now that the child is gone.
         cleanupChild()
+        flushPending()
         // Snapshot before stop so the active-time figure reflects the whole run; snapshot()
         // keeps working after stop, but reading it here keeps the intent obvious.
         const activeMs = deadline.snapshot().activeMs

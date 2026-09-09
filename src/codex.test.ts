@@ -406,33 +406,69 @@ test('runCodexReview throws CodexOutputError with usage when no final message is
   t.end()
 })
 
-// #31: a malicious PR can print a credential to stdout during the run. When the run then fails
-// with no final message, the transcript tail is embedded in the error — which is posted to the
-// Slack error thread and the daemon log — so it MUST be redacted. Uses a token-shaped value split
-// across two writes to also prove the whole-transcript redaction (not just per-chunk) catches it.
-test('runCodexReview redacts printed secrets from the CodexOutputError tail', async t => {
+// #31: a malicious PR can print a credential to stdout during the run. A GitHub PAT split across
+// two write chunks matches nothing in either half — only in the assembled buffer. All three
+// persisted/transmitted surfaces must still be redacted: the run-log file on disk, and (when the
+// run fails with no final message) the transcript tail embedded in the error posted to the Slack
+// error thread and the daemon log.
+test('runCodexReview redacts a chunk-split secret from the run log and the error tail', async t => {
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-test-runlog-'))
   const child = new FakeChild()
   const spawner = (() => child) as unknown as Spawner
   const clock = fakeClock()
 
-  const run = runCodexReview(runOptions(), spawner, clock.deps).then(
+  const run = runCodexReview({ ...runOptions(), logDir, runId: 'split' }, spawner, clock.deps).then(
     () => undefined,
     (error: unknown) => error
   )
   await settle()
   clock.tick(10_000)
-  // A GitHub PAT split across two chunks: neither half matches on its own; the assembled
-  // transcript does. Then close with no output file so the tail rides on the error.
+  // Split the PAT across two writes, the first with no newline so buffering must hold it until the
+  // line completes; then close with no output file so the tail also rides on the error.
   child.stdout.write('leaking ghp_ABCDEFGHIJKLMNOP')
   child.stdout.write('QRSTUVWXYZ0123456789 now\ntokens used\n5,000\n')
   await settle()
   child.emit('close', 1)
 
   const error = await run
+  const runLog = fs.readFileSync(path.join(logDir, 'split.log'), 'utf8')
+  t.notOk(/ghp_[A-Za-z0-9]{20,}/.test(runLog), 'no whole GitHub token is written to the run log')
+  t.ok(runLog.includes('[redacted:github-token]'), 'the run log holds the masked form')
   t.ok(error instanceof CodexOutputError, 'still a CodexOutputError')
   const rendered = String(error)
   t.notOk(/ghp_[A-Za-z0-9]{20,}/.test(rendered), 'no whole GitHub token survives in the error')
   t.ok(rendered.includes('[redacted:github-token]'), 'the token is masked in the tail')
+  t.end()
+})
+
+// #31: a PEM private key spans many lines and can be split across chunks (BEGIN + body in one, END
+// in the next). The block must be held until its END arrives and then redacted whole — no key
+// material may reach the run log in the meantime.
+test('runCodexReview redacts a chunk-split PEM private key from the run log', async t => {
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-test-runlog-'))
+  const child = new FakeChild()
+  const spawner = (() => child) as unknown as Spawner
+  const clock = fakeClock()
+
+  const run = runCodexReview({ ...runOptions(), logDir, runId: 'pem' }, spawner, clock.deps).then(
+    () => undefined,
+    () => undefined
+  )
+  await settle()
+  clock.tick(10_000)
+  const begin = '-----BEGIN RSA ' + 'PRIVATE KEY-----'
+  const end = '-----END RSA ' + 'PRIVATE KEY-----'
+  child.stdout.write(`before\n${begin}\nAAAAB3NzaC1yc2EKEYMATERIAL\n`)
+  child.stdout.write(`MOREKEYMATERIALbbbb\n${end}\nafter\n`)
+  await settle()
+  child.emit('close', 1)
+  await run
+
+  const runLog = fs.readFileSync(path.join(logDir, 'pem.log'), 'utf8')
+  t.notOk(runLog.includes('AAAAB3NzaC1yc2EKEYMATERIAL'), 'no key material reaches the run log')
+  t.notOk(runLog.includes('MOREKEYMATERIALbbbb'), 'no key material from the second chunk either')
+  t.ok(runLog.includes('[redacted:private-key]'), 'the whole block is masked')
+  t.ok(runLog.includes('before') && runLog.includes('after'), 'surrounding output is preserved')
   t.end()
 })
 

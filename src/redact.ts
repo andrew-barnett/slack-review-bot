@@ -70,3 +70,30 @@ export function redactSecrets(text: string, env: NodeJS.ProcessEnv = process.env
   }
   return out
 }
+
+const PEM_BEGIN = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/g
+const PEM_END = /-----END [A-Z0-9 ]*PRIVATE KEY-----/
+
+/**
+ * How much of a streaming output buffer is safe to redact and publish now, so that redaction never
+ * runs on a fragment of a secret that is still arriving. A secret never spans a line, so this is
+ * "up to the last newline" — except a PEM private-key block, which does span lines: while a
+ * `BEGIN … PRIVATE KEY` marker has no matching `END` yet, hold everything from that marker on, so
+ * the whole block is redacted together once its `END` arrives.
+ *
+ * Returns a cut length in [0, buf.length]. 0 means nothing is safe yet (a partial first line, or an
+ * open key block from the start) — the caller holds the whole buffer, flushing it only when it must
+ * bound memory or the stream closes. Callers still run {@link redactSecrets} on whatever they cut.
+ */
+export function safeRedactBoundary(buf: string): number {
+  let end = buf.lastIndexOf('\n') + 1
+  if (end === 0) return 0
+  const region = buf.slice(0, end)
+  PEM_BEGIN.lastIndex = 0
+  let match: RegExpExecArray | null
+  while ((match = PEM_BEGIN.exec(region)) !== null) {
+    // The first BEGIN with no END after it opens a block that is still arriving: hold from here.
+    if (!PEM_END.test(region.slice(match.index))) return match.index
+  }
+  return end
+}

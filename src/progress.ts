@@ -74,7 +74,7 @@ interface Entry {
  * (issue #31).
  */
 export function cleanLine(text: string): string {
-  const lines = redactSecrets(text).split('\n')
+  const lines = text.split('\n')
   let last = ''
   for (let i = lines.length - 1; i >= 0; i -= 1) {
     // eslint-disable-next-line no-control-regex
@@ -84,8 +84,12 @@ export function cleanLine(text: string): string {
       break
     }
   }
+  // Redact AFTER stripping ANSI/control codes, not before: an escape inserted inside a token (e.g.
+  // a colour code right after `xoxb-`) would break the shape match on the raw text, and the strip
+  // above would then reassemble the whole credential. Normalizing first closes that evasion (#31).
+  const redacted = redactSecrets(last)
   // Backticks would break the inline-code span the status reply wraps this line in.
-  const collapsed = last.replace(/\s+/g, ' ').replace(/`/g, "'")
+  const collapsed = redacted.replace(/\s+/g, ' ').replace(/`/g, "'")
   return collapsed.length > MAX_LINE ? `${collapsed.slice(0, MAX_LINE - 1)}…` : collapsed
 }
 
