@@ -406,6 +406,69 @@ test('runCodexReview throws CodexOutputError with usage when no final message is
   t.end()
 })
 
+// #31: a malicious PR can print a credential to stdout during the run. When the run then fails
+// with no final message, the transcript tail is embedded in the error — which is posted to the
+// Slack error thread and the daemon log — so it MUST be redacted. Uses a token-shaped value split
+// across two writes to also prove the whole-transcript redaction (not just per-chunk) catches it.
+test('runCodexReview redacts printed secrets from the CodexOutputError tail', async t => {
+  const child = new FakeChild()
+  const spawner = (() => child) as unknown as Spawner
+  const clock = fakeClock()
+
+  const run = runCodexReview(runOptions(), spawner, clock.deps).then(
+    () => undefined,
+    (error: unknown) => error
+  )
+  await settle()
+  clock.tick(10_000)
+  // A GitHub PAT split across two chunks: neither half matches on its own; the assembled
+  // transcript does. Then close with no output file so the tail rides on the error.
+  child.stdout.write('leaking ghp_ABCDEFGHIJKLMNOP')
+  child.stdout.write('QRSTUVWXYZ0123456789 now\ntokens used\n5,000\n')
+  await settle()
+  child.emit('close', 1)
+
+  const error = await run
+  t.ok(error instanceof CodexOutputError, 'still a CodexOutputError')
+  const rendered = String(error)
+  t.notOk(/ghp_[A-Za-z0-9]{20,}/.test(rendered), 'no whole GitHub token survives in the error')
+  t.ok(rendered.includes('[redacted:github-token]'), 'the token is masked in the tail')
+  t.end()
+})
+
+// #31: the last output line is posted to the Slack status reply via onProgress. A secret printed
+// on that line must reach the sink already redacted (the capture choke point does it).
+test('runCodexReview redacts printed secrets from the progress line', async t => {
+  const child = new FakeChild()
+  const spawner = (() => child) as unknown as Spawner
+  const clock = fakeClock()
+  const progress: string[] = []
+
+  const run = runCodexReview(
+    { ...runOptions(), timeoutMs: 10 * 60_000, onProgress: line => progress.push(line) },
+    spawner,
+    clock.deps
+  ).then(
+    () => undefined,
+    () => undefined
+  )
+  await settle()
+  clock.tick(10_000)
+  // Assemble the Slack-token shape at runtime so no literal secret pattern sits in the source
+  // (GitHub push protection blocks committed matches); the written chunk is still a full match.
+  const slackToken = ['xoxb', '1111111111', '2222222222', 'abcdefabcdefabcdefabcdef'].join('-')
+  child.stdout.write(`token ${slackToken} here\n`)
+  await settle()
+  child.emit('close', 1)
+  await run
+
+  t.ok(progress.length >= 1, 'the chunk was reported')
+  const joined = progress.join('\n')
+  t.notOk(/xox[baprs]-[A-Za-z0-9-]{6,}/.test(joined), 'no Slack token reaches the progress sink')
+  t.ok(joined.includes('[redacted:slack-token]'), 'the token is masked before onProgress')
+  t.end()
+})
+
 // A run that has printed nothing for its whole grace is wedged, not slow. It must be killed
 // and rejected with the typed error the runner retries on — and, like the timeout, measured in
 // active time so a closed lid is never mistaken for silence.

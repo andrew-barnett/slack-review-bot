@@ -8,6 +8,7 @@ import { CODEX_ENV_ALLOWLIST, CODEX_ENV_ALLOWLIST_PREFIXES } from './config'
 import { startActiveDeadline, type DeadlineDeps, type DeadlineSnapshot } from './deadline'
 import { REVIEW_OUTPUT_SCHEMA, parseReviewResult, type ReviewRunResult } from './schema'
 import { parseTokensUsed } from './usage'
+import { redactSecrets } from './redact'
 
 export interface CodexRunOptions {
   prompt: string
@@ -369,7 +370,11 @@ export async function runCodexReview(
       )
 
       const capture = (chunk: Buffer) => {
-        const text = chunk.toString('utf8')
+        // The single choke point for raw child output. Redact before it is stored or surfaced, so
+        // the transcript, the run log, and the status line all inherit it (issue #31). This masks
+        // a secret printed within one chunk; one split across two chunks is caught later when the
+        // assembled transcript is redacted again for the error thread (see below).
+        const text = redactSecrets(chunk.toString('utf8'))
         transcript = appendBoundedTail(transcript, text, TRANSCRIPT_TAIL_LIMIT)
         appendLog(text)
         // Any output is progress: reset the stall clock so only genuine silence trips it.
@@ -428,7 +433,10 @@ export async function runCodexReview(
     // in Codex's own teardown.
     const rawFinalMessage = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf8') : ''
     if (!rawFinalMessage.trim()) {
-      const tail = transcript.slice(-1500).trim()
+      // Redact the whole transcript before slicing: capture already redacted each chunk, but a
+      // secret split across two chunks is only whole here, and this tail is posted to the Slack
+      // error thread and the daemon log (issue #31).
+      const tail = redactSecrets(transcript).slice(-1500).trim()
       throw new CodexOutputError(
         `Codex exited with code ${exit.code} and produced no final message` + (tail ? `:\n${tail}` : ''),
         tokensUsed,
@@ -442,8 +450,13 @@ export async function runCodexReview(
     } catch (error) {
       // The run finished and cost tokens/time, but its final message is malformed or
       // schema-invalid. Surface it as an output failure that still carries the usage, rather
-      // than letting the parse throw a bare error that erases what the run spent.
-      throw new CodexOutputError(error instanceof Error ? error.message : String(error), tokensUsed, activeMs)
+      // than letting the parse throw a bare error that erases what the run spent. Redact in case a
+      // schema/parse error echoes part of the malformed message, which is untrusted output (#31).
+      throw new CodexOutputError(
+        redactSecrets(error instanceof Error ? error.message : String(error)),
+        tokensUsed,
+        activeMs
+      )
     }
 
     return { result, rawFinalMessage, tokensUsed, activeMs }

@@ -124,3 +124,13 @@ test('cleanLine takes the last non-empty line and sanitises it', t => {
   t.equal(cleanLine('   \n  \t '), '', 'nothing legible yields an empty string')
   t.end()
 })
+
+// #31: cleanLine is the sanitizer for the status line, so a secret on the last output line must be
+// masked here too — not only at the codex.ts capture point — so the safety property holds however
+// the line is reached.
+test('cleanLine redacts a secret on the surfaced line', t => {
+  const out = cleanLine('running with token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789')
+  t.notOk(/ghp_[A-Za-z0-9]{20,}/.test(out), 'no whole token reaches the status line')
+  t.ok(out.includes('[redacted:github-token]'), 'the token is masked')
+  t.end()
+})
