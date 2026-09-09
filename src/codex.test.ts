@@ -17,6 +17,7 @@ import {
   describeStall,
   describeTimeout,
   runCodexReview,
+  OUTPUT_FLUSH_LIMIT,
   TRANSCRIPT_TAIL_LIMIT,
   withGitSigningDisabled,
   type Spawner,
@@ -469,6 +470,94 @@ test('runCodexReview redacts a chunk-split PEM private key from the run log', as
   t.notOk(runLog.includes('MOREKEYMATERIALbbbb'), 'no key material from the second chunk either')
   t.ok(runLog.includes('[redacted:private-key]'), 'the whole block is masked')
   t.ok(runLog.includes('before') && runLog.includes('after'), 'surrounding output is preserved')
+  t.end()
+})
+
+test('runCodexReview does not publish a token split at the hold-buffer limit', async t => {
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-test-runlog-'))
+  const child = new FakeChild()
+  const token = 'ghp_' + 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+  const run = runCodexReview(
+    { ...runOptions(), logDir }, (() => child) as unknown as Spawner, fakeClock().deps
+  ).catch(() => undefined)
+  await settle()
+  // The cap falls inside a normal token, even though the token itself is short.
+  child.stdout.write(' '.repeat(OUTPUT_FLUSH_LIMIT - 10) + token.slice(0, 10))
+  child.stdout.write(token.slice(10) + '\n')
+  await settle()
+  child.emit('close', 1)
+  await run
+  const runLog = fs.readFileSync(path.join(logDir, 'test.log'), 'utf8')
+  t.notOk(runLog.includes(token), 'the full token must not be persisted across forced flushes')
+  fs.rmSync(logDir, { recursive: true, force: true })
+  t.end()
+})
+
+test('runCodexReview suppresses an unfinished private key when the child closes', async t => {
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-test-runlog-'))
+  const child = new FakeChild()
+  const body = 'synthetic-private-key-material'
+  const run = runCodexReview(
+    { ...runOptions(), logDir }, (() => child) as unknown as Spawner, fakeClock().deps
+  ).catch((error: unknown) => error)
+  await settle()
+  child.stdout.write('-----BEGIN RSA ' + 'PRIVATE KEY-----\n' + body + '\n')
+  await settle()
+  child.emit('close', 1)
+  const error = await run
+  const runLog = fs.readFileSync(path.join(logDir, 'test.log'), 'utf8')
+  t.notOk(runLog.includes(body), 'unfinished key material must not reach the run log')
+  t.notOk(String(error).includes(body), 'unfinished key material must not reach the error thread')
+  fs.rmSync(logDir, { recursive: true, force: true })
+  t.end()
+})
+
+test('runCodexReview preserves redaction across interleaved stdout and stderr', async t => {
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-test-runlog-'))
+  const child = new FakeChild()
+  const token = 'ghp_' + 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+  const run = runCodexReview(
+    { ...runOptions(), logDir }, (() => child) as unknown as Spawner, fakeClock().deps
+  ).catch((error: unknown) => error)
+  await settle()
+  child.stdout.write(token.slice(0, 10))
+  child.stderr.write('diagnostic\n')
+  child.stdout.write(token.slice(10) + '\n')
+  await settle()
+  child.emit('close', 1)
+  const error = await run
+  const runLog = fs.readFileSync(path.join(logDir, 'test.log'), 'utf8')
+  t.notOk(runLog.includes(token.slice(10)), 'stderr must not force a partial stdout token into the run log')
+  t.notOk(String(error).includes(token.slice(10)), 'interleaving must not leak token material in the error')
+  fs.rmSync(logDir, { recursive: true, force: true })
+  t.end()
+})
+
+test('runCodexReview redacts a multiline env secret emitted over separate chunks', async t => {
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-test-runlog-'))
+  const child = new FakeChild()
+  const name = 'REVIEW_TEST_MULTILINE_SECRET'
+  const previous = process.env[name]
+  const first = 'synthetic-credential-first-line'
+  const second = 'synthetic-credential-second-line'
+  process.env[name] = first + '\n' + second
+  try {
+    const run = runCodexReview(
+      { ...runOptions(), logDir }, (() => child) as unknown as Spawner, fakeClock().deps
+    ).catch(() => undefined)
+    await settle()
+    child.stdout.write(first + '\n')
+    child.stdout.write(second + '\n')
+    await settle()
+    child.emit('close', 1)
+    await run
+    const runLog = fs.readFileSync(path.join(logDir, 'test.log'), 'utf8')
+    t.notOk(runLog.includes(first) || runLog.includes(second), 'both lines of a held env secret must be masked')
+  } finally {
+    if (previous === undefined) delete process.env[name]
+    else process.env[name] = previous
+    fs.rmSync(logDir, { recursive: true, force: true })
+  }
   t.end()
 })
 
