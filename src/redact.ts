@@ -21,6 +21,12 @@ const SHAPE_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   // PEM private-key blocks first: a multi-line block that could otherwise be partly matched by a
   // narrower rule. Non-greedy so adjacent blocks are redacted separately.
   [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g, '[redacted:private-key]'],
+  // An UNTERMINATED key block: a BEGIN whose END has not arrived — a run killed mid-key-print, or a
+  // forced/close flush of a still-open block. Runs after the terminated rule above, so any BEGIN
+  // left is genuinely open; redact it through end-of-text. This only ever sees an open block on a
+  // flush/close/error-tail span (safeRedactBoundary holds open blocks out of normal spans), so it
+  // cannot over-redact mid-stream output.
+  [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*$/g, '[redacted:private-key]'],
   // Slack bot/user/config tokens (xoxb-, xoxp-, xoxa-, xoxr-, xoxs-) and app-level tokens (xapp-).
   [/xox[baprs]-[A-Za-z0-9-]{6,}/g, '[redacted:slack-token]'],
   [/xapp-[A-Za-z0-9-]{6,}/g, '[redacted:slack-token]'],
@@ -66,7 +72,15 @@ export function redactSecrets(text: string, env: NodeJS.ProcessEnv = process.env
     const value = env[name]
     if (!value || value.length < MIN_ENV_VALUE_LENGTH) continue
     if (!SENSITIVE_ENV_NAME.test(name)) continue
-    if (out.includes(value)) out = out.split(value).join('[redacted:env]')
+    // A multiline secret (e.g. a private key held in an env var) is published one line at a time by
+    // the streaming redactor, so the whole value never appears in a single span. Match the whole
+    // value AND each of its lines, longest first, so a surfaced fragment is masked too.
+    const needles = [value, ...value.split(/\r?\n/)]
+      .filter(n => n.length >= MIN_ENV_VALUE_LENGTH)
+      .sort((a, b) => b.length - a.length)
+    for (const needle of needles) {
+      if (out.includes(needle)) out = out.split(needle).join('[redacted:env]')
+    }
   }
   return out
 }

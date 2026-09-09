@@ -81,6 +81,14 @@ export const TRANSCRIPT_TAIL_LIMIT = 64 * 1024
  */
 export const OUTPUT_FLUSH_LIMIT = 64 * 1024
 
+/**
+ * When a forced flush fires (a line longer than the cap), keep this many trailing characters
+ * buffered rather than flushing everything, so a credential sitting across the forced boundary is
+ * held intact for the next chunk instead of being split into two unmatched halves. Comfortably
+ * larger than any single-line credential.
+ */
+export const OUTPUT_FLUSH_MARGIN = 4 * 1024
+
 /** Append to a rolling buffer, keeping only the last `limit` characters. */
 export function appendBoundedTail(buffer: string, text: string, limit: number): string {
   const combined = buffer + text
@@ -293,10 +301,6 @@ export async function runCodexReview(
 
   // A bounded in-memory tail; the full transcript goes to the run log via appendLog.
   let transcript = ''
-  // Raw child output buffered until it reaches a boundary safe to redact (see safeRedactBoundary):
-  // a secret split across two read chunks is whole only once concatenated here, so redacting per
-  // chunk would let it through to the run log and status line. Bounded by OUTPUT_FLUSH_LIMIT.
-  let pending = ''
   const appendLog = makeLogAppender(options.logDir, options.runId)
 
   try {
@@ -400,42 +404,60 @@ export async function runCodexReview(
         }
       }
 
-      const capture = (chunk: Buffer) => {
-        // Reset the stall clock on every raw chunk, before buffering: a run slowly writing one long
-        // line is active, not silent. (markActivity must see the chunk even when nothing publishes.)
-        deadline.markActivity()
-        pending += chunk.toString('utf8')
-        let cut = safeRedactBoundary(pending)
-        // If nothing is safe yet but the buffer is growing without bound (a very long line, or a PEM
-        // block that never closes), flush it anyway to cap memory. Redaction still runs on it.
-        if (cut === 0 && pending.length >= OUTPUT_FLUSH_LIMIT) cut = pending.length
-        if (cut > 0) {
-          publish(pending.slice(0, cut))
-          pending = pending.slice(cut)
+      // stdout and stderr each get their OWN hold buffer. A credential is written to one stream in
+      // one write; sharing a buffer would let the other stream's output interleave into the middle
+      // of it and defeat the match, leaking fragments (issue #31). Per-stream buffering keeps each
+      // stream's lines contiguous for redaction.
+      const makeStreamBuffer = () => {
+        let pending = ''
+        return {
+          push(chunk: Buffer) {
+            // Reset the stall clock on every raw chunk, before buffering: a run slowly writing one
+            // long line is active, not silent (markActivity must see it even when nothing publishes).
+            deadline.markActivity()
+            pending += chunk.toString('utf8')
+            let cut = safeRedactBoundary(pending)
+            // Nothing safe yet but the buffer is growing without bound (a line, or an open key
+            // block, longer than the cap): flush all but a trailing margin so a credential across
+            // the forced boundary is not split, and memory stays bounded. Redaction still runs.
+            if (cut === 0 && pending.length >= OUTPUT_FLUSH_LIMIT) {
+              cut = Math.max(0, pending.length - OUTPUT_FLUSH_MARGIN)
+            }
+            if (cut > 0) {
+              publish(pending.slice(0, cut))
+              pending = pending.slice(cut)
+            }
+          },
+          flush() {
+            if (pending) {
+              publish(pending)
+              pending = ''
+            }
+          },
         }
       }
-      child.stdout?.on('data', capture)
-      child.stderr?.on('data', capture)
+      const stdoutBuffer = makeStreamBuffer()
+      const stderrBuffer = makeStreamBuffer()
+      child.stdout?.on('data', chunk => stdoutBuffer.push(chunk))
+      child.stderr?.on('data', chunk => stderrBuffer.push(chunk))
 
-      // Flush whatever is still buffered when the stream ends, so the final line (and its token
-      // footer) reaches the transcript, and no held output is dropped.
-      const flushPending = () => {
-        if (pending) {
-          publish(pending)
-          pending = ''
-        }
+      // Flush both buffers when the stream ends, so the final line (and its token footer) reaches
+      // the transcript, and no held output — including an unterminated key block — is dropped.
+      const flushOutput = () => {
+        stdoutBuffer.flush()
+        stderrBuffer.flush()
       }
 
       child.on('error', error => {
         cleanupChild()
-        flushPending()
+        flushOutput()
         deadline.stop()
         reject(error)
       })
       child.on('close', code => {
         // Cancel any pending SIGKILL and deregister now that the child is gone.
         cleanupChild()
-        flushPending()
+        flushOutput()
         // Snapshot before stop so the active-time figure reflects the whole run; snapshot()
         // keeps working after stop, but reading it here keeps the intent obvious.
         const activeMs = deadline.snapshot().activeMs
