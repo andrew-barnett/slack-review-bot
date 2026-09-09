@@ -10,6 +10,8 @@
 // (a Codex run reporting progress, possibly across retries) -> done. `done` is called from the
 // same settle path that clears the cursor, so a crash cannot leak an entry.
 
+import { redactSecrets } from './redact'
+
 /** The most a surfaced output line may be before it is truncated for Slack. */
 const MAX_LINE = 140
 
@@ -64,10 +66,12 @@ interface Entry {
 }
 
 /**
- * Strip a Codex output line down to something safe and legible in a Slack line: no ANSI
- * colour codes or control characters, whitespace collapsed, and truncated. It is still raw
- * tool output, so a reader should treat it as a hint about what the run is doing, not as
- * trusted or complete text.
+ * Strip a Codex output line down to something safe and legible in a Slack line: secrets redacted,
+ * no ANSI colour codes or control characters, whitespace collapsed, and truncated. It is still raw
+ * tool output, so a reader should treat it as a hint about what the run is doing, not as trusted or
+ * complete text. Redaction is applied here — the dedicated sanitizer for the status line — as well
+ * as at the codex.ts capture choke point, so this line is safe even if reached by another path
+ * (issue #31).
  */
 export function cleanLine(text: string): string {
   const lines = text.split('\n')
@@ -80,8 +84,12 @@ export function cleanLine(text: string): string {
       break
     }
   }
+  // Redact AFTER stripping ANSI/control codes, not before: an escape inserted inside a token (e.g.
+  // a colour code right after `xoxb-`) would break the shape match on the raw text, and the strip
+  // above would then reassemble the whole credential. Normalizing first closes that evasion (#31).
+  const redacted = redactSecrets(last)
   // Backticks would break the inline-code span the status reply wraps this line in.
-  const collapsed = last.replace(/\s+/g, ' ').replace(/`/g, "'")
+  const collapsed = redacted.replace(/\s+/g, ' ').replace(/`/g, "'")
   return collapsed.length > MAX_LINE ? `${collapsed.slice(0, MAX_LINE - 1)}…` : collapsed
 }
 

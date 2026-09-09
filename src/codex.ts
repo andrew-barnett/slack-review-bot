@@ -8,6 +8,7 @@ import { CODEX_ENV_ALLOWLIST, CODEX_ENV_ALLOWLIST_PREFIXES } from './config'
 import { startActiveDeadline, type DeadlineDeps, type DeadlineSnapshot } from './deadline'
 import { REVIEW_OUTPUT_SCHEMA, parseReviewResult, type ReviewRunResult } from './schema'
 import { parseTokensUsed } from './usage'
+import { redactSecrets, createOutputRedactor } from './redact'
 
 export interface CodexRunOptions {
   prompt: string
@@ -71,6 +72,10 @@ export type Spawner = typeof spawn
  * ever read. Without this a long, noisy review grows an unbounded buffer for the life of the run.
  */
 export const TRANSCRIPT_TAIL_LIMIT = 64 * 1024
+
+// The redactor's hold-buffer cap lives with the streaming redactor in redact.ts; re-exported here
+// because the tests import it from this module.
+export { OUTPUT_FLUSH_LIMIT } from './redact'
 
 /** Append to a rolling buffer, keeping only the last `limit` characters. */
 export function appendBoundedTail(buffer: string, text: string, limit: number): string {
@@ -368,33 +373,58 @@ export async function runCodexReview(
         }
       )
 
-      const capture = (chunk: Buffer) => {
-        const text = chunk.toString('utf8')
-        transcript = appendBoundedTail(transcript, text, TRANSCRIPT_TAIL_LIMIT)
-        appendLog(text)
-        // Any output is progress: reset the stall clock so only genuine silence trips it.
-        deadline.markActivity()
-        // Surface the latest line for the status reply. Guarded so a broken progress sink can
-        // never take a review down — reporting what a run is doing is not worth failing it.
+      // Send an already-safe, redacted span of output to every surface that stores or shows it —
+      // the run log, the in-memory transcript, and the status reply — so all three inherit the one
+      // redaction pass (issue #31).
+      // `span` is already redacted by the stream redactor below; distribute it to the run log, the
+      // in-memory transcript, and the status reply.
+      const publish = (span: string) => {
+        if (!span) return
+        transcript = appendBoundedTail(transcript, span, TRANSCRIPT_TAIL_LIMIT)
+        appendLog(span)
+        // Guarded so a broken progress sink can never take a review down — reporting what a run is
+        // doing is not worth failing it.
         if (options.onProgress) {
           try {
-            options.onProgress(text, deadline.snapshot().activeMs)
+            options.onProgress(span, deadline.snapshot().activeMs)
           } catch {
             // A status-side failure is not the run's problem.
           }
         }
       }
-      child.stdout?.on('data', capture)
-      child.stderr?.on('data', capture)
+
+      // stdout and stderr each get their OWN streaming redactor. A credential is written to one
+      // stream in one write; a shared buffer would let the other stream's output interleave into
+      // the middle of a token and defeat the match. The redactor carries key-block state across
+      // chunks, so a chunk-split or over-long PEM key never leaks its body (issue #31).
+      const stdoutRedactor = createOutputRedactor()
+      const stderrRedactor = createOutputRedactor()
+      const captureFrom = (redactor: { push(t: string): string }) => (chunk: Buffer) => {
+        // Reset the stall clock on every raw chunk, before redacting: a run slowly writing one long
+        // line is active, not silent (markActivity must see it even when nothing publishes yet).
+        deadline.markActivity()
+        publish(redactor.push(chunk.toString('utf8')))
+      }
+      child.stdout?.on('data', captureFrom(stdoutRedactor))
+      child.stderr?.on('data', captureFrom(stderrRedactor))
+
+      // Flush both redactors when the stream ends, so the final line (and its token footer) reaches
+      // the transcript. A key block still open at close stays suppressed — flush emits no body.
+      const flushOutput = () => {
+        publish(stdoutRedactor.flush())
+        publish(stderrRedactor.flush())
+      }
 
       child.on('error', error => {
         cleanupChild()
+        flushOutput()
         deadline.stop()
         reject(error)
       })
       child.on('close', code => {
         // Cancel any pending SIGKILL and deregister now that the child is gone.
         cleanupChild()
+        flushOutput()
         // Snapshot before stop so the active-time figure reflects the whole run; snapshot()
         // keeps working after stop, but reading it here keeps the intent obvious.
         const activeMs = deadline.snapshot().activeMs
@@ -428,7 +458,10 @@ export async function runCodexReview(
     // in Codex's own teardown.
     const rawFinalMessage = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf8') : ''
     if (!rawFinalMessage.trim()) {
-      const tail = transcript.slice(-1500).trim()
+      // Redact the whole transcript before slicing: capture already redacted each chunk, but a
+      // secret split across two chunks is only whole here, and this tail is posted to the Slack
+      // error thread and the daemon log (issue #31).
+      const tail = redactSecrets(transcript).slice(-1500).trim()
       throw new CodexOutputError(
         `Codex exited with code ${exit.code} and produced no final message` + (tail ? `:\n${tail}` : ''),
         tokensUsed,
@@ -442,8 +475,13 @@ export async function runCodexReview(
     } catch (error) {
       // The run finished and cost tokens/time, but its final message is malformed or
       // schema-invalid. Surface it as an output failure that still carries the usage, rather
-      // than letting the parse throw a bare error that erases what the run spent.
-      throw new CodexOutputError(error instanceof Error ? error.message : String(error), tokensUsed, activeMs)
+      // than letting the parse throw a bare error that erases what the run spent. Redact in case a
+      // schema/parse error echoes part of the malformed message, which is untrusted output (#31).
+      throw new CodexOutputError(
+        redactSecrets(error instanceof Error ? error.message : String(error)),
+        tokensUsed,
+        activeMs
+      )
     }
 
     return { result, rawFinalMessage, tokensUsed, activeMs }

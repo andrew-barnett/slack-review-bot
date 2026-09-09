@@ -17,6 +17,7 @@ import {
   describeStall,
   describeTimeout,
   runCodexReview,
+  OUTPUT_FLUSH_LIMIT,
   TRANSCRIPT_TAIL_LIMIT,
   withGitSigningDisabled,
   type Spawner,
@@ -403,6 +404,238 @@ test('runCodexReview throws CodexOutputError with usage when no final message is
     t.equal(error.tokensUsed, 80_000, 'usage rides on the error even with no output file')
     t.ok(String(error).includes('produced no final message'), String(error))
   }
+  t.end()
+})
+
+// #31: a malicious PR can print a credential to stdout during the run. A GitHub PAT split across
+// two write chunks matches nothing in either half — only in the assembled buffer. All three
+// persisted/transmitted surfaces must still be redacted: the run-log file on disk, and (when the
+// run fails with no final message) the transcript tail embedded in the error posted to the Slack
+// error thread and the daemon log.
+test('runCodexReview redacts a chunk-split secret from the run log and the error tail', async t => {
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-test-runlog-'))
+  const child = new FakeChild()
+  const spawner = (() => child) as unknown as Spawner
+  const clock = fakeClock()
+
+  const run = runCodexReview({ ...runOptions(), logDir, runId: 'split' }, spawner, clock.deps).then(
+    () => undefined,
+    (error: unknown) => error
+  )
+  await settle()
+  clock.tick(10_000)
+  // Split the PAT across two writes, the first with no newline so buffering must hold it until the
+  // line completes; then close with no output file so the tail also rides on the error.
+  child.stdout.write('leaking ghp_ABCDEFGHIJKLMNOP')
+  child.stdout.write('QRSTUVWXYZ0123456789 now\ntokens used\n5,000\n')
+  await settle()
+  child.emit('close', 1)
+
+  const error = await run
+  const runLog = fs.readFileSync(path.join(logDir, 'split.log'), 'utf8')
+  t.notOk(/ghp_[A-Za-z0-9]{20,}/.test(runLog), 'no whole GitHub token is written to the run log')
+  t.ok(runLog.includes('[redacted:github-token]'), 'the run log holds the masked form')
+  t.ok(error instanceof CodexOutputError, 'still a CodexOutputError')
+  const rendered = String(error)
+  t.notOk(/ghp_[A-Za-z0-9]{20,}/.test(rendered), 'no whole GitHub token survives in the error')
+  t.ok(rendered.includes('[redacted:github-token]'), 'the token is masked in the tail')
+  t.end()
+})
+
+// #31: a PEM private key spans many lines and can be split across chunks (BEGIN + body in one, END
+// in the next). The block must be held until its END arrives and then redacted whole — no key
+// material may reach the run log in the meantime.
+test('runCodexReview redacts a chunk-split PEM private key from the run log', async t => {
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-test-runlog-'))
+  const child = new FakeChild()
+  const spawner = (() => child) as unknown as Spawner
+  const clock = fakeClock()
+
+  const run = runCodexReview({ ...runOptions(), logDir, runId: 'pem' }, spawner, clock.deps).then(
+    () => undefined,
+    () => undefined
+  )
+  await settle()
+  clock.tick(10_000)
+  const begin = '-----BEGIN RSA ' + 'PRIVATE KEY-----'
+  const end = '-----END RSA ' + 'PRIVATE KEY-----'
+  child.stdout.write(`before\n${begin}\nAAAAB3NzaC1yc2EKEYMATERIAL\n`)
+  child.stdout.write(`MOREKEYMATERIALbbbb\n${end}\nafter\n`)
+  await settle()
+  child.emit('close', 1)
+  await run
+
+  const runLog = fs.readFileSync(path.join(logDir, 'pem.log'), 'utf8')
+  t.notOk(runLog.includes('AAAAB3NzaC1yc2EKEYMATERIAL'), 'no key material reaches the run log')
+  t.notOk(runLog.includes('MOREKEYMATERIALbbbb'), 'no key material from the second chunk either')
+  t.ok(runLog.includes('[redacted:private-key]'), 'the whole block is masked')
+  t.ok(runLog.includes('before') && runLog.includes('after'), 'surrounding output is preserved')
+  t.end()
+})
+
+test('runCodexReview does not publish a token split at the hold-buffer limit', async t => {
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-test-runlog-'))
+  const child = new FakeChild()
+  const token = 'ghp_' + 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+  const run = runCodexReview(
+    { ...runOptions(), logDir }, (() => child) as unknown as Spawner, fakeClock().deps
+  ).catch(() => undefined)
+  await settle()
+  // The cap falls inside a normal token, even though the token itself is short.
+  child.stdout.write(' '.repeat(OUTPUT_FLUSH_LIMIT - 10) + token.slice(0, 10))
+  child.stdout.write(token.slice(10) + '\n')
+  await settle()
+  child.emit('close', 1)
+  await run
+  const runLog = fs.readFileSync(path.join(logDir, 'test.log'), 'utf8')
+  t.notOk(runLog.includes(token), 'the full token must not be persisted across forced flushes')
+  fs.rmSync(logDir, { recursive: true, force: true })
+  t.end()
+})
+
+test('runCodexReview does not persist a token embedded in an over-long line', async t => {
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-test-runlog-'))
+  const child = new FakeChild()
+  const token = 'ghp_' + 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+  const run = runCodexReview(
+    { ...runOptions(), logDir }, (() => child) as unknown as Spawner, fakeClock().deps
+  ).catch(() => undefined)
+  await settle()
+  // A single line past the cap with a whole token inside it: the over-long line is dropped, so the
+  // token is never persisted — no cut through it, and no prefix-less suffix published afterward.
+  child.stdout.write(' '.repeat(OUTPUT_FLUSH_LIMIT) + token + ' more\n')
+  await settle()
+  child.emit('close', 1)
+  await run
+  const runLog = fs.readFileSync(path.join(logDir, 'test.log'), 'utf8')
+  t.notOk(runLog.includes(token), 'a token in a dropped over-long line is not persisted')
+  fs.rmSync(logDir, { recursive: true, force: true })
+  t.end()
+})
+
+test('runCodexReview keeps an open PEM block redacted after a forced flush', async t => {
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-test-runlog-'))
+  const child = new FakeChild()
+  const body = 'synthetic-private-key-material-after-flush'
+  const progress: string[] = []
+  const run = runCodexReview(
+    { ...runOptions(), logDir, onProgress: line => progress.push(line) },
+    (() => child) as unknown as Spawner, fakeClock().deps
+  ).catch((error: unknown) => error)
+  await settle()
+  const begin = '-----BEGIN RSA ' + 'PRIVATE KEY-----'
+  // Padding forces publication of BEGIN while the block remains open.
+  child.stdout.write(begin + '\n' + ' '.repeat(OUTPUT_FLUSH_LIMIT - begin.length - 1))
+  child.stdout.write('\n' + body + '\n-----END RSA ' + 'PRIVATE KEY-----\n')
+  await settle()
+  child.emit('close', 1)
+  const error = await run
+  const runLog = fs.readFileSync(path.join(logDir, 'test.log'), 'utf8')
+  t.notOk(runLog.includes(body), 'key material after the forced flush must not reach the run log')
+  t.notOk(progress.join('').includes(body), 'key material must not reach the progress sink')
+  t.notOk(String(error).includes(body), 'key material must not reach the error tail')
+  fs.rmSync(logDir, { recursive: true, force: true })
+  t.end()
+})
+
+test('runCodexReview suppresses an unfinished private key when the child closes', async t => {
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-test-runlog-'))
+  const child = new FakeChild()
+  const body = 'synthetic-private-key-material'
+  const run = runCodexReview(
+    { ...runOptions(), logDir }, (() => child) as unknown as Spawner, fakeClock().deps
+  ).catch((error: unknown) => error)
+  await settle()
+  child.stdout.write('-----BEGIN RSA ' + 'PRIVATE KEY-----\n' + body + '\n')
+  await settle()
+  child.emit('close', 1)
+  const error = await run
+  const runLog = fs.readFileSync(path.join(logDir, 'test.log'), 'utf8')
+  t.notOk(runLog.includes(body), 'unfinished key material must not reach the run log')
+  t.notOk(String(error).includes(body), 'unfinished key material must not reach the error thread')
+  fs.rmSync(logDir, { recursive: true, force: true })
+  t.end()
+})
+
+test('runCodexReview preserves redaction across interleaved stdout and stderr', async t => {
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-test-runlog-'))
+  const child = new FakeChild()
+  const token = 'ghp_' + 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+  const run = runCodexReview(
+    { ...runOptions(), logDir }, (() => child) as unknown as Spawner, fakeClock().deps
+  ).catch((error: unknown) => error)
+  await settle()
+  child.stdout.write(token.slice(0, 10))
+  child.stderr.write('diagnostic\n')
+  child.stdout.write(token.slice(10) + '\n')
+  await settle()
+  child.emit('close', 1)
+  const error = await run
+  const runLog = fs.readFileSync(path.join(logDir, 'test.log'), 'utf8')
+  t.notOk(runLog.includes(token.slice(10)), 'stderr must not force a partial stdout token into the run log')
+  t.notOk(String(error).includes(token.slice(10)), 'interleaving must not leak token material in the error')
+  fs.rmSync(logDir, { recursive: true, force: true })
+  t.end()
+})
+
+test('runCodexReview redacts a multiline env secret emitted over separate chunks', async t => {
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-test-runlog-'))
+  const child = new FakeChild()
+  const name = 'REVIEW_TEST_MULTILINE_SECRET'
+  const previous = process.env[name]
+  const first = 'synthetic-credential-first-line'
+  const second = 'synthetic-credential-second-line'
+  process.env[name] = first + '\n' + second
+  try {
+    const run = runCodexReview(
+      { ...runOptions(), logDir }, (() => child) as unknown as Spawner, fakeClock().deps
+    ).catch(() => undefined)
+    await settle()
+    child.stdout.write(first + '\n')
+    child.stdout.write(second + '\n')
+    await settle()
+    child.emit('close', 1)
+    await run
+    const runLog = fs.readFileSync(path.join(logDir, 'test.log'), 'utf8')
+    t.notOk(runLog.includes(first) || runLog.includes(second), 'both lines of a held env secret must be masked')
+  } finally {
+    if (previous === undefined) delete process.env[name]
+    else process.env[name] = previous
+    fs.rmSync(logDir, { recursive: true, force: true })
+  }
+  t.end()
+})
+
+// #31: the last output line is posted to the Slack status reply via onProgress. A secret printed
+// on that line must reach the sink already redacted (the capture choke point does it).
+test('runCodexReview redacts printed secrets from the progress line', async t => {
+  const child = new FakeChild()
+  const spawner = (() => child) as unknown as Spawner
+  const clock = fakeClock()
+  const progress: string[] = []
+
+  const run = runCodexReview(
+    { ...runOptions(), timeoutMs: 10 * 60_000, onProgress: line => progress.push(line) },
+    spawner,
+    clock.deps
+  ).then(
+    () => undefined,
+    () => undefined
+  )
+  await settle()
+  clock.tick(10_000)
+  // Assemble the Slack-token shape at runtime so no literal secret pattern sits in the source
+  // (GitHub push protection blocks committed matches); the written chunk is still a full match.
+  const slackToken = ['xoxb', '1111111111', '2222222222', 'abcdefabcdefabcdefabcdef'].join('-')
+  child.stdout.write(`token ${slackToken} here\n`)
+  await settle()
+  child.emit('close', 1)
+  await run
+
+  t.ok(progress.length >= 1, 'the chunk was reported')
+  const joined = progress.join('\n')
+  t.notOk(/xox[baprs]-[A-Za-z0-9-]{6,}/.test(joined), 'no Slack token reaches the progress sink')
+  t.ok(joined.includes('[redacted:slack-token]'), 'the token is masked before onProgress')
   t.end()
 })
 

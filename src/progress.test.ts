@@ -124,3 +124,25 @@ test('cleanLine takes the last non-empty line and sanitises it', t => {
   t.equal(cleanLine('   \n  \t '), '', 'nothing legible yields an empty string')
   t.end()
 })
+
+// #31: cleanLine is the sanitizer for the status line, so a secret on the last output line must be
+// masked here too — not only at the codex.ts capture point — so the safety property holds however
+// the line is reached.
+test('cleanLine redacts a secret on the surfaced line', t => {
+  const out = cleanLine('running with token ghp_' + 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789')
+  t.notOk(/ghp_[A-Za-z0-9]{20,}/.test(out), 'no whole token reaches the status line')
+  t.ok(out.includes('[redacted:github-token]'), 'the token is masked')
+  t.end()
+})
+
+// #31: redaction must run AFTER ANSI stripping. A colour escape inserted inside a token would dodge
+// the shape match on the raw text; stripping ANSI then reassembles the whole token, so redacting
+// first (the earlier bug) would surface it. An escape mid-token must still end up masked.
+test('cleanLine redacts a token even when an ANSI escape is inserted inside it', t => {
+  const token = 'ghp_' + 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+  const withAnsi = 'run ' + token.slice(0, 8) + '\x1b[32m' + token.slice(8) // colour code mid-token
+  const out = cleanLine(withAnsi)
+  t.notOk(/ghp_[A-Za-z0-9]{20,}/.test(out), 'the reassembled token does not reach the status line')
+  t.ok(out.includes('[redacted:github-token]'), 'it is masked after ANSI normalization')
+  t.end()
+})
