@@ -157,6 +157,27 @@ test('replayMissed keeps the cursor below a request it just queued', async t => 
   t.end()
 })
 
+test('a shutdown-rejected request remains replayable after newer chatter is recorded', async t => {
+  const request = msg(20)
+  const h = harness(
+    { C1: { messages: [msg(5, false), request], truncated: false } },
+    { version: 1, channels: { C1: { ts: '1.000000', done: [], updatedAt: '' } } }
+  )
+  // The shutdown branch in app.ts returns false without beginning the request.
+  h.deps.dispatch = async () => false
+  const summary = await replayMissed(['C1'], h.deps)
+  const restarted = new CursorTracker(
+    { persist: () => {}, now: () => NOW, log: () => {} },
+    h.cursors.snapshot()
+  )
+  t.equal(summary.dispatched, 0, 'shutdown accepts no new review')
+  t.notOk(
+    restarted.isProcessed('C1', request.ts as string),
+    'recording newer chatter must not acknowledge a review rejected during shutdown'
+  )
+  t.end()
+})
+
 // Being removed from one channel, or losing a scope for it, must not stop the other channels
 // being caught up — and must not advance the cursor of the channel that failed, or its
 // backlog would be lost without ever being read.

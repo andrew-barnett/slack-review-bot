@@ -1,4 +1,5 @@
 import test from 'tape'
+import { SHUTDOWN_GRACE_MS } from './codex'
 import { loadConfig, looksLikeUserId, parseMsList, parseUserIds } from './config'
 
 /** The two required keys, so a test can vary only the knob it cares about. */
@@ -104,6 +105,16 @@ test('SHUTDOWN_DRAIN_MS defaults finite and is tunable', t => {
     loadConfig({ ...credentials, SHUTDOWN_DRAIN_MS: 'later' }).shutdownDrainMs,
     15_000,
     'a typo falls back to the default'
+  )
+  t.end()
+})
+
+test('default shutdown leaves time to reap children within the documented supervisor budget', t => {
+  const supervisorBudgetMs = 20_000
+  const config = loadConfig({ ...credentials })
+  t.ok(
+    config.shutdownDrainMs + SHUTDOWN_GRACE_MS < supervisorBudgetMs,
+    'review drain plus child-kill grace must finish before the supervisor kills the daemon'
   )
   t.end()
 })
