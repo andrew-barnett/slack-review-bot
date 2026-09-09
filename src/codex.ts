@@ -73,9 +73,9 @@ export type Spawner = typeof spawn
  */
 export const TRANSCRIPT_TAIL_LIMIT = 64 * 1024
 
-// The redactor's hold-buffer cap and forced-flush margin live with the streaming redactor in
-// redact.ts; re-exported here because the tests import them from this module.
-export { OUTPUT_FLUSH_LIMIT, OUTPUT_FLUSH_MARGIN } from './redact'
+// The redactor's hold-buffer cap lives with the streaming redactor in redact.ts; re-exported here
+// because the tests import it from this module.
+export { OUTPUT_FLUSH_LIMIT } from './redact'
 
 /** Append to a rolling buffer, keeping only the last `limit` characters. */
 export function appendBoundedTail(buffer: string, text: string, limit: number): string {

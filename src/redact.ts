@@ -92,17 +92,19 @@ export function redactSecrets(text: string, env: NodeJS.ProcessEnv = process.env
  */
 export const OUTPUT_FLUSH_LIMIT = 64 * 1024
 
-/**
- * On a forced flush of an over-long line, keep this many trailing characters buffered. Because the
- * buffer is redacted BEFORE it is cut, a credential wholly inside it is already masked; the margin
- * additionally ensures the cut never lands inside a credential that straddles the boundary (which
- * would leave its two halves contiguous in the run-log file). Comfortably larger than any
- * single-line credential.
- */
-export const OUTPUT_FLUSH_MARGIN = 4 * 1024
-
 const KEY_BEGIN_LINE = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/
 const KEY_END_LINE = /-----END [A-Z0-9 ]*PRIVATE KEY-----/
+
+/** Whether `s` contains a BEGIN PRIVATE KEY marker with no matching END after the last one. */
+function hasOpenPrivateKeyBegin(s: string): boolean {
+  const all = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/g
+  let match: RegExpExecArray | null
+  let open = false
+  while ((match = all.exec(s)) !== null) {
+    open = !KEY_END_LINE.test(s.slice(match.index))
+  }
+  return open
+}
 
 /** A stateful redactor for one output stream: feed raw chunks, get back safe-to-publish text. */
 export interface OutputRedactor {
@@ -119,10 +121,18 @@ export interface OutputRedactor {
  * following line is suppressed until the matching `END`, however many chunks or bytes that spans, so
  * an over-long or chunk-split key can never leak its body. One redactor per stream (stdout, stderr)
  * keeps each stream's lines contiguous, so the other stream cannot splice bytes into a token.
+ *
+ * A line longer than the cap has no safe cut (a cut inside a token would orphan one half), so such a
+ * line is dropped behind a notice — and, if it opened a key block, the block state is entered so the
+ * body is suppressed too. Over-long single lines are not normal Codex output.
  */
 export function createOutputRedactor(env: NodeJS.ProcessEnv = process.env): OutputRedactor {
   let pending = '' // raw output not yet safe to publish: a partial line, or a suppressed key body
   let inKeyBlock = false // between a BEGIN and END PRIVATE KEY line, tracked across chunks
+  // Discarding the rest of an over-long non-key line: set when the cap drops such a line, so the
+  // remainder — which may carry the tail of a credential whose head was dropped — is discarded too,
+  // through its terminating newline, rather than published prefix-less.
+  let droppingLine = false
 
   const emitLine = (line: string): string => {
     if (inKeyBlock) {
@@ -151,27 +161,49 @@ export function createOutputRedactor(env: NodeJS.ProcessEnv = process.env): Outp
   return {
     push(text) {
       pending += text
-      let out = drainLines()
+      let out = ''
+      // Finish discarding a dropped over-long line: swallow everything up to and including its next
+      // newline before any normal processing resumes.
+      if (droppingLine) {
+        const nl = pending.indexOf('\n')
+        if (nl === -1) {
+          pending = ''
+          return ''
+        }
+        pending = pending.slice(nl + 1)
+        droppingLine = false
+      }
+      out += drainLines()
       if (pending.length >= OUTPUT_FLUSH_LIMIT) {
         if (inKeyBlock) {
-          pending = '' // key body with no newline in sight: suppress it, keep nothing
+          pending = '' // suppressed key body with no newline in sight: keep nothing
+        } else if (hasOpenPrivateKeyBegin(pending)) {
+          // The over-long line opened a key block (a BEGIN with no END yet). Enter the block so
+          // every following line is suppressed until END — the marker itself will not survive the
+          // drop, so remembering the state here is what prevents the body leaking afterwards.
+          inKeyBlock = true
+          out += '[redacted:private-key]\n'
+          pending = ''
         } else {
-          // A single over-long line. Redact the whole buffer FIRST (so a credential wholly inside
-          // it is masked), THEN keep a trailing margin so the cut cannot split one that straddles
-          // the boundary. redactSecrets also masks an unterminated key block from its BEGIN.
-          const redacted = redactSecrets(pending, env)
-          const keepFrom = Math.max(0, redacted.length - OUTPUT_FLUSH_MARGIN)
-          out += redacted.slice(0, keepFrom)
-          pending = redacted.slice(keepFrom)
+          // An over-long non-key line with no newline. There is no cut that can redact a partial
+          // credential safely (a cut inside a token orphans one half), and an over-long single line
+          // is not normal Codex output, so drop it behind a notice and keep dropping until it ends.
+          out += '[redacted:over-long output line]\n'
+          droppingLine = true
+          pending = ''
         }
       }
       return out
     },
     flush() {
-      let out = drainLines()
-      if (pending && !inKeyBlock) out += redactSecrets(pending, env)
+      let out = ''
+      if (!droppingLine) {
+        out += drainLines()
+        if (pending && !inKeyBlock) out += redactSecrets(pending, env)
+      }
       pending = ''
       inKeyBlock = false
+      droppingLine = false
       return out
     },
   }

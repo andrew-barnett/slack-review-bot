@@ -134,6 +134,35 @@ test('createOutputRedactor suppresses a PEM key body across chunks and past the 
   t.end()
 })
 
+// Regression: a BEGIN marker at the END of an over-long line with no newline. The cap must notice
+// the block is open and enter it, or the key body arriving in the next chunk would publish unmasked.
+test('createOutputRedactor enters the key block when BEGIN ends an over-long line', t => {
+  const r = createOutputRedactor({})
+  const begin = '-----BEGIN RSA ' + 'PRIVATE KEY-----'
+  let out = r.push(' '.repeat(64 * 1024) + begin) // over-long, no newline, ends with the marker
+  out += r.push('\nKEYBODYDDDD\n-----END RSA ' + 'PRIVATE KEY-----\nafter\n')
+  out += r.flush()
+  t.notOk(out.includes('KEYBODYDDDD'), 'the key body after the forced flush is suppressed')
+  t.ok(out.includes('[redacted:private-key]'), 'the block is marked redacted')
+  t.ok(out.includes('after'), 'output after END resumes')
+  t.end()
+})
+
+// Regression: an over-long non-key line is dropped whole, including the suffix that arrives in the
+// next chunk — so a token straddling the drop point cannot leak its tail prefix-less.
+test('createOutputRedactor drops an over-long line and its continuation, not just the head', t => {
+  const r = createOutputRedactor({})
+  const token = 'ghp_' + 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+  let out = r.push(' '.repeat(64 * 1024) + token.slice(0, 10)) // head of the token, over the cap
+  out += r.push(token.slice(10) + ' trailing\n') // the suffix, then the line finally ends
+  out += r.push('next line\n')
+  out += r.flush()
+  t.notOk(out.includes(token), 'the whole token never appears')
+  t.notOk(out.includes(token.slice(10)), 'the prefix-less suffix is dropped too, not published')
+  t.ok(out.includes('next line'), 'normal output after the dropped line resumes')
+  t.end()
+})
+
 // flush emits the trailing partial line at end of stream (the token footer often has no final
 // newline), but a key block still open at close emits no body.
 test('createOutputRedactor flushes a trailing line but never an open key body', t => {

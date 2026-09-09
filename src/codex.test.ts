@@ -18,7 +18,6 @@ import {
   describeTimeout,
   runCodexReview,
   OUTPUT_FLUSH_LIMIT,
-  OUTPUT_FLUSH_MARGIN,
   TRANSCRIPT_TAIL_LIMIT,
   withGitSigningDisabled,
   type Spawner,
@@ -494,7 +493,7 @@ test('runCodexReview does not publish a token split at the hold-buffer limit', a
   t.end()
 })
 
-test('runCodexReview redacts a token across the actual forced-flush cut', async t => {
+test('runCodexReview does not persist a token embedded in an over-long line', async t => {
   const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-test-runlog-'))
   const child = new FakeChild()
   const token = 'ghp_' + 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
@@ -502,15 +501,14 @@ test('runCodexReview redacts a token across the actual forced-flush cut', async 
     { ...runOptions(), logDir }, (() => child) as unknown as Spawner, fakeClock().deps
   ).catch(() => undefined)
   await settle()
-  // The whole token has arrived, but the retained margin starts ten characters into it.
-  const cut = OUTPUT_FLUSH_LIMIT - OUTPUT_FLUSH_MARGIN
-  child.stdout.write(' '.repeat(cut - 10) + token + ' '.repeat(OUTPUT_FLUSH_MARGIN + 10 - token.length))
-  child.stdout.write('\n')
+  // A single line past the cap with a whole token inside it: the over-long line is dropped, so the
+  // token is never persisted — no cut through it, and no prefix-less suffix published afterward.
+  child.stdout.write(' '.repeat(OUTPUT_FLUSH_LIMIT) + token + ' more\n')
   await settle()
   child.emit('close', 1)
   await run
   const runLog = fs.readFileSync(path.join(logDir, 'test.log'), 'utf8')
-  t.notOk(runLog.includes(token), 'the margin must not split and persist a complete credential')
+  t.notOk(runLog.includes(token), 'a token in a dropped over-long line is not persisted')
   fs.rmSync(logDir, { recursive: true, force: true })
   t.end()
 })
