@@ -110,6 +110,21 @@ test('runJob reacts warning and explains when the review run fails', async t => 
   t.end()
 })
 
+// #32: a run that fails because a shutdown force-killed its child is NOT a review failure — it was
+// our own deploy. The job must post no error reaction or thread (the review will replay on the next
+// start), so an operator never sees a misleading error for a routine restart.
+test('runJob stays silent when the failure is a shutdown force-kill', async t => {
+  const rec = recorder(
+    async () => { throw new Error('Codex produced no final message') },
+    { isShuttingDown: () => true }
+  )
+  const outcome = await runJob(request, emoji, rec.deps)
+  t.equal(outcome, 'skipped', 'a shutdown kill is not reported as an error outcome')
+  t.deepEqual(rec.added, ['eyes'], 'no warning reaction is added')
+  t.deepEqual(rec.threads, [], 'no error thread is posted')
+  t.end()
+})
+
 // The reaction is a status surface, not a precondition. A workspace that has not
 // installed :approved_stamp: (reactions.add -> invalid_name) must not cost the user the
 // review they already paid for.

@@ -95,6 +95,19 @@ test('SLACK_REQUEST_TIMEOUT_MS defaults finite and is tunable', t => {
   t.end()
 })
 
+// The shutdown drain deadline (issue #32) defaults finite and is tunable for a longer supervisor
+// grace; a typo falls back rather than silently disabling the wait.
+test('SHUTDOWN_DRAIN_MS defaults finite and is tunable', t => {
+  t.equal(loadConfig({ ...credentials }).shutdownDrainMs, 15_000, 'default 15s')
+  t.equal(loadConfig({ ...credentials, SHUTDOWN_DRAIN_MS: '300000' }).shutdownDrainMs, 300_000, 'override honoured')
+  t.equal(
+    loadConfig({ ...credentials, SHUTDOWN_DRAIN_MS: 'later' }).shutdownDrainMs,
+    15_000,
+    'a typo falls back to the default'
+  )
+  t.end()
+})
+
 // The per-review usage reply defaults on — the feature is only useful if it appears without
 // configuration — but an operator who finds it noisy has to be able to switch it off, while the
 // status totals it feeds keep accruing regardless.

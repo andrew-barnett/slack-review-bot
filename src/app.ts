@@ -21,6 +21,7 @@ import {
   SHUTDOWN_POLL_MS,
 } from './codex'
 import { loadConfig, looksLikeUserId } from './config'
+import { createShutdownController } from './shutdown'
 import { openCursorStore, openNullCursorStore } from './cursor'
 import { makeGitHubEffects } from './github'
 import { renderHelp } from './help'
@@ -123,6 +124,10 @@ async function main(): Promise<void> {
   const reviewAttempts = config.stallBackoffMs.length > 0 ? config.stallBackoffMs.length : 1
   // Tracks live `codex exec` children so shutdown can signal them instead of orphaning them.
   const childRegistry = createChildRegistry()
+  // The termination contract (issue #32): stop accepting work on a signal, drain in-flight reviews
+  // to idle, and — if that times out — force-kill them so they replay cleanly instead of settling
+  // as a spurious error. Its `forced` flag gates the cursor settle and the error thread below.
+  const shutdown = createShutdownController()
   const runReview = makeReviewRunner(config, log, runCodexReview, reviews, childRegistry)
   // How far each channel has been processed, on disk. This is what makes a restart able to
   // pick up messages posted while the socket was down — Slack never redelivers them.
@@ -263,6 +268,13 @@ async function main(): Promise<void> {
       log('message.duplicate', { key, source })
       return false
     }
+    // Once a shutdown is under way, take on no new work: the socket is closing and the daemon is
+    // draining. Leaving the cursor untouched means a live message that just missed the cutoff is
+    // replayed on the next start rather than acknowledged and dropped (issue #32).
+    if (shutdown.requested) {
+      log('review.rejected.shutdown', { key, source })
+      return false
+    }
     markHandled(key)
     // Held below this message until the job settles, so a restart mid-review replays it
     // instead of leaving a message acknowledged with :eyes: and never answered.
@@ -279,6 +291,7 @@ async function main(): Promise<void> {
       recordUsage: u => {
         usage = u
       },
+      isShuttingDown: () => shutdown.forced,
       log,
     }
 
@@ -318,8 +331,8 @@ async function main(): Promise<void> {
 
     // Deliberately not awaited: Bolt acks the event when this handler returns, and a
     // review takes far longer than Slack's ack window. The queue, not the handler,
-    // is what serialises the work.
-    void queue
+    // is what serialises the work. The settled promise is tracked so a shutdown can drain it.
+    const settled = queue
       .run(() => {
         // The slot is taken: promote from waiting to active in the live status. Done here, not
         // inside the job, so the status shows it running the instant it starts — before the
@@ -348,12 +361,17 @@ async function main(): Promise<void> {
         log('job.crashed', { key, error: String(error) })
       })
       .finally(() => {
-        // Settled either way: the message has had its review, and a run that failed has
-        // already reported that in the channel. Replaying it would repeat the failure.
-        cursors.settle(request.message.channel, request.message.ts)
+        // Settle the cursor UNLESS a shutdown force-killed this review: a run that finished (passed
+        // or reported its own failure) should not replay, but one cut short by our deploy must stay
+        // unsettled so it replays cleanly on the next start rather than being dropped (issue #32).
+        if (!shutdown.forced) {
+          cursors.settle(request.message.channel, request.message.ts)
+        }
         // And it is no longer running or waiting, so it leaves the live status too.
         reviews.done(key)
       })
+    // Tracked so a shutdown drains this review to settlement before exiting (issue #32).
+    shutdown.track(settled)
 
     return true
   }
@@ -511,29 +529,47 @@ async function main(): Promise<void> {
   })
   setInterval(() => freeze.check(), FREEZE_CHECK_MS)
 
-  let stopping = false
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     process.on(signal, () => {
       // A second signal while already shutting down should not restart the sequence.
-      if (stopping) return
-      stopping = true
-      log('bot.stopping', { signal, codexRuns: childRegistry.size() })
-      // Stop the socket and drain the detached `codex exec` children concurrently, then exit.
-      // draining SIGTERMs every live child's process group, waits for them to exit, and escalates
-      // to SIGKILL for any that cling past the grace — so shutdown never leaves a wedged review
-      // reparented to init. An interrupted review replays on the next start, as designed.
-      const drained = drainChildRegistry(childRegistry, {
-        now: Date.now,
-        setTimer: (fn, ms) => {
-          const t = setTimeout(fn, ms)
-          t.unref?.()
-          return t
-        },
-        graceMs: SHUTDOWN_GRACE_MS,
-        pollMs: SHUTDOWN_POLL_MS,
-        log,
-      })
-      void Promise.allSettled([app.stop(), drained]).finally(() => process.exit(0))
+      if (!shutdown.request()) return
+      log('bot.stopping', { signal, active: shutdown.active(), codexRuns: childRegistry.size() })
+      void (async () => {
+        // Stop the socket first so no new events arrive; an in-flight review keeps running.
+        const socketStopped = app.stop().catch(error => {
+          log('bot.stop.socket-failed', { error: String(error) })
+        })
+        // Drain to idle: wait for the active review(s) to settle, up to the deadline. A drained
+        // review has settled its own cursor and reported its own outcome; nothing more to do.
+        const result = await shutdown.drain(config.shutdownDrainMs)
+        if (result === 'forced') {
+          // The deadline passed. `shutdown.forced` is now set, so the killed review's job suppresses
+          // its error thread and its cursor is left unsettled — it replays cleanly on the next start.
+          log('bot.drain-timeout', {
+            active: shutdown.active(),
+            drainMs: config.shutdownDrainMs,
+            hint: 'force-killing in-flight reviews; they replay on the next start',
+          })
+        } else {
+          log('bot.drained', {})
+        }
+        // Kill any surviving children: all of them in the forced case, a no-op once drained. This
+        // SIGTERMs each child's process group, waits, and escalates to SIGKILL for any that cling
+        // past the grace, so shutdown never leaves a review reparented to init.
+        await drainChildRegistry(childRegistry, {
+          now: Date.now,
+          setTimer: (fn, ms) => {
+            const t = setTimeout(fn, ms)
+            t.unref?.()
+            return t
+          },
+          graceMs: SHUTDOWN_GRACE_MS,
+          pollMs: SHUTDOWN_POLL_MS,
+          log,
+        })
+        await socketStopped
+        process.exit(0)
+      })()
     })
   }
 }
