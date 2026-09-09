@@ -21,11 +21,11 @@ const SHAPE_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   // PEM private-key blocks first: a multi-line block that could otherwise be partly matched by a
   // narrower rule. Non-greedy so adjacent blocks are redacted separately.
   [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g, '[redacted:private-key]'],
-  // An UNTERMINATED key block: a BEGIN whose END has not arrived — a run killed mid-key-print, or a
-  // forced/close flush of a still-open block. Runs after the terminated rule above, so any BEGIN
-  // left is genuinely open; redact it through end-of-text. This only ever sees an open block on a
-  // flush/close/error-tail span (safeRedactBoundary holds open blocks out of normal spans), so it
-  // cannot over-redact mid-stream output.
+  // An UNTERMINATED key block: a BEGIN whose END has not arrived. The streaming redactor suppresses
+  // open blocks line by line, so this rule is the backstop for the non-streaming callers of
+  // redactSecrets — the error-tail redaction of a transcript that ends mid-key, and the over-long
+  // single-line-with-a-BEGIN case in the redactor's cap path. Runs after the terminated rule above,
+  // so any BEGIN left here is genuinely open; redact it through end-of-text.
   [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*$/g, '[redacted:private-key]'],
   // Slack bot/user/config tokens (xoxb-, xoxp-, xoxa-, xoxr-, xoxs-) and app-level tokens (xapp-).
   [/xox[baprs]-[A-Za-z0-9-]{6,}/g, '[redacted:slack-token]'],
@@ -85,29 +85,94 @@ export function redactSecrets(text: string, env: NodeJS.ProcessEnv = process.env
   return out
 }
 
-const PEM_BEGIN = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/g
-const PEM_END = /-----END [A-Z0-9 ]*PRIVATE KEY-----/
+/**
+ * Cap on the streaming redactor's hold buffer. Output is normally published at each line boundary;
+ * this only forces progress when a single line (or a suppressed key body) grows past it, so a run
+ * that never emits a newline cannot grow the buffer without limit.
+ */
+export const OUTPUT_FLUSH_LIMIT = 64 * 1024
 
 /**
- * How much of a streaming output buffer is safe to redact and publish now, so that redaction never
- * runs on a fragment of a secret that is still arriving. A secret never spans a line, so this is
- * "up to the last newline" — except a PEM private-key block, which does span lines: while a
- * `BEGIN … PRIVATE KEY` marker has no matching `END` yet, hold everything from that marker on, so
- * the whole block is redacted together once its `END` arrives.
- *
- * Returns a cut length in [0, buf.length]. 0 means nothing is safe yet (a partial first line, or an
- * open key block from the start) — the caller holds the whole buffer, flushing it only when it must
- * bound memory or the stream closes. Callers still run {@link redactSecrets} on whatever they cut.
+ * On a forced flush of an over-long line, keep this many trailing characters buffered. Because the
+ * buffer is redacted BEFORE it is cut, a credential wholly inside it is already masked; the margin
+ * additionally ensures the cut never lands inside a credential that straddles the boundary (which
+ * would leave its two halves contiguous in the run-log file). Comfortably larger than any
+ * single-line credential.
  */
-export function safeRedactBoundary(buf: string): number {
-  let end = buf.lastIndexOf('\n') + 1
-  if (end === 0) return 0
-  const region = buf.slice(0, end)
-  PEM_BEGIN.lastIndex = 0
-  let match: RegExpExecArray | null
-  while ((match = PEM_BEGIN.exec(region)) !== null) {
-    // The first BEGIN with no END after it opens a block that is still arriving: hold from here.
-    if (!PEM_END.test(region.slice(match.index))) return match.index
+export const OUTPUT_FLUSH_MARGIN = 4 * 1024
+
+const KEY_BEGIN_LINE = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/
+const KEY_END_LINE = /-----END [A-Z0-9 ]*PRIVATE KEY-----/
+
+/** A stateful redactor for one output stream: feed raw chunks, get back safe-to-publish text. */
+export interface OutputRedactor {
+  /** Feed a raw chunk; returns redacted text safe to publish now (may be empty while buffering). */
+  push(text: string): string
+  /** Flush the buffered tail at end of stream; returns the final redacted text. */
+  flush(): string
+}
+
+/**
+ * A streaming redactor that is correct across chunk boundaries, which stateless per-chunk redaction
+ * is not. It processes output a line at a time (a single-line secret is always whole within a line)
+ * and carries key-block state ACROSS chunks: once a `BEGIN … PRIVATE KEY` line is seen, every
+ * following line is suppressed until the matching `END`, however many chunks or bytes that spans, so
+ * an over-long or chunk-split key can never leak its body. One redactor per stream (stdout, stderr)
+ * keeps each stream's lines contiguous, so the other stream cannot splice bytes into a token.
+ */
+export function createOutputRedactor(env: NodeJS.ProcessEnv = process.env): OutputRedactor {
+  let pending = '' // raw output not yet safe to publish: a partial line, or a suppressed key body
+  let inKeyBlock = false // between a BEGIN and END PRIVATE KEY line, tracked across chunks
+
+  const emitLine = (line: string): string => {
+    if (inKeyBlock) {
+      if (KEY_END_LINE.test(line)) inKeyBlock = false
+      return '' // suppress every line of the block; BEGIN already emitted the one placeholder
+    }
+    if (KEY_BEGIN_LINE.test(line)) {
+      if (KEY_END_LINE.test(line)) return redactSecrets(line, env) // whole block on a single line
+      inKeyBlock = true
+      return '[redacted:private-key]\n'
+    }
+    return redactSecrets(line, env)
   }
-  return end
+
+  const drainLines = (): string => {
+    let out = ''
+    let nl = pending.indexOf('\n')
+    while (nl !== -1) {
+      out += emitLine(pending.slice(0, nl + 1))
+      pending = pending.slice(nl + 1)
+      nl = pending.indexOf('\n')
+    }
+    return out
+  }
+
+  return {
+    push(text) {
+      pending += text
+      let out = drainLines()
+      if (pending.length >= OUTPUT_FLUSH_LIMIT) {
+        if (inKeyBlock) {
+          pending = '' // key body with no newline in sight: suppress it, keep nothing
+        } else {
+          // A single over-long line. Redact the whole buffer FIRST (so a credential wholly inside
+          // it is masked), THEN keep a trailing margin so the cut cannot split one that straddles
+          // the boundary. redactSecrets also masks an unterminated key block from its BEGIN.
+          const redacted = redactSecrets(pending, env)
+          const keepFrom = Math.max(0, redacted.length - OUTPUT_FLUSH_MARGIN)
+          out += redacted.slice(0, keepFrom)
+          pending = redacted.slice(keepFrom)
+        }
+      }
+      return out
+    },
+    flush() {
+      let out = drainLines()
+      if (pending && !inKeyBlock) out += redactSecrets(pending, env)
+      pending = ''
+      inKeyBlock = false
+      return out
+    },
+  }
 }

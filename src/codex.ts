@@ -8,7 +8,7 @@ import { CODEX_ENV_ALLOWLIST, CODEX_ENV_ALLOWLIST_PREFIXES } from './config'
 import { startActiveDeadline, type DeadlineDeps, type DeadlineSnapshot } from './deadline'
 import { REVIEW_OUTPUT_SCHEMA, parseReviewResult, type ReviewRunResult } from './schema'
 import { parseTokensUsed } from './usage'
-import { redactSecrets, safeRedactBoundary } from './redact'
+import { redactSecrets, createOutputRedactor } from './redact'
 
 export interface CodexRunOptions {
   prompt: string
@@ -73,21 +73,9 @@ export type Spawner = typeof spawn
  */
 export const TRANSCRIPT_TAIL_LIMIT = 64 * 1024
 
-/**
- * Cap on the redaction hold buffer. Output is normally published at each line/PEM boundary; this
- * only forces a flush when a single line (or an unterminated key block) grows past it, so a run
- * that never emits a newline cannot grow `pending` without limit. A real PEM key is a few KB, well
- * under this, so a legitimate block always completes and redacts whole before the cap is reached.
- */
-export const OUTPUT_FLUSH_LIMIT = 64 * 1024
-
-/**
- * When a forced flush fires (a line longer than the cap), keep this many trailing characters
- * buffered rather than flushing everything, so a credential sitting across the forced boundary is
- * held intact for the next chunk instead of being split into two unmatched halves. Comfortably
- * larger than any single-line credential.
- */
-export const OUTPUT_FLUSH_MARGIN = 4 * 1024
+// The redactor's hold-buffer cap and forced-flush margin live with the streaming redactor in
+// redact.ts; re-exported here because the tests import them from this module.
+export { OUTPUT_FLUSH_LIMIT, OUTPUT_FLUSH_MARGIN } from './redact'
 
 /** Append to a rolling buffer, keeping only the last `limit` characters. */
 export function appendBoundedTail(buffer: string, text: string, limit: number): string {
@@ -388,64 +376,43 @@ export async function runCodexReview(
       // Send an already-safe, redacted span of output to every surface that stores or shows it —
       // the run log, the in-memory transcript, and the status reply — so all three inherit the one
       // redaction pass (issue #31).
+      // `span` is already redacted by the stream redactor below; distribute it to the run log, the
+      // in-memory transcript, and the status reply.
       const publish = (span: string) => {
         if (!span) return
-        const redacted = redactSecrets(span)
-        transcript = appendBoundedTail(transcript, redacted, TRANSCRIPT_TAIL_LIMIT)
-        appendLog(redacted)
+        transcript = appendBoundedTail(transcript, span, TRANSCRIPT_TAIL_LIMIT)
+        appendLog(span)
         // Guarded so a broken progress sink can never take a review down — reporting what a run is
         // doing is not worth failing it.
         if (options.onProgress) {
           try {
-            options.onProgress(redacted, deadline.snapshot().activeMs)
+            options.onProgress(span, deadline.snapshot().activeMs)
           } catch {
             // A status-side failure is not the run's problem.
           }
         }
       }
 
-      // stdout and stderr each get their OWN hold buffer. A credential is written to one stream in
-      // one write; sharing a buffer would let the other stream's output interleave into the middle
-      // of it and defeat the match, leaking fragments (issue #31). Per-stream buffering keeps each
-      // stream's lines contiguous for redaction.
-      const makeStreamBuffer = () => {
-        let pending = ''
-        return {
-          push(chunk: Buffer) {
-            // Reset the stall clock on every raw chunk, before buffering: a run slowly writing one
-            // long line is active, not silent (markActivity must see it even when nothing publishes).
-            deadline.markActivity()
-            pending += chunk.toString('utf8')
-            let cut = safeRedactBoundary(pending)
-            // Nothing safe yet but the buffer is growing without bound (a line, or an open key
-            // block, longer than the cap): flush all but a trailing margin so a credential across
-            // the forced boundary is not split, and memory stays bounded. Redaction still runs.
-            if (cut === 0 && pending.length >= OUTPUT_FLUSH_LIMIT) {
-              cut = Math.max(0, pending.length - OUTPUT_FLUSH_MARGIN)
-            }
-            if (cut > 0) {
-              publish(pending.slice(0, cut))
-              pending = pending.slice(cut)
-            }
-          },
-          flush() {
-            if (pending) {
-              publish(pending)
-              pending = ''
-            }
-          },
-        }
+      // stdout and stderr each get their OWN streaming redactor. A credential is written to one
+      // stream in one write; a shared buffer would let the other stream's output interleave into
+      // the middle of a token and defeat the match. The redactor carries key-block state across
+      // chunks, so a chunk-split or over-long PEM key never leaks its body (issue #31).
+      const stdoutRedactor = createOutputRedactor()
+      const stderrRedactor = createOutputRedactor()
+      const captureFrom = (redactor: { push(t: string): string }) => (chunk: Buffer) => {
+        // Reset the stall clock on every raw chunk, before redacting: a run slowly writing one long
+        // line is active, not silent (markActivity must see it even when nothing publishes yet).
+        deadline.markActivity()
+        publish(redactor.push(chunk.toString('utf8')))
       }
-      const stdoutBuffer = makeStreamBuffer()
-      const stderrBuffer = makeStreamBuffer()
-      child.stdout?.on('data', chunk => stdoutBuffer.push(chunk))
-      child.stderr?.on('data', chunk => stderrBuffer.push(chunk))
+      child.stdout?.on('data', captureFrom(stdoutRedactor))
+      child.stderr?.on('data', captureFrom(stderrRedactor))
 
-      // Flush both buffers when the stream ends, so the final line (and its token footer) reaches
-      // the transcript, and no held output — including an unterminated key block — is dropped.
+      // Flush both redactors when the stream ends, so the final line (and its token footer) reaches
+      // the transcript. A key block still open at close stays suppressed — flush emits no body.
       const flushOutput = () => {
-        stdoutBuffer.flush()
-        stderrBuffer.flush()
+        publish(stdoutRedactor.flush())
+        publish(stderrRedactor.flush())
       }
 
       child.on('error', error => {

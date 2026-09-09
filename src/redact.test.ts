@@ -1,5 +1,5 @@
 import test from 'tape'
-import { redactSecrets, safeRedactBoundary } from './redact'
+import { redactSecrets, createOutputRedactor } from './redact'
 
 // Credential-shaped fixtures are assembled at runtime (join/concat) rather than written as literals,
 // so no contiguous secret pattern sits in the committed source to trip GitHub push protection. The
@@ -94,23 +94,56 @@ test('redactSecrets leaves ordinary output unchanged', t => {
   t.end()
 })
 
-// safeRedactBoundary decides how much of a streaming buffer is safe to redact now — the mechanism
-// that stops a secret split across chunks from being redacted as two unmatched halves.
-test('safeRedactBoundary publishes only complete lines', t => {
-  t.equal(safeRedactBoundary('no newline yet'), 0, 'a partial first line holds entirely')
-  t.equal(safeRedactBoundary('done\npartial'), 'done\n'.length, 'holds back the trailing partial line')
-  t.equal(safeRedactBoundary('a\nb\n'), 4, 'a fully-terminated buffer is entirely safe')
+// The streaming redactor only publishes complete lines, holding a partial line until its newline
+// arrives — this is what stops a secret split across chunks from being redacted as two unmatched
+// halves. A whole line, secret or not, is emitted; a partial line is withheld.
+test('createOutputRedactor holds a partial line until its newline arrives', t => {
+  const r = createOutputRedactor({})
+  t.equal(r.push('running jest'), '', 'a line with no newline yet is withheld')
+  t.equal(r.push(' and mocha\n'), 'running jest and mocha\n', 'the completed line is published whole')
   t.end()
 })
 
-// A PEM private key spans lines; while its END has not arrived, everything from BEGIN must be held
-// so the block is redacted whole, not leaked line by line.
-test('safeRedactBoundary holds an unterminated PEM block from its BEGIN', t => {
+// A GitHub token split across two chunks matches nothing in either half; because the redactor waits
+// for the whole line, the token is redacted once, and never surfaced in two contiguous halves.
+test('createOutputRedactor redacts a token split across chunks', t => {
+  const r = createOutputRedactor({})
+  const first = r.push('using ghp_ABCDEFGHIJKLMNOP')
+  const second = r.push('QRSTUVWXYZ0123456789 now\n')
+  const all = first + second
+  t.notOk(/ghp_[A-Za-z0-9]{20,}/.test(all), 'no whole token is published')
+  t.ok(all.includes('[redacted:github-token]'), 'it is masked once the line completes')
+  t.end()
+})
+
+// A PEM private key spans lines and may span chunks/an over-long body. Once BEGIN is seen every
+// following line is suppressed until END, across chunks and regardless of size, so no key material
+// is ever published — only a single placeholder.
+test('createOutputRedactor suppresses a PEM key body across chunks and past the cap', t => {
+  const r = createOutputRedactor({})
   const begin = '-----BEGIN RSA ' + 'PRIVATE KEY-----'
-  const open = `safe line\n${begin}\nKEYBODY\n`
-  t.equal(safeRedactBoundary(open), 'safe line\n'.length, 'holds from the BEGIN line, publishing only what precedes it')
   const end = '-----END RSA ' + 'PRIVATE KEY-----'
-  const closed = `safe line\n${begin}\nKEYBODY\n${end}\ntail\n`
-  t.equal(safeRedactBoundary(closed), closed.length, 'once END arrives the whole block is safe to publish')
+  let out = r.push(`before\n${begin}\nKEYBODYAAAA\n`)
+  out += r.push('x'.repeat(70 * 1024) + '\n') // an over-long body line: forced past the cap
+  out += r.push(`KEYBODYBBBB\n${end}\nafter\n`)
+  out += r.flush()
+  t.notOk(out.includes('KEYBODYAAAA') || out.includes('KEYBODYBBBB'), 'no key material is published')
+  t.notOk(out.includes('x'.repeat(64)), 'the over-long body is not published either')
+  t.ok(out.includes('[redacted:private-key]'), 'the block is marked redacted')
+  t.ok(out.includes('before') && out.includes('after'), 'surrounding output survives')
+  t.end()
+})
+
+// flush emits the trailing partial line at end of stream (the token footer often has no final
+// newline), but a key block still open at close emits no body.
+test('createOutputRedactor flushes a trailing line but never an open key body', t => {
+  const r = createOutputRedactor({})
+  t.equal(r.push('tokens used\n300,448'), 'tokens used\n', 'the completed line publishes; the footer waits')
+  t.equal(r.flush(), '300,448', 'flush emits the trailing partial line')
+
+  const r2 = createOutputRedactor({})
+  const begin = '-----BEGIN RSA ' + 'PRIVATE KEY-----'
+  r2.push(`${begin}\nKEYBODYCCCC\n`)
+  t.notOk(r2.flush().includes('KEYBODYCCCC'), 'an open block emits no body on flush')
   t.end()
 })
