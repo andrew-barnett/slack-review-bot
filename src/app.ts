@@ -269,9 +269,11 @@ async function main(): Promise<void> {
       return false
     }
     // Once a shutdown is under way, take on no new work: the socket is closing and the daemon is
-    // draining. Leaving the cursor untouched means a live message that just missed the cutoff is
-    // replayed on the next start rather than acknowledged and dropped (issue #32).
+    // draining. Hold the message below the watermark (begin, but never enqueue) so a catch-up that
+    // records newer chatter cannot step the watermark over it — it replays on the next start rather
+    // than being acknowledged and dropped (issue #32).
     if (shutdown.requested) {
+      cursors.begin(request.message.channel, request.message.ts)
       log('review.rejected.shutdown', { key, source })
       return false
     }

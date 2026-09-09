@@ -287,7 +287,7 @@ contract makes the outcome deterministic instead.
 
 **Drain to idle.** On SIGINT/SIGTERM the daemon stops accepting new work (a live message that just
 missed the cutoff is left untouched, so it replays rather than being acknowledged and dropped),
-closes the socket, and waits for the active review to settle — up to `SHUTDOWN_DRAIN_MS` (15s). A
+closes the socket, and waits for the active review to settle — up to `SHUTDOWN_DRAIN_MS` (5s). A
 review that settles in that window commits normally and reports its real outcome.
 
 **Force-kill replays cleanly.** A review that has not settled by the deadline is force-killed. The
@@ -618,7 +618,7 @@ All optional except the two tokens.
 | `USAGE_REPLY_ENABLED` | `true` | Post a per-review usage line (tokens, active time, attempts) as a thread reply on every completed review. Off silences the reply; the `status` token totals are kept either way. |
 | `SLACK_REQUEST_TIMEOUT_MS` | `30000` | Per-request timeout for the bot's Slack Web API calls. The WebClient defaults to no timeout, so a wedged `conversations.history` could hang the catch-up forever; this caps it, paired with a five-minute bounded retry policy. |
 | `CODEX_ENV_PASSTHROUGH` | *(none)* | Extra environment variable names (comma/space separated) to pass through to the Codex child on top of the built-in allowlist. Keep minimal — anything added is visible to model-generated commands and untrusted PR code. |
-| `SHUTDOWN_DRAIN_MS` | `15000` | On SIGINT/SIGTERM, how long to wait for an in-flight review to settle before force-killing it (it then replays on the next start, with no error thread). See [Shutting down](#shutting-down). Keep below the supervisor's kill timeout so children are reaped before a SIGKILL orphans them. |
+| `SHUTDOWN_DRAIN_MS` | `5000` | On SIGINT/SIGTERM, how long to wait for an in-flight review to settle before force-killing it (it then replays on the next start, with no error thread). See [Shutting down](#shutting-down). Keep below the supervisor's kill timeout so children are reaped before a SIGKILL orphans them. |
 
 Booleans accept `1`, `true`, `yes` or `on`, case-insensitively; any other non-empty value
 is false, and an empty one falls back to the default rather than to false.
@@ -876,7 +876,7 @@ review that misbehaves in Slack reproduces from the terminal.
   the timer, which is overdue the moment the process thaws.
 - **A shutdown drains to idle, and a review it has to cut short runs again.** On SIGINT/SIGTERM
   the daemon stops accepting new work and waits for the active review to settle, up to
-  `SHUTDOWN_DRAIN_MS` (15s) — see [Shutting down](#shutting-down). A review that settles in that
+  `SHUTDOWN_DRAIN_MS` (5s) — see [Shutting down](#shutting-down). A review that settles in that
   window is committed normally. One that does not is force-killed and left **unsettled** so it
   replays on the next start, with **no error thread** posted for the kill (it was our deploy, not a
   failure of the PR). The cursor commits a message only once its job settles, so a cut-short review
