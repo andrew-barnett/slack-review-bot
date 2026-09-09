@@ -1,5 +1,5 @@
 import test from 'tape'
-import { redactSecrets, createOutputRedactor } from './redact'
+import { redactSecrets, createOutputRedactor, OUTPUT_FLUSH_LIMIT } from './redact'
 
 // Credential-shaped fixtures are assembled at runtime (join/concat) rather than written as literals,
 // so no contiguous secret pattern sits in the committed source to trip GitHub push protection. The
@@ -174,5 +174,49 @@ test('createOutputRedactor flushes a trailing line but never an open key body', 
   const begin = '-----BEGIN RSA ' + 'PRIVATE KEY-----'
   r2.push(`${begin}\nKEYBODYCCCC\n`)
   t.notOk(r2.flush().includes('KEYBODYCCCC'), 'an open block emits no body on flush')
+  t.end()
+})
+
+test('createOutputRedactor recognizes BEGIN inside a discarded line continuation', t => {
+  const begin = '-----BEGIN RSA ' + 'PRIVATE KEY-----'
+  const end = '-----END RSA ' + 'PRIVATE KEY-----'
+  const body = 'synthetic-key-body-after-dropped-marker'
+  for (const split of [0, 10]) {
+    const r = createOutputRedactor({})
+    let out = r.push(' '.repeat(OUTPUT_FLUSH_LIMIT - split) + begin.slice(0, split))
+    out += r.push(begin.slice(split) + '\n' + body + '\n' + end + '\nafter\n')
+    out += r.flush()
+    t.notOk(out.includes(body), `key body is suppressed with ${split} marker characters before the cap`)
+    t.ok(out.includes('after'), 'ordinary output resumes after END')
+  }
+  t.end()
+})
+
+test('createOutputRedactor tracks a new BEGIN after END on the same line', t => {
+  const begin = '-----BEGIN RSA ' + 'PRIVATE KEY-----'
+  const end = '-----END RSA ' + 'PRIVATE KEY-----'
+  const body = 'synthetic-second-key-body'
+  for (const firstKey of [begin + '\nfirst-key-body\n', begin + 'first-key-body']) {
+    const r = createOutputRedactor({})
+    const out = r.push(firstKey + end + begin + '\n' + body + '\n' + end + '\nafter\n') + r.flush()
+    t.notOk(out.includes(body), 'the second key remains suppressed when its BEGIN follows END')
+    t.ok(out.includes('after'), 'ordinary output resumes after the second END')
+  }
+  t.end()
+})
+
+test('redactSecrets masks a whole env secret before masking its substrings', t => {
+  const prefix = 'synthetic-shared-credential-prefix'
+  const suffix = 'synthetic-private-suffix-material'
+  const overlap = redactSecrets(prefix + suffix, {
+    FIRST_TOKEN: prefix,
+    SECOND_TOKEN: prefix + suffix,
+  })
+  t.notOk(overlap.includes(suffix), 'a shorter env secret must not prevent masking the longer one')
+  const shapedPrefix = 'ghp_' + 'A'.repeat(36)
+  const shapedOverlap = redactSecrets(shapedPrefix + ':' + suffix, {
+    MODEL_SECRET: shapedPrefix + ':' + suffix,
+  })
+  t.notOk(shapedOverlap.includes(suffix), 'a shape match must not prevent masking the whole env secret')
   t.end()
 })
