@@ -18,6 +18,7 @@ import {
   describeTimeout,
   runCodexReview,
   OUTPUT_FLUSH_LIMIT,
+  OUTPUT_FLUSH_MARGIN,
   TRANSCRIPT_TAIL_LIMIT,
   withGitSigningDisabled,
   type Spawner,
@@ -489,6 +490,52 @@ test('runCodexReview does not publish a token split at the hold-buffer limit', a
   await run
   const runLog = fs.readFileSync(path.join(logDir, 'test.log'), 'utf8')
   t.notOk(runLog.includes(token), 'the full token must not be persisted across forced flushes')
+  fs.rmSync(logDir, { recursive: true, force: true })
+  t.end()
+})
+
+test('runCodexReview redacts a token across the actual forced-flush cut', async t => {
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-test-runlog-'))
+  const child = new FakeChild()
+  const token = 'ghp_' + 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+  const run = runCodexReview(
+    { ...runOptions(), logDir }, (() => child) as unknown as Spawner, fakeClock().deps
+  ).catch(() => undefined)
+  await settle()
+  // The whole token has arrived, but the retained margin starts ten characters into it.
+  const cut = OUTPUT_FLUSH_LIMIT - OUTPUT_FLUSH_MARGIN
+  child.stdout.write(' '.repeat(cut - 10) + token + ' '.repeat(OUTPUT_FLUSH_MARGIN + 10 - token.length))
+  child.stdout.write('\n')
+  await settle()
+  child.emit('close', 1)
+  await run
+  const runLog = fs.readFileSync(path.join(logDir, 'test.log'), 'utf8')
+  t.notOk(runLog.includes(token), 'the margin must not split and persist a complete credential')
+  fs.rmSync(logDir, { recursive: true, force: true })
+  t.end()
+})
+
+test('runCodexReview keeps an open PEM block redacted after a forced flush', async t => {
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-test-runlog-'))
+  const child = new FakeChild()
+  const body = 'synthetic-private-key-material-after-flush'
+  const progress: string[] = []
+  const run = runCodexReview(
+    { ...runOptions(), logDir, onProgress: line => progress.push(line) },
+    (() => child) as unknown as Spawner, fakeClock().deps
+  ).catch((error: unknown) => error)
+  await settle()
+  const begin = '-----BEGIN RSA ' + 'PRIVATE KEY-----'
+  // Padding forces publication of BEGIN while the block remains open.
+  child.stdout.write(begin + '\n' + ' '.repeat(OUTPUT_FLUSH_LIMIT - begin.length - 1))
+  child.stdout.write('\n' + body + '\n-----END RSA ' + 'PRIVATE KEY-----\n')
+  await settle()
+  child.emit('close', 1)
+  const error = await run
+  const runLog = fs.readFileSync(path.join(logDir, 'test.log'), 'utf8')
+  t.notOk(runLog.includes(body), 'key material after the forced flush must not reach the run log')
+  t.notOk(progress.join('').includes(body), 'key material must not reach the progress sink')
+  t.notOk(String(error).includes(body), 'key material must not reach the error tail')
   fs.rmSync(logDir, { recursive: true, force: true })
   t.end()
 })
