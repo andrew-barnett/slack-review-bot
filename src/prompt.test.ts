@@ -79,3 +79,27 @@ test('buildPrompt refuses an empty PR list', t => {
   t.throws(() => buildPrompt({ prs: [], instructions: '', worktreeRoot }), /at least one/)
   t.end()
 })
+
+// Regression: the bot was recording `blocked` for repos whose CLAUDE.md merely shapes
+// the environment (integration tests that need live services, "never read decrypted
+// files"), refusing reviews it could have completed. The unattended resolution must
+// default to honoring such a constraint and reviewing whatever can still be evaluated —
+// e.g. skip only the un-runnable suites and review the diff with the rest.
+test('buildPrompt tells an unattended run to honor environment-shaping constraints and still review', t => {
+  const prompt = buildPrompt({ prs: [ref('a', 1)], instructions: '', worktreeRoot })
+  t.ok(prompt.includes('honor the constraint and complete the review'), 'default is complete-while-honoring')
+  t.ok(prompt.includes('run the tests that can run'), 'reviews with the runnable tests instead of blocking on a suite it cannot run')
+  t.ok(prompt.includes('Bias toward completing the review'), 'states the completion bias explicitly')
+  t.end()
+})
+
+// The `blocked` state must be reserved for instructions that would make the review
+// unsound or subvert it (approve-without-review, suppress findings) — not the routine
+// operating guidance almost every repo carries. This catches a regression back to the
+// old "any material change is fatal" behavior.
+test('buildPrompt blocks only on review-subverting instructions, not constraints it can honor', t => {
+  const prompt = buildPrompt({ prs: [ref('a', 1)], instructions: '', worktreeRoot })
+  t.ok(prompt.includes('unsound or subvert'), 'names the subversion test for blocking')
+  t.ok(prompt.includes('suppress or soften findings'), 'gives a concrete review-subverting example')
+  t.end()
+})
