@@ -67,14 +67,12 @@ test('buildPrompt pins the worktree root the sandbox actually allows', t => {
 
 // Issue #46: the worktree path is deterministic and reused across runs/retries, so a prior
 // run killed mid-install leaves a partial node_modules there. The prompt must tell the review
-// to remove that path before creating the worktree, or the next install fails with ENOTEMPTY.
+// to inspect that path and start from a clean directory, or the next install fails with ENOTEMPTY.
+// (The removal is guarded — see the safeguards test below.)
 test('buildPrompt tells the review to start from a clean worktree path', t => {
   const prompt = buildPrompt({ prs: [ref('a', 1)], instructions: '', worktreeRoot })
   t.ok(prompt.includes('Start clean'), 'instructs a clean start')
-  t.ok(
-    prompt.includes(`\`${worktreeRoot}/<repo>-<number>\` before creating the worktree`),
-    'removes the reused path before creating the worktree'
-  )
+  t.ok(prompt.includes('inspect whatever is already at'), 'inspects the reused path before recreating it')
   t.ok(prompt.includes('ENOTEMPTY'), 'names the failure the stale state causes')
   t.end()
 })
