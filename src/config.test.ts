@@ -183,10 +183,12 @@ test('loadConfig defaults the queued emoji and lets QUEUED_EMOJI override it', t
 
 const MIN = 60 * 1000
 
-// The operator's schedule, verbatim: 2, 5, 7, 12 minutes, then give up. Shipping it as the
-// default means the bot behaves as specified with no configuration.
+// The escalating schedule: 10, 13, 15, 15 minutes, then give up. The first grace must comfortably
+// exceed a cold `npm ci` on the largest repo — codex streams no stdout during a non-TTY install, so
+// too short a grace kills a healthy install mid-run and the reused checkout then fails the retry
+// with ENOTEMPTY (issue #44). Every entry stays under the 15-minute stall ceiling.
 test('loadConfig defaults the stall back-off to the specified escalating schedule', t => {
-  t.deepEqual(loadConfig({ ...credentials }).stallBackoffMs, [2, 5, 7, 12].map(m => m * MIN))
+  t.deepEqual(loadConfig({ ...credentials }).stallBackoffMs, [10, 13, 15, 15].map(m => m * MIN))
   t.equal(loadConfig({ ...credentials }).stallMaxMs, 15 * MIN, 'and caps a single wait at 15 minutes')
   t.end()
 })
@@ -203,7 +205,7 @@ test('loadConfig parses and clamps a custom stall schedule to the ceiling', t =>
 // bound rather than only a filter on overrides.
 test('loadConfig clamps the default schedule to a lowered ceiling', t => {
   const config = loadConfig({ ...credentials, STALL_MAX_MS: String(3 * MIN) })
-  t.deepEqual(config.stallBackoffMs, [2, 3, 3, 3].map(m => m * MIN), 'nothing exceeds a 3-minute ceiling')
+  t.deepEqual(config.stallBackoffMs, [3, 3, 3, 3].map(m => m * MIN), 'nothing exceeds a 3-minute ceiling')
   t.end()
 })
 

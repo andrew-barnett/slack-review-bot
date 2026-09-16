@@ -46,8 +46,6 @@ export function makeReviewRunner(
 ): (request: ReviewRequest) => Promise<ReviewOutcome> {
   return async request => {
     const key = progressKey(request)
-    // Once per request, before any attempt: a fresh token is good for hours, so retries reuse it.
-    if (refreshAuth) await refreshAuth()
     const prompt = buildPrompt({
       prs: request.prs,
       instructions: request.instructions,
@@ -76,6 +74,12 @@ export function makeReviewRunner(
 
       // Reflect the attempt in the live status so a watcher can see a retry in progress.
       reviews?.attempt(key, attempt + 1)
+
+      // Refresh the CodeArtifact token before EACH attempt, not once per request (issue #44). A
+      // review that stalls and is retried across sleep cycles can outlive the ≤12h token TTL, so a
+      // retry reusing the first attempt's token gets a 401. The login script self-caches by expiry,
+      // so this is a cheap no-op until the token actually needs re-minting. Best-effort: never throws.
+      if (refreshAuth) await refreshAuth()
 
       try {
         const outcome = await runCodex({

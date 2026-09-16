@@ -266,9 +266,8 @@ test('makeReviewRunner reports attempt and output to the live-status registry', 
 })
 
 // The private-registry refresh (issue #42) must run before Codex is spawned, so the `npm ci`
-// inside the run reads a fresh CodeArtifact token. Asserts the runner awaits it first, and only
-// once per request (the token is good for hours, so retries reuse it).
-test('makeReviewRunner refreshes registry auth once, before running Codex', async t => {
+// inside the run reads a fresh CodeArtifact token. A single-attempt run refreshes exactly once.
+test('makeReviewRunner refreshes registry auth before running Codex', async t => {
   const order: string[] = []
   let refreshes = 0
   const refreshAuth = async (): Promise<void> => {
@@ -283,7 +282,34 @@ test('makeReviewRunner refreshes registry auth once, before running Codex', asyn
 
   await runner(request)
   t.deepEqual(order, ['refresh', 'codex'], 'refresh runs, then Codex')
-  t.equal(refreshes, 1, 'refreshed exactly once for the request')
+  t.equal(refreshes, 1, 'refreshed once for a single-attempt request')
+  t.end()
+})
+
+// Issue #44: the refresh must run before EVERY attempt, not once per request. A review that stalls
+// and is retried across sleep cycles can run past the ≤12h CodeArtifact token TTL, so a retry that
+// reuses the first attempt's token gets a 401 (the observed "npm ci authentication failed" / 401
+// review outcomes). The login script self-caches by expiry, so a per-attempt refresh is a cheap
+// no-op until the token actually needs re-minting — but the retry hours later does re-mint.
+test('makeReviewRunner refreshes registry auth before every attempt', async t => {
+  const order: string[] = []
+  let refreshes = 0
+  const refreshAuth = async (): Promise<void> => {
+    refreshes += 1
+    order.push('refresh')
+  }
+  let calls = 0
+  const fakeRun: typeof runCodexReview = async opts => {
+    order.push('codex')
+    calls += 1
+    if (calls < 2) throw stall(opts.stallTimeoutMs)
+    return passed()
+  }
+  const runner = makeReviewRunner(config([1000, 2000]), () => {}, fakeRun, undefined, undefined, refreshAuth)
+
+  await runner(request)
+  t.deepEqual(order, ['refresh', 'codex', 'refresh', 'codex'], 'refresh precedes each attempt, including the retry')
+  t.equal(refreshes, 2, 'refreshed once per attempt (the stalled first attempt and the succeeding retry)')
   t.end()
 })
 
