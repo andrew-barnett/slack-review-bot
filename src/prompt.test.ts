@@ -65,6 +65,27 @@ test('buildPrompt pins the worktree root the sandbox actually allows', t => {
   t.end()
 })
 
+// Issue #46: the worktree path is deterministic and reused across runs/retries, so a prior
+// run killed mid-install leaves a partial node_modules there. The prompt must tell the review
+// to inspect that path and start from a clean directory, or the next install fails with ENOTEMPTY.
+// (The removal is guarded — see the safeguards test below.)
+test('buildPrompt tells the review to start from a clean worktree path', t => {
+  const prompt = buildPrompt({ prs: [ref('a', 1)], instructions: '', worktreeRoot })
+  t.ok(prompt.includes('Start clean'), 'instructs a clean start')
+  t.ok(prompt.includes('inspect whatever is already at'), 'inspects the reused path before recreating it')
+  t.ok(prompt.includes('ENOTEMPTY'), 'names the failure the stale state causes')
+  t.end()
+})
+
+// The review skill permits removing a reused checkout only after verifying that it is a
+// Codex-created checkout for the same PR with no unpushed changes. An unconditional removal
+// could discard a developer's checkout or review changes that need to be pushed.
+test('buildPrompt preserves the review skill safeguards before removing a reused worktree', t => {
+  const prompt = buildPrompt({ prs: [ref('a', 1)], instructions: '', worktreeRoot })
+  t.ok(prompt.includes('only remove or replace it when it is clearly a Codex-created review checkout for the same PR with no unpushed changes'))
+  t.end()
+})
+
 // One bad PR in a batch must not cost the user the other reviews.
 test('buildPrompt requires independent per-PR results', t => {
   const prompt = buildPrompt({ prs: [ref('a', 1), ref('b', 2)], instructions: '', worktreeRoot })
