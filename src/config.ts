@@ -287,13 +287,16 @@ export function loadReviewConfig(env: NodeJS.ProcessEnv = process.env): ReviewCo
     // No single wait for output ever exceeds this — the operator's "don't go more than 15
     // minutes between status updates" rule, enforced by clamping every grace to it.
     stallMaxMs: parsePositiveInt(env.STALL_MAX_MS, 15 * 60 * 1000),
-    // Increasing patience across retries: give a fresh run two minutes to say something, then
-    // a re-run five, then seven, then twelve; a run silent through all four is killed for good.
-    // The queue behind it is why the early graces are short — a genuinely wedged run should not
-    // hold a slot for its full budget four times over.
+    // Increasing patience across retries: give a fresh run ten minutes to say something, then a
+    // re-run thirteen, then fifteen, then fifteen; a run silent through all four is killed for good.
+    // The first grace must comfortably exceed a cold `npm ci` on the largest repo: codex streams no
+    // stdout during a non-TTY install, so a shorter grace (the original 2 minutes) killed a healthy
+    // install mid-run, and the reused checkout then failed the retry with ENOTEMPTY (issue #44). The
+    // queue tolerates the longer waits because a genuinely wedged run is rare, while a killed install
+    // was routine. Every grace is still clamped under the 15-minute ceiling.
     stallBackoffMs: parseMsList(
       env.STALL_BACKOFF_MS,
-      [2, 5, 7, 12].map(m => m * 60 * 1000),
+      [10, 13, 15, 15].map(m => m * 60 * 1000),
       parsePositiveInt(env.STALL_MAX_MS, 15 * 60 * 1000)
     ),
     concurrency: parsePositiveInt(env.CONCURRENCY, 1),

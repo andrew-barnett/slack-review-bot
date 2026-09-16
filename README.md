@@ -360,11 +360,13 @@ current grace is killed and retried as a fresh run. Like the budget, the grace i
 in *active* time — a closed lid is discounted — so a sleeping laptop is never mistaken for a
 hang.
 
-The grace lengthens with each retry, from `STALL_BACKOFF_MS`: 2 minutes for the first
-attempt, then 5, 7 and 12 for the re-runs, and a run silent through all four is killed for
-good and reported as an error. No single grace ever exceeds `STALL_MAX_MS` (15m), so the bot
-never waits longer than that for a sign of life. A stall logs `codex.stalled`; a retry logs
-`review.retry`; giving up logs `review.gave-up`.
+The grace lengthens with each retry, from `STALL_BACKOFF_MS`: 10 minutes for the first
+attempt, then 13, 15 and 15 for the re-runs, and a run silent through all four is killed for
+good and reported as an error. The first grace is generous because a cold `npm ci` on a large
+repo produces no stdout under codex's non-TTY exec, and a shorter grace killed a healthy
+install mid-run — the reused checkout then failed the retry with `ENOTEMPTY`. No single grace
+ever exceeds `STALL_MAX_MS` (15m), so the bot never waits longer than that for a sign of life.
+A stall logs `codex.stalled`; a retry logs `review.retry`; giving up logs `review.gave-up`.
 
 ### Skipping a deleted request
 
@@ -624,7 +626,7 @@ All optional except the two tokens.
 | `REMOVE_ACK_ON_COMPLETE` | `false` | Remove `:eyes:` once a verdict is posted. |
 | `CONCURRENCY` | `1` | Reviews running at once. |
 | `RUN_TIMEOUT_MS` | `10800000` | Hard kill for one Codex run (3h of *active* time — see [Operating notes](#operating-notes)). |
-| `STALL_BACKOFF_MS` | `120000,300000,420000,720000` | Per-attempt grace a run may go without output before it is killed as stalled and retried: 2m, then 5m, 7m, 12m, then given up. Empty disables stall detection and retries. |
+| `STALL_BACKOFF_MS` | `600000,780000,900000,900000` | Per-attempt grace a run may go without output before it is killed as stalled and retried: 10m, then 13m, 15m, 15m, then given up. The first grace exceeds a cold `npm ci` so a silent install is not killed mid-run. Empty disables stall detection and retries. |
 | `STALL_MAX_MS` | `900000` | Ceiling on any single stall grace (15m). Every `STALL_BACKOFF_MS` entry is clamped to it. |
 | `CODEX_PROFILE` | `review-bot` | Codex config profile name. |
 | `WORKSPACE_ROOT` | `~/src` | Directory holding the local checkouts. |
