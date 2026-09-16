@@ -133,6 +133,26 @@ test('USAGE_REPLY_ENABLED defaults on and can be turned off', t => {
   t.end()
 })
 
+// The CodeArtifact token refresh (issue #42) defaults on — a platform install needs it without
+// configuration — but is a kill switch for an install with no private registry. The script path
+// defaults to the vendored copy and is overridable.
+test('CODEARTIFACT_REFRESH defaults on with a vendored script path, both overridable', t => {
+  const defaults = loadConfig({ ...credentials })
+  t.equal(defaults.codeartifactRefreshEnabled, true, 'default on')
+  t.equal(
+    loadConfig({ ...credentials, CODEARTIFACT_REFRESH: 'false' }).codeartifactRefreshEnabled,
+    false,
+    'kill switch honoured'
+  )
+  t.ok(defaults.codeartifactLoginScript.endsWith('/scripts/codeartifact-login.sh'), 'defaults to the vendored script')
+  t.equal(
+    loadConfig({ ...credentials, CODEARTIFACT_LOGIN_SCRIPT: '/custom/login.sh' }).codeartifactLoginScript,
+    '/custom/login.sh',
+    'script path override honoured'
+  )
+  t.end()
+})
+
 // The catch-up is the thing that makes a missed message recoverable without a restart, so
 // both triggers default to on: an install that sets neither variable has to end up with the
 // safe behaviour, since the failure mode of the old default was silence.

@@ -305,6 +305,29 @@ durable per-PR idempotency (issue #35) is the follow-up that closes that, and a 
 listener/worker (issue #34) is the stronger long-term answer where a listener deploy never touches a
 running review.
 
+### Private registry auth
+
+Reviewed repos install their `@trade-platform/*` dependencies from **AWS CodeArtifact**, whose npm
+auth tokens live at most 12 hours. Those tokens are minted by the platform repos' `login.sh` and
+written to the user `~/.npmrc`. A laptop daemon runs for days, so without intervention every review
+`npm ci` eventually hits an expired token and fails with `E401` — the review still runs and posts
+findings, but its tests never run and coverage gating is skipped (issue #42).
+
+Before each review the bot runs a **vendored copy** of that login script,
+`scripts/codeartifact-login.sh -u` (`CODEARTIFACT_LOGIN_SCRIPT`), in the daemon process — outside
+the Codex sandbox, as the operator's user with the IAM `staging` profile. The script scopes the
+registry to `@trade-platform` and **self-caches by expiry** (a `;expires=` marker in the npmrc), so
+running it before every review is a cheap no-op until the token actually needs re-minting; the
+sandboxed `npm ci` then reads the fresh token from `~/.npmrc`.
+
+The refresh is **best-effort**: a failure is logged (`codeartifact.refresh-failed`, exit code only —
+never the token) and the review proceeds, since an unrefreshable token only leaves matters exactly as
+they were. It needs `aws`, `jq`, `gdate` (coreutils) and `bash` on `PATH` and a reachable `staging`
+profile; if the profile's credentials are rotated away the refresh fails until they are restored.
+The token is a short-lived bearer token on local disk — inherent to CodeArtifact npm auth, and the
+same file the manual `login.sh` writes; it is never passed through the Codex env allowlist. Turn the
+whole step off with `CODEARTIFACT_REFRESH=0` for an install with no private registry.
+
 ### How a run is judged
 
 Codex is run with `--output-schema`, so its final message is a structured object rather
@@ -619,6 +642,8 @@ All optional except the two tokens.
 | `SLACK_REQUEST_TIMEOUT_MS` | `30000` | Per-request timeout for the bot's Slack Web API calls. The WebClient defaults to no timeout, so a wedged `conversations.history` could hang the catch-up forever; this caps it, paired with a five-minute bounded retry policy. |
 | `CODEX_ENV_PASSTHROUGH` | *(none)* | Extra environment variable names (comma/space separated) to pass through to the Codex child on top of the built-in allowlist. Keep minimal — anything added is visible to model-generated commands and untrusted PR code. |
 | `SHUTDOWN_DRAIN_MS` | `5000` | On SIGINT/SIGTERM, how long to wait for an in-flight review to settle before force-killing it (it then replays on the next start, with no error thread). See [Shutting down](#shutting-down). Keep below the supervisor's kill timeout so children are reaped before a SIGKILL orphans them. |
+| `CODEARTIFACT_REFRESH` | `true` | Refresh the AWS CodeArtifact npm token before each review, so a review's `npm ci` authenticates instead of failing with E401 on a token the long-lived daemon has let expire. See [Private registry auth](#private-registry-auth). Turn off for an install with no private registry. |
+| `CODEARTIFACT_LOGIN_SCRIPT` | *(vendored `scripts/codeartifact-login.sh`)* | Path to the login script the refresh runs. Defaults to the vendored copy resolved relative to the bot; override to point at a different one. |
 
 Booleans accept `1`, `true`, `yes` or `on`, case-insensitively; any other non-empty value
 is false, and an empty one falls back to the default rather than to false.
