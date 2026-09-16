@@ -110,6 +110,11 @@ every one of them.
 
 Create every PR worktree under \`${worktreeRoot}/<repo>-<number>\`. That path is the one
 the sandbox grants write access to; worktrees anywhere else will fail on permissions.
+**Start clean.** That path is reused across runs and retries, so it may still hold a partial
+checkout or a half-installed \`node_modules\` from an earlier run that was killed mid-install.
+Remove \`${worktreeRoot}/<repo>-<number>\` before creating the worktree there, so dependency
+installation starts fresh — a leftover partial \`node_modules\` otherwise makes the install
+fail with \`ENOTEMPTY\` and no tests run.
 The local checkouts are the workspace root — treat them as read-only control plane
 exactly as the skill requires.
 
