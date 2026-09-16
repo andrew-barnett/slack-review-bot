@@ -35,10 +35,19 @@ export function makeReviewRunner(
   /** Live-status registry, updated per attempt and per output chunk. The CLI passes nothing. */
   reviews?: ActiveReviews,
   /** Registry of live Codex children, so a shutdown can signal them. The CLI passes nothing. */
-  registry?: ChildRegistry
+  registry?: ChildRegistry,
+  /**
+   * Refresh the private-registry (CodeArtifact) npm token before spawning Codex, so the
+   * sandboxed `npm ci` authenticates instead of failing with a stale token (issue #42).
+   * Best-effort — it never throws — and wired only by the daemon/CLI; when unset (unit tests)
+   * the step is skipped, so the runner needs no live AWS to be tested.
+   */
+  refreshAuth?: () => Promise<void>
 ): (request: ReviewRequest) => Promise<ReviewOutcome> {
   return async request => {
     const key = progressKey(request)
+    // Once per request, before any attempt: a fresh token is good for hours, so retries reuse it.
+    if (refreshAuth) await refreshAuth()
     const prompt = buildPrompt({
       prs: request.prs,
       instructions: request.instructions,

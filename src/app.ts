@@ -21,6 +21,7 @@ import {
   SHUTDOWN_POLL_MS,
 } from './codex'
 import { loadConfig, looksLikeUserId } from './config'
+import { ensureRegistryAuth } from './registry-auth'
 import { createShutdownController } from './shutdown'
 import { openCursorStore, openNullCursorStore } from './cursor'
 import { makeGitHubEffects } from './github'
@@ -128,7 +129,13 @@ async function main(): Promise<void> {
   // to idle, and — if that times out — force-kill them so they replay cleanly instead of settling
   // as a spurious error. Its `forced` flag gates the cursor settle and the error thread below.
   const shutdown = createShutdownController()
-  const runReview = makeReviewRunner(config, log, runCodexReview, reviews, childRegistry)
+  const runReview = makeReviewRunner(config, log, runCodexReview, reviews, childRegistry, () =>
+    ensureRegistryAuth({
+      scriptPath: config.codeartifactLoginScript,
+      enabled: config.codeartifactRefreshEnabled,
+      log,
+    })
+  )
   // How far each channel has been processed, on disk. This is what makes a restart able to
   // pick up messages posted while the socket was down — Slack never redelivers them.
   const cursors = config.cursorFile

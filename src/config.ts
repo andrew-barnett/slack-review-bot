@@ -9,6 +9,7 @@
 
 import * as os from 'os'
 import * as path from 'path'
+import { defaultLoginScriptPath } from './registry-auth'
 
 /**
  * Everything needed to run a review. Deliberately free of Slack credentials so the
@@ -61,6 +62,15 @@ export interface ReviewConfig {
    * model-directed commands and untrusted PR code.
    */
   codexEnvPassthrough: string[]
+  /**
+   * Whether to refresh the AWS CodeArtifact npm token before each review (issue #42). Platform
+   * repos install `@trade-platform/*` from CodeArtifact, whose tokens expire within 12 hours; a
+   * days-old daemon otherwise hands every review a stale token and `npm ci` fails with E401.
+   * The operator kill switch — turn it off for an install with no private registry.
+   */
+  codeartifactRefreshEnabled: boolean
+  /** Absolute path to the vendored CodeArtifact login script the refresh runs. */
+  codeartifactLoginScript: string
 }
 
 export interface Config extends ReviewConfig {
@@ -290,6 +300,8 @@ export function loadReviewConfig(env: NodeJS.ProcessEnv = process.env): ReviewCo
     disableGitSigning: parseBool(env.DISABLE_GIT_SIGNING, true),
     runLogDir: env.RUN_LOG_DIR ?? path.join(home, 'src', 'slack-review-bot', 'runs'),
     codexEnvPassthrough: parseList(env.CODEX_ENV_PASSTHROUGH),
+    codeartifactRefreshEnabled: parseBool(env.CODEARTIFACT_REFRESH, true),
+    codeartifactLoginScript: env.CODEARTIFACT_LOGIN_SCRIPT || defaultLoginScriptPath(),
   }
 }
 

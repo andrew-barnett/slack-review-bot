@@ -11,6 +11,7 @@ import { parseMessage } from './parse-message'
 import { buildPrompt } from './prompt'
 import { renderThread, verdictFor } from './render'
 import { makeReviewRunner } from './review'
+import { ensureRegistryAuth } from './registry-auth'
 import type { ReviewRequest } from './job'
 import { renderUsageLine } from './usage'
 
@@ -49,7 +50,16 @@ async function main(): Promise<void> {
   }
 
   process.stderr.write(`Reviewing ${request.prs.length} pull request(s) via Codex...\n`)
-  const { result, usage } = await makeReviewRunner(config)(request)
+  // Same private-registry refresh the daemon does, so a terminal review of a platform repo does
+  // not fail `npm ci` on a stale CodeArtifact token (issue #42).
+  const refreshAuth = (): Promise<void> =>
+    ensureRegistryAuth({
+      scriptPath: config.codeartifactLoginScript,
+      enabled: config.codeartifactRefreshEnabled,
+    })
+  const { result, usage } = await makeReviewRunner(config, undefined, undefined, undefined, undefined, refreshAuth)(
+    request
+  )
 
   process.stdout.write(`\n${JSON.stringify(result, null, 2)}\n`)
   process.stdout.write(`\nVerdict: ${verdictFor(result)}\n`)

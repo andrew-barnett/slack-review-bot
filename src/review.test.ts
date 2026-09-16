@@ -264,3 +264,35 @@ test('makeReviewRunner reports attempt and output to the live-status registry', 
   )
   t.end()
 })
+
+// The private-registry refresh (issue #42) must run before Codex is spawned, so the `npm ci`
+// inside the run reads a fresh CodeArtifact token. Asserts the runner awaits it first, and only
+// once per request (the token is good for hours, so retries reuse it).
+test('makeReviewRunner refreshes registry auth once, before running Codex', async t => {
+  const order: string[] = []
+  let refreshes = 0
+  const refreshAuth = async (): Promise<void> => {
+    refreshes += 1
+    order.push('refresh')
+  }
+  const fakeRun: typeof runCodexReview = async () => {
+    order.push('codex')
+    return passed()
+  }
+  const runner = makeReviewRunner(config([]), () => {}, fakeRun, undefined, undefined, refreshAuth)
+
+  await runner(request)
+  t.deepEqual(order, ['refresh', 'codex'], 'refresh runs, then Codex')
+  t.equal(refreshes, 1, 'refreshed exactly once for the request')
+  t.end()
+})
+
+// The refresh is optional: a runner wired without it (unit tests, dry runs) must still work and
+// never touch a registry — proving the daemon needs no live AWS to be exercised.
+test('makeReviewRunner runs without a refresh hook', async t => {
+  const fakeRun: typeof runCodexReview = async () => passed()
+  const runner = makeReviewRunner(config([]), () => {}, fakeRun)
+  const { result } = await runner(request)
+  t.equal(result.results[0].status, 'passed', 'review completes with no refresh wired')
+  t.end()
+})
