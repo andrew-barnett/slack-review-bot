@@ -79,6 +79,15 @@ test('buildPrompt tells the review to start from a clean worktree path', t => {
   t.end()
 })
 
+// The review skill permits removing a reused checkout only after verifying that it is a
+// Codex-created checkout for the same PR with no unpushed changes. An unconditional removal
+// could discard a developer's checkout or review changes that need to be pushed.
+test('buildPrompt preserves the review skill safeguards before removing a reused worktree', t => {
+  const prompt = buildPrompt({ prs: [ref('a', 1)], instructions: '', worktreeRoot })
+  t.ok(prompt.includes('only remove or replace it when it is clearly a Codex-created review checkout for the same PR with no unpushed changes'))
+  t.end()
+})
+
 // One bad PR in a batch must not cost the user the other reviews.
 test('buildPrompt requires independent per-PR results', t => {
   const prompt = buildPrompt({ prs: [ref('a', 1), ref('b', 2)], instructions: '', worktreeRoot })
