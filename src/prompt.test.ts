@@ -25,9 +25,20 @@ test('buildPrompt spells out the unattended resolutions for every asking branch'
   t.ok(/Never ask\s+for confirmation/.test(prompt), 'forbids asking')
   t.ok(prompt.includes('Missing issue reference'), 'covers the issue-reference branch')
   t.ok(prompt.includes('out of date with its base'), 'covers the stale-base branch')
-  // The skill refuses an out-of-date PR outright. Telling Codex to merge the base would
-  // have the bot rewriting someone's branch in a case the skill explicitly forbids.
-  t.ok(prompt.includes('Do not bring the branch up to date'), 'does not authorise a base merge')
+  // Since 2026-08-19 the skill auto-merges a conflict-free stale base rather than refusing.
+  // The bot must defer to that "Automatic Base Merge" section, not force a block — a
+  // regression to the old "Do not bring the branch up to date" wording would leave every
+  // out-of-date PR stuck as `blocked` even when the base merges cleanly.
+  t.ok(prompt.includes('Automatic Base Merge'), 'defers to the skill clean auto-merge')
+  t.notOk(prompt.includes('Do not bring the branch up to date'), 'does not suppress the base merge')
+  // The bot normally supplies commit.gpgsign=false so test-only commits can be pushed without
+  // a signing key. A base merge is different: the review skill requires it to stop rather than
+  // bypass signing, so this prompt must restore signing for that one command.
+  t.ok(prompt.includes('commit.gpgsign=true'), 'does not push an unsigned automatic base merge')
+  // The conflict case is the one that must still block, so the reviewer never rewrites
+  // someone's branch with a merge that would need manual resolution.
+  t.ok(prompt.includes('not** conflict-free') || prompt.includes('not conflict-free'),
+    'still blocks when the base merge would conflict')
   t.ok(prompt.includes('AGENTS.md'), 'covers the repo-instruction branch')
   t.end()
 })

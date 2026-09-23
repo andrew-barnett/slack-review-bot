@@ -438,15 +438,20 @@ sandbox: workspace-write [workdir, /tmp, $TMPDIR, /private/tmp/codex-pr-review,
 Sandbox permissions are only half of "unattended". The skill itself has branches that
 stop and ask a human — a missing issue reference on an in-scope repo, a stale merge
 base, an `AGENTS.md` change that alters the review process. `src/prompt.ts` resolves
-each one up front, so Codex never blocks on a question nobody will answer. The policy is
-to record those PRs as `blocked` with a reason and post nothing to GitHub for them, which
-is what the skill already requires for those cases.
+each one up front, so Codex never blocks on a question nobody will answer. For the
+missing-issue-reference case the policy is to record the PR as `blocked` with a reason and
+post nothing to GitHub for it, which is what the skill already requires. The stale-base
+case is split: when the base merges cleanly the skill brings the branch up to date itself
+and the review continues; only a conflicting merge (or a failed precondition) is recorded
+as `blocked`.
 
 These resolutions are written against the skill's current rules, so they need re-checking
-if `aqua-skills/skills/review-pr/SKILL.md` changes. In particular the skill *refuses* an
-out-of-date PR rather than merging its base, and the prompt tells Codex explicitly not to
-bring the branch up to date — the bot must never rewrite someone's branch in a case the
-skill declines to review at all.
+if `aqua-skills/skills/review-pr/SKILL.md` changes. In particular the skill's "Stale Base
+Branch: Automatic Base Merge" section brings a conflict-free base up to date without asking
+— it probes with `git merge-tree --write-tree` and merges and pushes only when that probe
+is clean — so the prompt defers to it rather than forcing a block. The bot still refuses to
+rewrite someone's branch when the merge would conflict: that case falls back to `blocked`,
+naming the base and merge-base commits and posting nothing to GitHub.
 
 Run `npm run review -- --dry-run <pr-url>` to read the exact prompt.
 
@@ -459,6 +464,14 @@ therefore sets `commit.gpgsign=false` for Codex's children only, via `GIT_CONFIG
 — your own git config is untouched — and the thread discloses that the test commits it
 pushed are unsigned. Set `DISABLE_GIT_SIGNING=0` to turn this off, accepting that a run
 can then block on a passphrase prompt.
+
+An **automatic base merge** is the one exception: unlike a throwaway test commit, its merge
+commit lands on the contributor's branch, and the review skill forbids pushing an unsigned
+commit onto a branch that may require signed commits. So the prompt tells Codex to force
+signing back on for that single command (`git -c commit.gpgsign=true merge …`), overriding
+the process-wide `commit.gpgsign=false`. If that signed commit cannot be created (a cold
+`pinentry` cache with nobody present), the merge is abandoned and the PR falls back to
+`blocked` rather than pushing an unsigned merge.
 
 ## Setup
 
