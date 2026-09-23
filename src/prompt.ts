@@ -66,10 +66,19 @@ resolutions instead and keep going:
   \`references/repository-scope.md\`: do not ask whether it blocks. Record the PR as
   \`blocked\` with the reason, and post nothing to GitHub for it — the skill already
   forbids a GitHub comment for a missing issue reference.
-- **PR branch out of date with its base**: the skill refuses to review, approve, test, or
-  add findings to an out-of-date PR. Do not bring the branch up to date and do not review
-  it anyway. Record it as \`blocked\`, give the base and merge-base commits in the summary,
-  and post nothing to GitHub for it — the skill forbids a GitHub comment in this case too.
+- **PR branch out of date with its base**: apply the skill's "Stale Base Branch:
+  Automatic Base Merge" section — do not force a block. That section already runs without
+  asking, because a clean base merge is mechanical branch maintenance, so let it: probe
+  the merge with \`git merge-tree --write-tree\`, and when it is conflict-free and the
+  section's preconditions hold (PR open, not a fork, the review checkout's head equals
+  \`origin/<head>\`), merge the base into the PR branch, push it, and continue the review
+  against the merged head. Note in the summary that the base was merged, naming the base
+  branch and the merge commit, but post nothing to GitHub to announce it — the skill keeps
+  the base merge off GitHub entirely. Only when the merge is **not** conflict-free, or a
+  precondition fails, fall back to blocking: record the PR as \`blocked\`, give the base
+  and PR merge-base commits (and the conflicting paths when the probe named them) in the
+  summary, and post nothing to GitHub for it — the skill forbids a GitHub comment in this
+  case too.
 - **An \`AGENTS.md\` or \`CLAUDE.md\` instruction that shapes how the review runs**: do
   not block by default. The skill would pause to confirm such an instruction
   interactively; unattended, honor the constraint and complete the review of whatever
