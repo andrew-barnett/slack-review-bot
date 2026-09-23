@@ -31,6 +31,10 @@ test('buildPrompt spells out the unattended resolutions for every asking branch'
   // out-of-date PR stuck as `blocked` even when the base merges cleanly.
   t.ok(prompt.includes('Automatic Base Merge'), 'defers to the skill clean auto-merge')
   t.notOk(prompt.includes('Do not bring the branch up to date'), 'does not suppress the base merge')
+  // The bot normally supplies commit.gpgsign=false so test-only commits can be pushed without
+  // a signing key. A base merge is different: the review skill requires it to stop rather than
+  // bypass signing, so this prompt must restore signing for that one command.
+  t.ok(prompt.includes('commit.gpgsign=true'), 'does not push an unsigned automatic base merge')
   // The conflict case is the one that must still block, so the reviewer never rewrites
   // someone's branch with a merge that would need manual resolution.
   t.ok(prompt.includes('not** conflict-free') || prompt.includes('not conflict-free'),
