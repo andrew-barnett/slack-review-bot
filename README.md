@@ -465,6 +465,14 @@ therefore sets `commit.gpgsign=false` for Codex's children only, via `GIT_CONFIG
 pushed are unsigned. Set `DISABLE_GIT_SIGNING=0` to turn this off, accepting that a run
 can then block on a passphrase prompt.
 
+An **automatic base merge** is the one exception: unlike a throwaway test commit, its merge
+commit lands on the contributor's branch, and the review skill forbids pushing an unsigned
+commit onto a branch that may require signed commits. So the prompt tells Codex to force
+signing back on for that single command (`git -c commit.gpgsign=true merge …`), overriding
+the process-wide `commit.gpgsign=false`. If that signed commit cannot be created (a cold
+`pinentry` cache with nobody present), the merge is abandoned and the PR falls back to
+`blocked` rather than pushing an unsigned merge.
+
 ## Setup
 
 ### 1. Slack app

@@ -72,9 +72,15 @@ resolutions instead and keep going:
   the merge with \`git merge-tree --write-tree\`, and when it is conflict-free and the
   section's preconditions hold (PR open, not a fork, the review checkout's head equals
   \`origin/<head>\`), merge the base into the PR branch, push it, and continue the review
-  against the merged head. Note in the summary that the base was merged, naming the base
-  branch and the merge commit, but post nothing to GitHub to announce it — the skill keeps
-  the base merge off GitHub entirely. Only when the merge is **not** conflict-free, or a
+  against the merged head. **Sign that merge commit.** This run supplies
+  \`commit.gpgsign=false\` so unattended test commits never hang on a signing prompt, but a
+  base merge is different: the skill forbids pushing an unsigned commit onto a branch that
+  may require signed commits, so create the merge with signing forced back on for that one
+  command — \`git -c commit.gpgsign=true merge --no-ff --no-edit origin/<base>\`. If the
+  signed merge commit cannot be created, do not push and do not fall back to an unsigned
+  merge; treat it as the skill's signing-failure stop and block the PR instead. Note in the
+  summary that the base was merged, naming the base branch and the merge commit, but post
+  nothing to GitHub to announce it — the skill keeps the base merge off GitHub entirely. Only when the merge is **not** conflict-free, or a
   precondition fails, fall back to blocking: record the PR as \`blocked\`, give the base
   and PR merge-base commits (and the conflicting paths when the probe named them) in the
   summary, and post nothing to GitHub for it — the skill forbids a GitHub comment in this
