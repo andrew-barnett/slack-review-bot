@@ -5,6 +5,7 @@ import {
   renderHumanReviewComment,
   renderHumanReviewThread,
 } from './gate'
+import { AGENT_NO_MENTION_NOTE } from './agent-note'
 
 // The file matcher: values.yaml and its per-environment siblings in any directory, but never
 // the encrypted twin (which is ciphertext and safe) or an unrelated yaml.
@@ -54,6 +55,15 @@ test('renderHumanReviewComment explains the unverified case', t => {
   const text = renderHumanReviewComment([], false)
   t.ok(/human review is required/i.test(text), 'still requires a human')
   t.ok(/couldn't confirm|could not confirm|caution/i.test(text), 'frames it as caution')
+  t.end()
+})
+
+// The gate comment is posted directly by the bot under a human's token, so it must carry the
+// hidden no-mention note that steers other AI agents off @-mentioning that borrowed author.
+// Both branches (verified and unverified) are GitHub comments and must carry it.
+test('renderHumanReviewComment embeds the hidden no-mention note in both branches', t => {
+  t.ok(renderHumanReviewComment(['values.yaml'], true).includes(AGENT_NO_MENTION_NOTE), 'verified branch')
+  t.ok(renderHumanReviewComment([], false).includes(AGENT_NO_MENTION_NOTE), 'unverified branch')
   t.end()
 })
 

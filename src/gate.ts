@@ -9,6 +9,7 @@
 // Pure: the file list is fetched elsewhere and passed in, so the rule is testable without a
 // GitHub call.
 
+import { withAgentNote } from './agent-note'
 import type { PullRequestRef } from './parse-message'
 
 /**
@@ -43,25 +44,31 @@ export function protectedDeploymentsFiles(pr: Pick<PullRequestRef, 'repo'>, chan
  */
 export function renderHumanReviewComment(files: string[], verified: boolean): string {
   const header = '**Automated review skipped — a human review is required.**'
+  // Every GitHub comment the bot authors carries the hidden no-mention note: it posts under a
+  // human's token, so another AI agent reading this comment would otherwise @-mention them.
   if (!verified) {
-    return [
-      `🙋 ${header}`,
-      '',
-      "I couldn't confirm which files this `deployments` pull request changes, so out of " +
-        'caution I have not reviewed it. Please have a person review these changes.',
-    ].join('\n')
+    return withAgentNote(
+      [
+        `🙋 ${header}`,
+        '',
+        "I couldn't confirm which files this `deployments` pull request changes, so out of " +
+          'caution I have not reviewed it. Please have a person review these changes.',
+      ].join('\n')
+    )
   }
   const list = files.map(file => `- \`${file}\``).join('\n')
-  return [
-    `🙋 ${header}`,
-    '',
-    'This pull request changes deployment values in the `deployments` repo, which must be ' +
-      'reviewed by a person rather than by the bot:',
-    '',
-    list,
-    '',
-    'I have not reviewed these changes — please have a human review and approve them.',
-  ].join('\n')
+  return withAgentNote(
+    [
+      `🙋 ${header}`,
+      '',
+      'This pull request changes deployment values in the `deployments` repo, which must be ' +
+        'reviewed by a person rather than by the bot:',
+      '',
+      list,
+      '',
+      'I have not reviewed these changes — please have a human review and approve them.',
+    ].join('\n')
+  )
 }
 
 /** The Slack thread note summarising which requested PRs were handed to a human. */
