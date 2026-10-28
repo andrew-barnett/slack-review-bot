@@ -1,5 +1,6 @@
 import test from 'tape'
 import { buildPrompt } from './prompt'
+import { AGENT_NO_MENTION_NOTE } from './agent-note'
 import type { PullRequestRef } from './parse-message'
 
 function ref(repo: string, number: number): PullRequestRef {
@@ -94,6 +95,19 @@ test('buildPrompt tells the review to start from a clean worktree path', t => {
 test('buildPrompt preserves the review skill safeguards before removing a reused worktree', t => {
   const prompt = buildPrompt({ prs: [ref('a', 1)], instructions: '', worktreeRoot })
   t.ok(prompt.includes('only remove or replace it when it is clearly a Codex-created review checkout for the same PR with no unpushed changes'))
+  t.end()
+})
+
+// The findings/approval comments are posted by Codex via the skill, not by the bot, so the only
+// control surface is the prompt: it must carry the hidden no-mention note verbatim and tell the
+// run to append it to every GitHub comment. A regression here reintroduces the spurious
+// @-mentions of the borrowed-token author on everyone else's PRs.
+test('buildPrompt tells the run to append the hidden no-mention note to every GitHub comment', t => {
+  const prompt = buildPrompt({ prs: [ref('a', 1)], instructions: '', worktreeRoot })
+  t.ok(prompt.includes(AGENT_NO_MENTION_NOTE), 'embeds the exact note block')
+  t.ok(/append[\s\S]*every[\s\S]*comment you\s+post to GitHub/i.test(prompt), 'instructs appending to every comment')
+  // The note must stay before the output contract so the contract remains the prompt's last word.
+  t.ok(prompt.indexOf(AGENT_NO_MENTION_NOTE) < prompt.indexOf('Output contract'), 'note precedes the output contract')
   t.end()
 })
 
