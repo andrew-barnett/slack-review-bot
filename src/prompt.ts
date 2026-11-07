@@ -141,18 +141,16 @@ Create every PR worktree under \`${worktreeRoot}/<repo>-<number>\`. That path is
 the sandbox grants write access to; worktrees anywhere else will fail on permissions.
 **Start clean.** That path is reused across runs and retries, so it may still hold a partial
 checkout or a half-installed \`node_modules\` from an earlier run that was killed mid-install,
-which makes the next dependency install fail with \`ENOTEMPTY\` and run no tests. It may also hold
-a working tree the dependency install itself dirtied: installs routinely regenerate tracked files
-(a bundled worker path, a lockfile, build output), and that regenerated output is
-reproducible debris the next install simply rewrites — not work to preserve.
-Before creating the worktree, inspect whatever is already at \`${worktreeRoot}/<repo>-<number>\`.
-Do not conflate that install debris with real work: a reused checkout may also carry unpushed
-commits, or an uncommitted edit a prior review wrote but had not yet committed, and both are work
-you must keep — never delete a checkout to get a clean start when it holds either.
-Only remove or replace it when it is clearly a Codex-created review checkout for the same PR
-with no unpushed commits and whose only uncommitted changes are files the dependency install regenerates;
-discard that regenerated debris and recreate the checkout so the install starts from an empty directory.
-If the reused checkout carries unpushed commits or any other uncommitted change, preserve it and do not recreate it.
+which makes the next dependency install fail with \`ENOTEMPTY\` and run no tests. It may also be
+dirty because the dependency install regenerates tracked files (a bundled worker path, a lockfile,
+build output). Neither a partial install nor a dirty working tree is work to preserve: every attempt
+is a fresh run that recreates the checkout and redoes the review, so uncommitted changes left there
+are abandoned scratch the next review simply regenerates. The one thing worth preserving is an
+**unpushed commit** — a prior run killed after committing a test change but before pushing it.
+Before creating the worktree, inspect whatever is already at \`${worktreeRoot}/<repo>-<number>\`:
+remove or replace it when it is a Codex-created review checkout for the same PR with no unpushed commits
+— a dirty or install-regenerated working tree does not block this — then recreate it so the install
+starts from an empty directory. Preserve it only when it carries an unpushed commit.
 The local checkouts are the workspace root — treat them as read-only control plane
 exactly as the skill requires.
 

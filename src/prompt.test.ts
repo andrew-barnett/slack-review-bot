@@ -89,44 +89,25 @@ test('buildPrompt tells the review to start from a clean worktree path', t => {
   t.end()
 })
 
-// The review skill permits removing a reused checkout only after verifying that it is a
-// Codex-created checkout for the same PR with no unpushed commits and no uncommitted changes
-// beyond install-regenerated debris. An unconditional removal could discard commits a prior run
-// made but never pushed, or an uncommitted edit it had not yet committed.
-test('buildPrompt preserves the review skill safeguards before removing a reused worktree', t => {
+// The guard keys destruction on unpushed COMMITS, not on a dirty working tree. review.ts makes
+// every attempt a fresh run in a fresh worktree that redoes the review from scratch, so uncommitted
+// changes in a reused checkout are abandoned scratch the next run regenerates — not work to lose.
+// The one thing a reused checkout can hold that is NOT reproducible is a commit made but not pushed.
+test('buildPrompt removes a reused worktree only when it has no unpushed commits', t => {
   const prompt = buildPrompt({ prs: [ref('a', 1)], instructions: '', worktreeRoot })
-  t.ok(prompt.includes('Only remove or replace it when it is clearly a Codex-created review checkout for the same PR'))
-  t.ok(prompt.includes('with no unpushed commits'))
+  t.ok(prompt.includes('remove or replace it when it is a Codex-created review checkout for the same PR with no unpushed commits'))
+  t.ok(prompt.includes('Preserve it only when it carries an unpushed commit'), 'an unpushed commit is the one preserve case')
   t.end()
 })
 
 // Regression: an install (`npm ci`/`pnpm install`) routinely regenerates tracked files — e.g.
-// aix-ui's libs/ui-shared/src/lib/pdf-worker-path.ts — leaving the reused worktree with an
-// uncommitted change. The old guard ("no unpushed changes") read that dirty tree as unsafe and
-// refused to recreate the checkout, so a re-review was reported `blocked` for pure install debris.
-// The prompt must mark install-regenerated output as reproducible debris, not work to preserve.
+// aix-ui's libs/ui-shared/src/lib/pdf-worker-path.ts — leaving the reused worktree dirty. The old
+// guard ("no unpushed changes") read that dirty tree as unsafe and refused to recreate the checkout,
+// so a re-review was reported `blocked` for pure install debris. The prompt must say a dirty /
+// install-regenerated working tree does not block recreating the checkout.
 test('buildPrompt does not let an install-regenerated working tree block recreating the worktree', t => {
   const prompt = buildPrompt({ prs: [ref('a', 1)], instructions: '', worktreeRoot })
-  t.ok(prompt.includes('reproducible debris the next install simply rewrites'), 'install output is debris, not work')
-  t.end()
-})
-
-// A reused checkout may also contain an uncommitted edit (e.g. a regression test) a prior review
-// wrote but was killed before committing. A dirty tree alone cannot distinguish that from install
-// debris, so the guard must preserve the checkout whenever it holds any uncommitted change that is
-// NOT install-regenerated output (or any unpushed commit) — only install debris may be discarded.
-test('buildPrompt preserves uncommitted review changes in a reused worktree', t => {
-  const prompt = buildPrompt({ prs: [ref('a', 1)], instructions: '', worktreeRoot })
-  t.ok(prompt.includes('any other uncommitted change, preserve it and do not recreate it'), 'non-debris uncommitted work must block replacement')
-  t.end()
-})
-
-// A path that an install can rewrite can still contain a reviewer's uncommitted edit. Before
-// removing a dirty checkout, the prompt must require an exact content comparison with an
-// isolated clean install, rather than treating the path name as proof that the change is debris.
-test('buildPrompt requires verification before discarding supposedly regenerated files', t => {
-  const prompt = buildPrompt({ prs: [ref('a', 1)], instructions: '', worktreeRoot })
-  t.ok(prompt.includes('confirming its contents match exactly'), 'a regenerable path alone is not safe to discard')
+  t.ok(prompt.includes('a dirty or install-regenerated working tree does not block this'), 'a dirty tree must not block recreation')
   t.end()
 })
 
