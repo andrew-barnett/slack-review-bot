@@ -90,12 +90,13 @@ test('buildPrompt tells the review to start from a clean worktree path', t => {
 })
 
 // The review skill permits removing a reused checkout only after verifying that it is a
-// Codex-created checkout for the same PR with no unpushed commits. An unconditional removal
-// could discard commits a prior run made but never pushed. The guard keys on unpushed
-// *commits*, not a dirty working tree (see the generated-file test below).
+// Codex-created checkout for the same PR with no unpushed commits and no uncommitted changes
+// beyond install-regenerated debris. An unconditional removal could discard commits a prior run
+// made but never pushed, or an uncommitted edit it had not yet committed.
 test('buildPrompt preserves the review skill safeguards before removing a reused worktree', t => {
   const prompt = buildPrompt({ prs: [ref('a', 1)], instructions: '', worktreeRoot })
-  t.ok(prompt.includes('only remove or replace it when it is clearly a Codex-created review checkout for the same PR with no unpushed commits'))
+  t.ok(prompt.includes('Only remove or replace it when it is clearly a Codex-created review checkout for the same PR'))
+  t.ok(prompt.includes('with no unpushed commits'))
   t.end()
 })
 
@@ -103,19 +104,20 @@ test('buildPrompt preserves the review skill safeguards before removing a reused
 // aix-ui's libs/ui-shared/src/lib/pdf-worker-path.ts — leaving the reused worktree with an
 // uncommitted change. The old guard ("no unpushed changes") read that dirty tree as unsafe and
 // refused to recreate the checkout, so a re-review was reported `blocked` for pure install debris.
-// The prompt must say an install-regenerated/dirty working tree does not count as work to preserve.
+// The prompt must mark install-regenerated output as reproducible debris, not work to preserve.
 test('buildPrompt does not let an install-regenerated working tree block recreating the worktree', t => {
   const prompt = buildPrompt({ prs: [ref('a', 1)], instructions: '', worktreeRoot })
-  t.ok(prompt.includes('does not count as unpushed work and must not block recreating'), 'a dirty/regenerated tree must not block recreation')
+  t.ok(prompt.includes('reproducible debris the next install simply rewrites'), 'install output is debris, not work')
   t.end()
 })
 
-// A reused checkout may also contain an uncommitted test edit from a prior review run. The
-// cleanup guard cannot distinguish that from install debris by merely seeing a dirty tree, so it
-// must retain the review skill's protection until it has verified there are no unpushed changes.
+// A reused checkout may also contain an uncommitted edit (e.g. a regression test) a prior review
+// wrote but was killed before committing. A dirty tree alone cannot distinguish that from install
+// debris, so the guard must preserve the checkout whenever it holds any uncommitted change that is
+// NOT install-regenerated output (or any unpushed commit) — only install debris may be discarded.
 test('buildPrompt preserves uncommitted review changes in a reused worktree', t => {
   const prompt = buildPrompt({ prs: [ref('a', 1)], instructions: '', worktreeRoot })
-  t.ok(prompt.includes('with no unpushed changes'), 'uncommitted review changes must block replacement')
+  t.ok(prompt.includes('any other uncommitted change, preserve it and do not recreate it'), 'non-debris uncommitted work must block replacement')
   t.end()
 })
 

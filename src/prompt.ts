@@ -143,15 +143,16 @@ the sandbox grants write access to; worktrees anywhere else will fail on permiss
 checkout or a half-installed \`node_modules\` from an earlier run that was killed mid-install,
 which makes the next dependency install fail with \`ENOTEMPTY\` and run no tests. It may also hold
 a working tree the dependency install itself dirtied: installs routinely regenerate tracked files
-(a bundled worker path, a lockfile, build output), so an uncommitted change to a tracked file
-there is expected install debris, not work to preserve. The only state worth preserving is
-**unpushed commits** (a prior run killed after committing a test change but before pushing it).
-Before creating the worktree,
-inspect whatever is already at \`${worktreeRoot}/<repo>-<number>\` and
-only remove or replace it when it is clearly a Codex-created review checkout for the same PR with no unpushed commits;
-a dirty or install-regenerated working tree
-does not count as unpushed work and must not block recreating
-the checkout, then recreate it so the install starts from an empty directory.
+(a bundled worker path, a lockfile, build output), and that regenerated output is
+reproducible debris the next install simply rewrites — not work to preserve.
+Before creating the worktree, inspect whatever is already at \`${worktreeRoot}/<repo>-<number>\`.
+Do not conflate that install debris with real work: a reused checkout may also carry unpushed
+commits, or an uncommitted edit a prior review wrote but had not yet committed, and both are work
+you must keep — never delete a checkout to get a clean start when it holds either.
+Only remove or replace it when it is clearly a Codex-created review checkout for the same PR
+with no unpushed commits and whose only uncommitted changes are files the dependency install regenerates;
+discard that regenerated debris and recreate the checkout so the install starts from an empty directory.
+If the reused checkout carries unpushed commits or any other uncommitted change, preserve it and do not recreate it.
 The local checkouts are the workspace root — treat them as read-only control plane
 exactly as the skill requires.
 
