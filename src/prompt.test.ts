@@ -89,12 +89,25 @@ test('buildPrompt tells the review to start from a clean worktree path', t => {
   t.end()
 })
 
-// The review skill permits removing a reused checkout only after verifying that it is a
-// Codex-created checkout for the same PR with no unpushed changes. An unconditional removal
-// could discard a developer's checkout or review changes that need to be pushed.
-test('buildPrompt preserves the review skill safeguards before removing a reused worktree', t => {
+// The guard keys destruction on unpushed COMMITS, not on a dirty working tree. review.ts makes
+// every attempt a fresh run in a fresh worktree that redoes the review from scratch, so uncommitted
+// changes in a reused checkout are abandoned scratch the next run regenerates — not work to lose.
+// The one thing a reused checkout can hold that is NOT reproducible is a commit made but not pushed.
+test('buildPrompt removes a reused worktree only when it has no unpushed commits', t => {
   const prompt = buildPrompt({ prs: [ref('a', 1)], instructions: '', worktreeRoot })
-  t.ok(prompt.includes('only remove or replace it when it is clearly a Codex-created review checkout for the same PR with no unpushed changes'))
+  t.ok(prompt.includes('remove or replace it when it is a Codex-created review checkout for the same PR with no unpushed commits'))
+  t.ok(prompt.includes('Preserve it only when it carries an unpushed commit'), 'an unpushed commit is the one preserve case')
+  t.end()
+})
+
+// Regression: an install (`npm ci`/`pnpm install`) routinely regenerates tracked files — e.g.
+// aix-ui's libs/ui-shared/src/lib/pdf-worker-path.ts — leaving the reused worktree dirty. The old
+// guard ("no unpushed changes") read that dirty tree as unsafe and refused to recreate the checkout,
+// so a re-review was reported `blocked` for pure install debris. The prompt must say a dirty /
+// install-regenerated working tree does not block recreating the checkout.
+test('buildPrompt does not let an install-regenerated working tree block recreating the worktree', t => {
+  const prompt = buildPrompt({ prs: [ref('a', 1)], instructions: '', worktreeRoot })
+  t.ok(prompt.includes('a dirty or install-regenerated working tree does not block this'), 'a dirty tree must not block recreation')
   t.end()
 })
 
