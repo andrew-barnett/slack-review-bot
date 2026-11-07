@@ -110,6 +110,15 @@ test('buildPrompt does not let an install-regenerated working tree block recreat
   t.end()
 })
 
+// A reused checkout may also contain an uncommitted test edit from a prior review run. The
+// cleanup guard cannot distinguish that from install debris by merely seeing a dirty tree, so it
+// must retain the review skill's protection until it has verified there are no unpushed changes.
+test('buildPrompt preserves uncommitted review changes in a reused worktree', t => {
+  const prompt = buildPrompt({ prs: [ref('a', 1)], instructions: '', worktreeRoot })
+  t.ok(prompt.includes('with no unpushed changes'), 'uncommitted review changes must block replacement')
+  t.end()
+})
+
 // The findings/approval comments are posted by Codex via the skill, not by the bot, so the only
 // control surface is the prompt: it must carry the hidden no-mention note verbatim and tell the
 // run to append it to every GitHub comment. A regression here reintroduces the spurious
