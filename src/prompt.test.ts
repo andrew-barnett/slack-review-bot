@@ -90,11 +90,23 @@ test('buildPrompt tells the review to start from a clean worktree path', t => {
 })
 
 // The review skill permits removing a reused checkout only after verifying that it is a
-// Codex-created checkout for the same PR with no unpushed changes. An unconditional removal
-// could discard a developer's checkout or review changes that need to be pushed.
+// Codex-created checkout for the same PR with no unpushed commits. An unconditional removal
+// could discard commits a prior run made but never pushed. The guard keys on unpushed
+// *commits*, not a dirty working tree (see the generated-file test below).
 test('buildPrompt preserves the review skill safeguards before removing a reused worktree', t => {
   const prompt = buildPrompt({ prs: [ref('a', 1)], instructions: '', worktreeRoot })
-  t.ok(prompt.includes('only remove or replace it when it is clearly a Codex-created review checkout for the same PR with no unpushed changes'))
+  t.ok(prompt.includes('only remove or replace it when it is clearly a Codex-created review checkout for the same PR with no unpushed commits'))
+  t.end()
+})
+
+// Regression: an install (`npm ci`/`pnpm install`) routinely regenerates tracked files — e.g.
+// aix-ui's libs/ui-shared/src/lib/pdf-worker-path.ts — leaving the reused worktree with an
+// uncommitted change. The old guard ("no unpushed changes") read that dirty tree as unsafe and
+// refused to recreate the checkout, so a re-review was reported `blocked` for pure install debris.
+// The prompt must say an install-regenerated/dirty working tree does not count as work to preserve.
+test('buildPrompt does not let an install-regenerated working tree block recreating the worktree', t => {
+  const prompt = buildPrompt({ prs: [ref('a', 1)], instructions: '', worktreeRoot })
+  t.ok(prompt.includes('does not count as unpushed work and must not block recreating'), 'a dirty/regenerated tree must not block recreation')
   t.end()
 })
 

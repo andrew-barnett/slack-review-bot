@@ -141,10 +141,17 @@ Create every PR worktree under \`${worktreeRoot}/<repo>-<number>\`. That path is
 the sandbox grants write access to; worktrees anywhere else will fail on permissions.
 **Start clean.** That path is reused across runs and retries, so it may still hold a partial
 checkout or a half-installed \`node_modules\` from an earlier run that was killed mid-install,
-which makes the next dependency install fail with \`ENOTEMPTY\` and run no tests. Before creating
-the worktree, inspect whatever is already at \`${worktreeRoot}/<repo>-<number>\`:
-only remove or replace it when it is clearly a Codex-created review checkout for the same PR with no unpushed changes,
-then recreate it so the install starts from an empty directory.
+which makes the next dependency install fail with \`ENOTEMPTY\` and run no tests. It may also hold
+a working tree the dependency install itself dirtied: installs routinely regenerate tracked files
+(a bundled worker path, a lockfile, build output), so an uncommitted change to a tracked file
+there is expected install debris, not work to preserve. The only state worth preserving is
+**unpushed commits** (a prior run killed after committing a test change but before pushing it).
+Before creating the worktree,
+inspect whatever is already at \`${worktreeRoot}/<repo>-<number>\` and
+only remove or replace it when it is clearly a Codex-created review checkout for the same PR with no unpushed commits;
+a dirty or install-regenerated working tree
+does not count as unpushed work and must not block recreating
+the checkout, then recreate it so the install starts from an empty directory.
 The local checkouts are the workspace root — treat them as read-only control plane
 exactly as the skill requires.
 
