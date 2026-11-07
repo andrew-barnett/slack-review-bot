@@ -121,6 +121,15 @@ test('buildPrompt preserves uncommitted review changes in a reused worktree', t 
   t.end()
 })
 
+// A path that an install can rewrite can still contain a reviewer's uncommitted edit. Before
+// removing a dirty checkout, the prompt must require an exact content comparison with an
+// isolated clean install, rather than treating the path name as proof that the change is debris.
+test('buildPrompt requires verification before discarding supposedly regenerated files', t => {
+  const prompt = buildPrompt({ prs: [ref('a', 1)], instructions: '', worktreeRoot })
+  t.ok(prompt.includes('confirming its contents match exactly'), 'a regenerable path alone is not safe to discard')
+  t.end()
+})
+
 // The findings/approval comments are posted by Codex via the skill, not by the bot, so the only
 // control surface is the prompt: it must carry the hidden no-mention note verbatim and tell the
 // run to append it to every GitHub comment. A regression here reintroduces the spurious
