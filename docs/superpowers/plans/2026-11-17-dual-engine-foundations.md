@@ -1107,6 +1107,26 @@ test('isTeamMember is true only for an active membership', async t => {
   t.end()
 })
 
+// reviews() must follow GraphQL pagination. A PR with more than 100 opinionated reviewers would
+// otherwise lose an eligible owner approval on page two and under-predict eligibility.
+test('reviews follows pageInfo across pages', async t => {
+  const pages = [
+    { nodes: [{ author: { login: 'a' }, state: 'COMMENTED', submittedAt: '2026-11-17T08:00:00Z' }], pageInfo: { hasNextPage: true, endCursor: 'c1' } },
+    { nodes: [{ author: { login: 'owner' }, state: 'APPROVED', submittedAt: '2026-11-17T09:00:00Z' }], pageInfo: { hasNextPage: false, endCursor: null } },
+  ]
+  const afters: unknown[] = []
+  const gh = makeApproverGitHub('tok', async (_args, opts) => {
+    const body = JSON.parse(opts?.input ?? '{}')
+    afters.push(body.variables.after)
+    const page = pages[afters.length - 1]
+    return JSON.stringify({ data: { repository: { pullRequest: { latestOpinionatedReviews: page } } } })
+  })
+  const reviews = await gh.reviews(pr)
+  t.deepEqual(afters, [null, 'c1'], 'second request carries the first page cursor')
+  t.deepEqual(reviews.map(r => r.login), ['a', 'owner'], 'the page-two approval is returned')
+  t.end()
+})
+
 // Only added and context lines on the new side can carry an inline comment. Deleted lines and
 // lines outside every hunk must fall back to the review body.
 test('parsePatchLines returns RIGHT-side added and context lines', t => {
@@ -1246,15 +1266,29 @@ export function makeApproverGitHub(token: string, run: GhRunner = defaultRunner(
       return r?.state === 'active'
     },
     async reviews(pr) {
-      const data = await graphql<{
-        repository: { pullRequest: { latestOpinionatedReviews: { nodes: { author: { login: string } | null; state: ReviewFact['state']; submittedAt: string }[] } } }
-      }>(
-        `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){latestOpinionatedReviews(first:100){nodes{author{login} state submittedAt}}}}}`,
-        { owner: pr.owner, name: pr.repo, number: pr.number }
-      )
-      return data.repository.pullRequest.latestOpinionatedReviews.nodes
-        .filter(n => n.author)
-        .map(n => ({ login: n.author!.login, state: n.state, submittedAt: n.submittedAt }))
+      // Every page: an owner's approval past the first 100 reviewers must not be silently dropped.
+      type Page = {
+        repository: {
+          pullRequest: {
+            latestOpinionatedReviews: {
+              nodes: { author: { login: string } | null; state: ReviewFact['state']; submittedAt: string }[]
+              pageInfo: { hasNextPage: boolean; endCursor: string | null }
+            }
+          }
+        }
+      }
+      const out: ReviewFact[] = []
+      let after: string | null = null
+      do {
+        const data: Page = await graphql<Page>(
+          `query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){latestOpinionatedReviews(first:100,after:$after){nodes{author{login} state submittedAt} pageInfo{hasNextPage endCursor}}}}}`,
+          { owner: pr.owner, name: pr.repo, number: pr.number, after }
+        )
+        const page = data.repository.pullRequest.latestOpinionatedReviews
+        for (const n of page.nodes) if (n.author) out.push({ login: n.author.login, state: n.state, submittedAt: n.submittedAt })
+        after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null
+      } while (after)
+      return out
     },
     async latestPush(pr, headRef) {
       const ref = encodeURIComponent(`refs/heads/${headRef}`)
