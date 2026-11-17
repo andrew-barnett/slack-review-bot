@@ -101,7 +101,9 @@ The code is split into a pure evaluator and a fetch layer.
 | CODEOWNERS | first of `.github/CODEOWNERS`, `CODEOWNERS`, `docs/CODEOWNERS` at `ref={base}` via the contents API |
 | CODEOWNERS validity | `GET /repos/{o}/{r}/codeowners/errors?ref={base}` |
 | team membership | `GET /orgs/{org}/teams/{slug}/memberships/{bot}` (state `active`) for each `@org/team` owner the evaluator needs |
-| current approvals | GraphQL `pullRequest.latestOpinionatedReviews` (author, state, commit oid) |
+| current approvals | GraphQL `pullRequest.latestOpinionatedReviews` (author, state, commit oid, submittedAt) |
+| other approvers' eligibility | `GET /repos/{o}/{r}/collaborators/{login}/permission` for each other approver, plus team membership as for the bot when evaluating owner coverage |
+| latest pusher of the head branch | `GET /repos/{o}/{r}/activity?ref=refs/heads/{head}&activity_type=push&per_page=1` (actor, after-SHA, timestamp). Needed only when `require_last_push_approval` is set. A head branch in a fork is not readable this way, so the result is "cannot verify". Readability is checked in V1. |
 
 **Evaluator.** `evaluateEligibility(facts) -> Eligibility`, a pure function:
 
@@ -117,13 +119,29 @@ type Eligibility = {
 
 Rules:
 
-1. Bot login equals the PR author → `wontCount` ("the bot account authored this PR").
-2. Bot permission below `write` → `wontCount`.
-3. Effective rule = the **strictest** across every ruleset `pull_request` rule and classic protection. That is the maximum `required_approving_review_count`, and each boolean is true if any source sets it true.
-4. If `require_code_owner_review` is set: for every changed path, find the CODEOWNERS entry that matches (last match wins). A path is **covered** when the bot is listed directly (`@bot`) or is an active member of a listed team. A path with an empty owner list needs no owner. If no path is covered while some path needs an owner → `wontCount`. If some paths are covered and others are not → `partial`, and the uncovered owners go in `missing`.
-5. Approval count: other approvals are reviews in `latestOpinionatedReviews` with state `APPROVED`, from someone other than the bot and the author. When `dismissStale` is set, only approvals on the current head SHA count. If `1 + others < required` → `partial`, with "N more approval(s)" in `missing`.
-6. If any source needed by rules 2-5 could not be read, or `codeowners/errors` is non-empty → `wontCount`, with the unreadable source named (the Q4 decision). A source that is legitimately absent is not unreadable: no ruleset, no classic protection (404), or no CODEOWNERS file all read as "no requirement".
-7. Otherwise → `counts`.
+The evaluator first decides whether the bot's approval would be **valid** at all. Then it simulates the PR's requirements with the eligible existing approvals plus the bot's approval.
+
+1. **Effective rule.** Take the **strictest** across every ruleset `pull_request` rule and classic protection. That is the maximum `required_approving_review_count`, and each boolean (`require_code_owner_review`, `require_last_push_approval`, `dismiss_stale_reviews_on_push`) is true if any source sets it true.
+2. **Eligible existing approvals.** These are reviews in `latestOpinionatedReviews` that meet all of the following:
+   - state `APPROVED`;
+   - not from the bot and not from the PR author;
+   - the reviewer has `write` or higher permission (an approval from a read-only reviewer is shown but never counts);
+   - when `dismiss_stale_reviews_on_push` is set, `commit oid == head SHA`;
+   - when `require_last_push_approval` is set, the reviewer is not the latest pusher, and the review was submitted after the latest push.
+3. **Bot validity.** The bot's approval is **invalid**, giving `wontCount` with the reason, when:
+   - the bot authored the PR;
+   - the bot has less than `write` permission; or
+   - `require_last_push_approval` is set and the bot is the latest pusher. For example, the bot updated the branch earlier, or the role account pushed commits.
+4. **Owner coverage** (only when `require_code_owner_review` is set). For each changed path, the CODEOWNERS entry that matches is the last one to match. A path with no matching entry, or with an empty owner list, needs no owner. A path that needs an owner is **satisfied** when any of its owners has approved, counting only eligible approvals plus the bot's. An owner has approved if the approver is listed directly or is an active member of a listed team.
+5. **Remaining requirements** after adding the bot's approval:
+   - the approval shortfall, `required - (eligible + 1)`, when positive;
+   - every owner path still unsatisfied (its owners go in `missing`);
+   - when `require_last_push_approval` is set, whether any approval would then exist from someone other than the latest pusher, after the latest push. The bot's own approval satisfies this unless rule 3 made it invalid.
+6. **Verdict.**
+   - No remaining requirements → `counts`.
+   - Some remain, and the bot's approval reduced them (it filled an approval slot, or satisfied at least one owner path that was otherwise unsatisfied) → `partial`, with what remains in `missing`.
+   - Some remain, and the bot's approval reduced nothing → `wontCount`. Its approval would not move the PR toward mergeable.
+7. **Cannot verify.** If any source that rules 1-5 need could not be read, or `codeowners/errors` is non-empty → `wontCount`, naming the unreadable source (the Q4 decision). The latest pusher is needed only when `require_last_push_approval` is set; a fork head branch counts as unreadable. A source that is legitimately absent is not unreadable: no ruleset, no classic protection (404), or no CODEOWNERS file all read as "no requirement".
 
 **CODEOWNERS matcher** (`codeowners.ts`, pure). It implements GitHub's documented syntax:
 
@@ -305,7 +323,7 @@ Until the skill ships report-only mode, dual mode stays behind `REVIEW_ENGINES`,
 
 ## 8. Verification items (spike before the dependent sub-issues)
 
-- **V1.** With the role PAT, what is readable: `branches/{b}/protection` (classic protection normally needs admin), `rules/branches/{b}`, team memberships (`read:org`, and secret teams), `codeowners/errors`? If classic protection is unreadable to a write-level account, rule 6 would make every classically protected repo `wontCount`. The fallback is decided with the user before 5.2 is built. Candidates: GraphQL `baseRef.branchProtectionRule` readability, or classifying "classic protection unreadable" as `partial` with a reason instead of `wontCount`.
+- **V1.** With the role PAT, what is readable: `branches/{b}/protection` (classic protection normally needs admin), `rules/branches/{b}`, team memberships (`read:org`, and secret teams), `codeowners/errors`, the repository activity API for the latest pusher? If classic protection is unreadable to a write-level account, rule 7 would make every classically protected repo `wontCount`. The fallback is decided with the user before 5.2 is built. Candidates: GraphQL `baseRef.branchProtectionRule` readability, or classifying "classic protection unreadable" as `partial` with a reason instead of `wontCount`.
 - **V2.** Claude Code headless: structured-output flag, stream-JSON progress events, the permission mode that never prompts, sandbox config for the worktree root, and auth (API key or `setup-token`).
 - **V3.** Whether update-branch attributes the push to the token user, and how it interacts with `require_last_push_approval` and `dismiss_stale_reviews_on_push`.
 - **V4.** How `doctor` can confirm the engine token is read-only without writing anything: fine-grained token permissions, or classic `X-OAuth-Scopes`.
@@ -321,7 +339,7 @@ Until the skill ships report-only mode, dual mode stays behind `REVIEW_ENGINES`,
 ## 10. Testing
 
 - `codeowners.ts`: GitHub's documented examples, last-match-wins, anchoring, `*` against `**`, trailing `/`, an empty owner list, and the unsupported `!` and `[]`.
-- `preflight.ts` evaluator: table tests for every rule in section 5.2, including strictest-of-sources merging, stale-approval exclusion, unreadable source → `wontCount`, and an absent source treated as no requirement.
+- `preflight.ts` evaluator: table tests for every rule in section 5.2, including strictest-of-sources merging, stale-approval exclusion, a read-only reviewer's approval not counted, an existing code-owner approval satisfying a path the bot does not own (bot fills the count → `counts`), the bot as latest pusher under `require_last_push_approval` (→ `wontCount`), a valid bot approval that reduces nothing (→ `wontCount`), unreadable source → `wontCount`, and an absent source treated as no requirement.
 - `dual.ts`: table tests for every row of both section 5.8 tables, serial skip, head moved, idempotency skip, and read-back mismatch.
 - `config.ts` and `codex.ts` env: the approver token is dropped even when passed through; `GH_TOKEN` is set from the engine token and the operator's tokens are stripped in dual mode.
 - `schema.ts` v2: strict-mode shape, `clean` with a blocking finding rejected, `reviewedSha` format.
