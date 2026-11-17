@@ -37,7 +37,7 @@ Slack request
        └─ dual review runner, per PR:
             1. pre-flight        (approver token, read-only GitHub calls)
             2. update branch?    (approver token, PUT update-branch)        [Q3]
-            3. pin head SHA
+            3. pin head SHA      (re-run pre-flight first if step 2 moved the head)
             4. engines           (engine token, report-only review-pr)
                  codex ─┐  parallel or serial                               [Q2]
                  claude ┘
@@ -127,7 +127,6 @@ The evaluator first decides whether the bot's approval would be **valid** at all
    - not from the bot and not from the PR author;
    - the reviewer has `write` or higher permission (an approval from a read-only reviewer is shown but never counts);
    - when `dismiss_stale_reviews_on_push` is set, `commit oid == head SHA`;
-   - when `require_last_push_approval` is set, the reviewer is not the latest pusher, and the review was submitted after the latest push.
 3. **Bot validity.** The bot's approval is **invalid**, giving `wontCount` with the reason, when:
    - the bot authored the PR;
    - the bot has less than `write` permission; or
@@ -136,7 +135,7 @@ The evaluator first decides whether the bot's approval would be **valid** at all
 5. **Remaining requirements** after adding the bot's approval:
    - the approval shortfall, `required - (eligible + 1)`, when positive;
    - every owner path still unsatisfied (its owners go in `missing`);
-   - when `require_last_push_approval` is set, whether any approval would then exist from someone other than the latest pusher, after the latest push. The bot's own approval satisfies this unless rule 3 made it invalid.
+   - when `require_last_push_approval` is set, whether the latest push would then be approved. That needs at least one approval from someone other than the latest pusher, submitted after that push: an eligible existing approval, or the bot's own (valid unless rule 3 failed). This is checked **separately** from rule 2. Approvals from before the latest push still count toward the approval number and owner coverage unless `dismiss_stale_reviews_on_push` removed them; they just cannot satisfy the latest-push requirement.
 6. **Verdict.**
    - No remaining requirements → `counts`.
    - Some remain, and the bot's approval reduced them (it filled an approval slot, or satisfied at least one owner path that was otherwise unsatisfied) → `partial`, with what remains in `missing`.
@@ -159,7 +158,7 @@ Run after pre-flight, before pinning, only when the base has moved. "Moved" mean
 
 - If `eligibility.lastPushApproval` is true: do not update. Record the PR as `blocked` ("base moved; this repo requires approval of the latest push, so the author must update the branch"). Post nothing to GitHub.
 - Otherwise: `PUT /repos/{o}/{r}/pulls/{n}/update-branch` with `expected_head_sha` set to the current head.
-  - `202`: poll `GET /pulls/{n}` until `head.sha` changes, using the same timeout as `gh` calls, then continue with the new head.
+  - `202`: poll `GET /pulls/{n}` until `head.sha` changes, using the same timeout as `gh` calls, then **re-run the whole pre-flight against the new head** before pinning. The update can dismiss existing approvals (when `dismiss_stale_reviews_on_push` is set) and makes the bot the latest pusher, so the earlier prediction is stale. The re-evaluated eligibility is the one used for posting and rendering.
   - `422` (conflict, or the head moved): mark the PR `blocked` with the reason, and post nothing.
 
 The update is pushed by the role account. Pre-flight already established that `require_last_push_approval` is off, so the bot's own push does not void its approval. **To verify (V3):** that the update-branch API attributes the push to the token's user.
@@ -177,7 +176,7 @@ interface EngineRunInput {
 interface EngineRunOutcome {
   engine: 'codex' | 'claude'
   results: EnginePrResult[]   // one per PR, reconciled like reconcileResults
-  usage: RunUsage
+  usage: RunUsage           // per engine; see 5.9
   error?: string              // process-level failure: timeout, stall kill, unparseable output
 }
 interface Engine { name: 'codex' | 'claude'; run(input: EngineRunInput): Promise<EngineRunOutcome> }
@@ -195,6 +194,7 @@ interface Engine { name: 'codex' | 'claude'; run(input: EngineRunInput): Promise
   - the secret-blocking `PreToolUse` hook (`block-secret-reads.py`);
   - a sandbox and permission config confined to `WORKTREE_ROOT`, the workspace root (read-only), and the package caches;
   - **none** of the operator's personal hooks, memory, or MCP servers. Personal Stop hooks and reminders would otherwise block or derail an unattended run.
+  - Not `--bare`: that flag skips hooks, and the secret-blocking hook must load. Isolation comes from the dedicated config dir instead.
 - Auth: a non-interactive Claude credential (an API key or a long-lived token from `claude setup-token`, to be decided in V2). It is passed by exact name through the child allowlist. Like Codex's own credential today, it is visible to untrusted PR code. This is the same accepted risk, and it is recorded in section 9.
 - Environment: the same `buildChildEnv` allowlist plus the Claude credential name, with `GH_TOKEN` set to the engine token (section 5.1).
 
@@ -254,7 +254,7 @@ The schema stays strict-mode compatible, as v1 is: every property is required an
 | `verdict: clean` | `clean` |
 | not run (serial, earlier engine not clean) | `skipped` |
 
-Serial mode runs the next engine only when the previous one is `clean` for **every** PR in the request. A PR where the first engine was not clean gets `skipped` for the rest.
+Serial mode decides **per PR**. The next engine receives only the PRs for which every earlier engine was `clean`. The other PRs keep their earlier engines' states and get `skipped` for the rest, so a defect in one PR never denies another PR its second review. A `skipped` engine only ever sits beside a non-clean earlier engine, so the PR's row in the decision table comes from that earlier state (`findings`, `blocked`, or `invalid`). If no PR is left, the next engine is not spawned.
 
 **Per-PR decision** (after step 6 confirms the head still equals the pinned SHA; otherwise the outcome is `headMoved`, nothing is posted, and Slack says "head moved during review; re-request"):
 
@@ -278,7 +278,9 @@ A `skipped` engine is never `clean`. Every `APPROVE` requires every configured e
 
 **Read-back:** after posting `APPROVE`, call `readDecision`. If the result contradicts the prediction (for example, `counts` but `reviewDecision != APPROVED`), add a warning line to Slack naming both. The approval is not withdrawn: the posted review is correct, and only the prediction was wrong.
 
-### 5.9 Rendering (`render.ts`, `job.ts`)
+### 5.9 Rendering (`render.ts`, `job.ts`, `usage.ts`)
+
+**Usage.** `RunUsage` gains a per-engine breakdown. Codex keeps today's transcript-footer parse in `usage.ts`. Claude's comes from the final `result` event of `--output-format stream-json`: input, output, cache-read and cache-write tokens, `total_cost_usd`, `num_turns`, and `duration_ms`. The per-review usage reply and the status totals show each engine separately (`Codex 412k tok · Claude 380k tok ($2.10)`). With subscription auth (`CLAUDE_CODE_OAUTH_TOKEN`), `total_cost_usd` is a notional cost figure, not a charge, and is labelled as such. A killed run reports whatever usage was seen before the kill, as Codex does today.
 
 `JobOutcome` gains `approved`, `approvedPartial`, `cleanNotCounted` and `headMoved`. The existing `pass` maps to `approved` in dual mode. The thread reply shows, per PR: the pre-flight verdict, each engine's state, the outcome, and the review URL. Reactions:
 
@@ -324,7 +326,7 @@ Until the skill ships report-only mode, dual mode stays behind `REVIEW_ENGINES`,
 ## 8. Verification items (spike before the dependent sub-issues)
 
 - **V1.** With the role PAT, what is readable: `branches/{b}/protection` (classic protection normally needs admin), `rules/branches/{b}`, team memberships (`read:org`, and secret teams), `codeowners/errors`, the repository activity API for the latest pusher? If classic protection is unreadable to a write-level account, rule 7 would make every classically protected repo `wontCount`. The fallback is decided with the user before 5.2 is built. Candidates: GraphQL `baseRef.branchProtectionRule` readability, or classifying "classic protection unreadable" as `partial` with a reason instead of `wontCount`.
-- **V2.** Claude Code headless: structured-output flag, stream-JSON progress events, the permission mode that never prompts, sandbox config for the worktree root, and auth (API key or `setup-token`).
+- **V2.** Claude Code headless: structured-output flag, stream-JSON progress events, the permission mode that never prompts, sandbox config for the worktree root, and auth (a subscription token from `claude setup-token` passed as `CLAUDE_CODE_OAUTH_TOKEN`, or an API key). Bedrock and Vertex are excluded, because their cloud keys would sit in the engine env. `--json-schema` is confirmed present in Claude Code 2.1.284.
 - **V3.** Whether update-branch attributes the push to the token user, and how it interacts with `require_last_push_approval` and `dismiss_stale_reviews_on_push`.
 - **V4.** How `doctor` can confirm the engine token is read-only without writing anything: fine-grained token permissions, or classic `X-OAuth-Scopes`.
 
@@ -339,8 +341,8 @@ Until the skill ships report-only mode, dual mode stays behind `REVIEW_ENGINES`,
 ## 10. Testing
 
 - `codeowners.ts`: GitHub's documented examples, last-match-wins, anchoring, `*` against `**`, trailing `/`, an empty owner list, and the unsupported `!` and `[]`.
-- `preflight.ts` evaluator: table tests for every rule in section 5.2, including strictest-of-sources merging, stale-approval exclusion, a read-only reviewer's approval not counted, an existing code-owner approval satisfying a path the bot does not own (bot fills the count → `counts`), the bot as latest pusher under `require_last_push_approval` (→ `wontCount`), a valid bot approval that reduces nothing (→ `wontCount`), unreadable source → `wontCount`, and an absent source treated as no requirement.
-- `dual.ts`: table tests for every row of both section 5.8 tables, serial skip, head moved, idempotency skip, and read-back mismatch.
+- `preflight.ts` evaluator: table tests for every rule in section 5.2, including strictest-of-sources merging, stale-approval exclusion, a read-only reviewer's approval not counted, an approval from before the latest push still counting toward the approval number and owner coverage while not satisfying the latest-push requirement, an existing code-owner approval satisfying a path the bot does not own (bot fills the count → `counts`), the bot as latest pusher under `require_last_push_approval` (→ `wontCount`), a valid bot approval that reduces nothing (→ `wontCount`), unreadable source → `wontCount`, and an absent source treated as no requirement.
+- `dual.ts`: table tests for every row of both section 5.8 tables, serial per-PR scheduling (a mixed request: engine A finds a defect in PR 1 and is clean on PR 2, and engine B reviews only PR 2), re-evaluated eligibility after update-branch dismisses an owner approval, head moved, idempotency skip, and read-back mismatch.
 - `config.ts` and `codex.ts` env: the approver token is dropped even when passed through; `GH_TOKEN` is set from the engine token and the operator's tokens are stripped in dual mode.
 - `schema.ts` v2: strict-mode shape, `clean` with a blocking finding rejected, `reviewedSha` format.
 - `github.ts`: the argument and stdin shape of `postReview` (approver env per call, never argv bodies), and parsing commentable lines from patches.
