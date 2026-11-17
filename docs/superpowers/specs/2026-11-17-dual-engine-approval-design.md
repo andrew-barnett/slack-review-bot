@@ -126,7 +126,7 @@ The evaluator first decides whether the bot's approval would be **valid** at all
    - state `APPROVED`;
    - not from the bot and not from the PR author;
    - the reviewer has `write` or higher permission (an approval from a read-only reviewer is shown but never counts);
-   - when `dismiss_stale_reviews_on_push` is set, `commit oid == head SHA`;
+   - not dismissed. GitHub's own review state is authoritative: a review it dismissed reads `DISMISSED`, not `APPROVED`. The evaluator never infers dismissal from `commit oid != head SHA`, because GitHub keeps an approval when a push leaves the reviewed diff unchanged (for example, an empty commit);
 3. **Bot validity.** The bot's approval is **invalid**, giving `wontCount` with the reason, when:
    - the bot authored the PR;
    - the bot has less than `write` permission; or
@@ -341,7 +341,7 @@ Until the skill ships report-only mode, dual mode stays behind `REVIEW_ENGINES`,
 ## 10. Testing
 
 - `codeowners.ts`: GitHub's documented examples, last-match-wins, anchoring, `*` against `**`, trailing `/`, an empty owner list, and the unsupported `!` and `[]`.
-- `preflight.ts` evaluator: table tests for every rule in section 5.2, including strictest-of-sources merging, stale-approval exclusion, a read-only reviewer's approval not counted, an approval from before the latest push still counting toward the approval number and owner coverage while not satisfying the latest-push requirement, an existing code-owner approval satisfying a path the bot does not own (bot fills the count → `counts`), the bot as latest pusher under `require_last_push_approval` (→ `wontCount`), a valid bot approval that reduces nothing (→ `wontCount`), unreadable source → `wontCount`, and an absent source treated as no requirement.
+- `preflight.ts` evaluator: table tests for every rule in section 5.2, including strictest-of-sources merging, a dismissed approval excluded by its `DISMISSED` state, an approval on an older SHA still counting after an empty-commit push, a read-only reviewer's approval not counted, an approval from before the latest push still counting toward the approval number and owner coverage while not satisfying the latest-push requirement, an existing code-owner approval satisfying a path the bot does not own (bot fills the count → `counts`), the bot as latest pusher under `require_last_push_approval` (→ `wontCount`), a valid bot approval that reduces nothing (→ `wontCount`), unreadable source → `wontCount`, and an absent source treated as no requirement.
 - `dual.ts`: table tests for every row of both section 5.8 tables, serial per-PR scheduling (a mixed request: engine A finds a defect in PR 1 and is clean on PR 2, and engine B reviews only PR 2), re-evaluated eligibility after update-branch dismisses an owner approval, head moved, idempotency skip, and read-back mismatch.
 - `config.ts` and `codex.ts` env: the approver token is dropped even when passed through; `GH_TOKEN` is set from the engine token and the operator's tokens are stripped in dual mode.
 - `schema.ts` v2: strict-mode shape, `clean` with a blocking finding rejected, `reviewedSha` format.
