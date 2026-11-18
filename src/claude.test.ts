@@ -271,3 +271,77 @@ test('runClaudeReview reads a result event larger than the transcript tail', asy
   t.equal(value?.result.results[0].findings[0].body.length, TRANSCRIPT_TAIL_LIMIT)
   t.end()
 })
+
+// The prompt follows the boolean -p as a positional; one starting with a dash would be read as a
+// flag. Fail closed. Regression caught: a PR-derived prompt smuggling a CLI option.
+test('buildClaudeArgs rejects a prompt that starts with a dash', t => {
+  t.throws(() => buildClaudeArgs({ prompt: '--dangerously-skip-permissions', schemaJson: '{}', workspaceRoot: '/ws' }), /must not start/)
+  t.end()
+})
+
+// Even when named as passthrough, an API key must not reach the child, so the OAuth token is the
+// credential used. Package caches move under the engine root so the profile need not grant writes
+// to the operator's cache dirs. GH_ENTERPRISE_TOKEN and an inherited GH_TOKEN must not survive.
+test('buildClaudeEnv drops API key and extra GitHub tokens and redirects caches', t => {
+  const env = buildClaudeEnv(
+    { PATH: '/usr/bin', ANTHROPIC_API_KEY: 'k', GH_ENTERPRISE_TOKEN: 'e', GH_TOKEN: 'operator-gh', CLAUDE_CODE_OAUTH_TOKEN: 'c' },
+    { configDir: '/cfg', engineGhToken: 'engine-placeholder', envPassthrough: ['ANTHROPIC_API_KEY'], disableGitSigning: false, cacheRoot: '/wt/claude' }
+  )
+  t.notOk('ANTHROPIC_API_KEY' in env, 'API key dropped despite passthrough')
+  t.notOk('GH_ENTERPRISE_TOKEN' in env, 'enterprise token dropped')
+  t.equal(env.GH_TOKEN, 'engine-placeholder', 'inherited GH_TOKEN replaced')
+  t.equal(env.XDG_CACHE_HOME, '/wt/claude/.cache')
+  t.equal(env.npm_config_cache, '/wt/claude/.cache/npm')
+  t.equal(env.npm_config_store_dir, '/wt/claude/.cache/pnpm-store')
+  t.end()
+})
+
+// A success result without structured output is not a clean review. Regression caught: treating a
+// missing verdict as approval.
+test('runClaudeReview fails when structured_output is missing or null', async t => {
+  for (const so of [undefined, null]) {
+    const { child, run } = start()
+    await settle()
+    child.stdout.write(resultEvent(so) + '\n')
+    await settle()
+    child.emit('close', 0)
+    const { error } = await run
+    t.equal((error as ClaudeRunError).kind, 'output')
+    t.match(String(error), /without structured output/)
+  }
+  t.end()
+})
+
+// A truncated or garbled final result line cannot be parsed, so no result event exists: an output
+// failure, never a pass.
+test('runClaudeReview fails on an unparseable final result line', async t => {
+  const { child, run } = start()
+  await settle()
+  child.stdout.write('{"type":"result","structured_output":{"results":[\n')
+  await settle()
+  child.emit('close', 0)
+  const { error } = await run
+  t.equal((error as ClaudeRunError).kind, 'output')
+  t.end()
+})
+
+// A multi-byte character split across two pipe chunks must survive. Regression caught: per-chunk
+// decoding turning it into U+FFFD, which was then posted to GitHub.
+test('runClaudeReview keeps UTF-8 characters split across stdout chunks', async t => {
+  const withChars = { results: [{ ...clean.results[0], verdict: 'findings', findings: [{ severity: 'blocking', file: 'a.ts', line: 1, body: 'caf\u00e9 \u{1F600}' }] }] }
+  const buf = Buffer.from(resultEvent(withChars) + '\n', 'utf8')
+  const cut = (needle: string) => buf.indexOf(Buffer.from(needle, 'utf8'))
+  const e = cut('\u00e9') + 1
+  const emoji = cut('\u{1F600}') + 2
+  const { child, run } = start()
+  await settle()
+  child.stdout.write(buf.subarray(0, e))
+  child.stdout.write(buf.subarray(e, emoji))
+  child.stdout.write(buf.subarray(emoji))
+  await settle()
+  child.emit('close', 0)
+  const { value, error } = await run
+  t.equal(error, undefined, String(error))
+  t.equal(value?.result.results[0].findings[0].body, 'caf\u00e9 \u{1F600}')
+  t.end()
+})

@@ -5,6 +5,7 @@
 import { spawn, type ChildProcess } from 'child_process'
 import * as fs from 'fs'
 import * as path from 'path'
+import { StringDecoder } from 'string_decoder'
 import { startActiveDeadline, type DeadlineDeps, type DeadlineSnapshot } from './deadline'
 import { createOutputRedactor } from './redact'
 
@@ -299,27 +300,42 @@ export function superviseChild(
     // chunks, so a chunk-split or over-long PEM key never leaks its body (issue #31).
     const stdoutRedactor = createOutputRedactor()
     const stderrRedactor = createOutputRedactor()
-    const captureFrom = (redactor: { push(t: string): string }, raw?: (text: string) => void) => (chunk: Buffer) => {
-      // Reset the stall clock on every raw chunk, before redacting: a run slowly writing one long
-      // line is active, not silent (markActivity must see it even when nothing publishes yet).
-      deadline.markActivity()
-      const text = chunk.toString('utf8')
-      if (raw) {
-        // A parser failure must never take the run down; the caller sees a missing result instead.
-        try {
-          raw(text)
-        } catch {
-          // Ignored on purpose.
+    // Each stream decodes through its OWN StringDecoder, so a multi-byte character split across two
+    // pipe chunks survives instead of becoming U+FFFD (which would later be posted to GitHub).
+    const capture = (redactor: { push(t: string): string }, raw?: (text: string) => void) => {
+      const decoder = new StringDecoder('utf8')
+      const deliver = (text: string) => {
+        if (!text) return
+        if (raw) {
+          // A parser failure must never take the run down; the caller sees a missing result instead.
+          try {
+            raw(text)
+          } catch {
+            // Ignored on purpose.
+          }
         }
+        publish(redactor.push(text))
       }
-      publish(redactor.push(text))
+      return {
+        // Reset the stall clock on every raw chunk, before decoding: a run slowly writing one long
+        // line is active, not silent (markActivity must see it even when nothing publishes yet).
+        onData: (chunk: Buffer) => {
+          deadline.markActivity()
+          deliver(decoder.write(chunk))
+        },
+        end: () => deliver(decoder.end()),
+      }
     }
-    child.stdout?.on('data', captureFrom(stdoutRedactor, options.onStdout))
-    child.stderr?.on('data', captureFrom(stderrRedactor))
+    const stdoutCapture = capture(stdoutRedactor, options.onStdout)
+    const stderrCapture = capture(stderrRedactor)
+    child.stdout?.on('data', stdoutCapture.onData)
+    child.stderr?.on('data', stderrCapture.onData)
 
     // Flush both redactors when the stream ends, so the final line (and its token footer) reaches
     // the transcript. A key block still open at close stays suppressed — flush emits no body.
     const flushOutput = () => {
+      stdoutCapture.end()
+      stderrCapture.end()
       publish(stdoutRedactor.flush())
       publish(stderrRedactor.flush())
     }

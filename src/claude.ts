@@ -7,6 +7,7 @@
 
 import { spawn } from 'child_process'
 import * as fs from 'fs'
+import * as path from 'path'
 import { buildChildEnv, withEngineGhToken, withGitSigningDisabled } from './codex'
 import { type DeadlineDeps } from './deadline'
 import { redactSecrets } from './redact'
@@ -75,6 +76,8 @@ export class ClaudeRunError extends Error {
 
 /** Assemble the `claude` argument list. Exported for unit testing. */
 export function buildClaudeArgs(options: { prompt: string; schemaJson: string; workspaceRoot: string }): string[] {
+  // The prompt is a positional after the boolean -p; a leading dash would be parsed as a flag.
+  if (options.prompt.startsWith('-')) throw new Error('Claude prompt must not start with "-"')
   return [
     '-p', options.prompt,
     // Every event is one stdout line: progress for the stall timer, and the final `result` event.
@@ -96,10 +99,27 @@ export function buildClaudeArgs(options: { prompt: string; schemaJson: string; w
  */
 export function buildClaudeEnv(
   base: NodeJS.ProcessEnv,
-  options: { configDir: string; engineGhToken: string; envPassthrough?: string[]; disableGitSigning: boolean }
+  options: {
+    configDir: string
+    engineGhToken: string
+    envPassthrough?: string[]
+    disableGitSigning: boolean
+    /** This engine's worktree root; package caches are redirected beneath it. */
+    cacheRoot?: string
+  }
 ): NodeJS.ProcessEnv {
   let env = buildChildEnv(base, [...(options.envPassthrough ?? []), CLAUDE_TOKEN_VAR])
+  // The OAuth token must be the credential in use, even if an operator passed an API key through.
+  delete env.ANTHROPIC_API_KEY
   env.CLAUDE_CONFIG_DIR = options.configDir
+  if (options.cacheRoot) {
+    // Keep package caches inside the engine's own worktree root, so the sandbox profile need not
+    // grant writes to the operator's ~/.npm, ~/.cache, ~/Library/Caches or ~/Library/pnpm.
+    const cache = path.join(options.cacheRoot, '.cache')
+    env.XDG_CACHE_HOME = cache
+    env.npm_config_cache = path.join(cache, 'npm')
+    env.npm_config_store_dir = path.join(cache, 'pnpm-store')
+  }
   if (options.disableGitSigning) env = withGitSigningDisabled(env)
   return withEngineGhToken(env, options.engineGhToken)
 }
@@ -201,6 +221,7 @@ export async function runClaudeReview(
     engineGhToken: options.engineGhToken,
     envPassthrough: options.envPassthrough,
     disableGitSigning: options.disableGitSigning,
+    cacheRoot: options.worktreeRoot,
   })
   const args = buildClaudeArgs({
     prompt: options.prompt,
