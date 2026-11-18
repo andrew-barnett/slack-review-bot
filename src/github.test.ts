@@ -1,5 +1,6 @@
 import test from 'tape'
-import { defaultRunner, GH_COMMAND_TIMEOUT_MS, makeGitHubEffects } from './github'
+import type { ApproverGitHub } from './approver-github'
+import { defaultRunner, GH_COMMAND_TIMEOUT_MS, makeGitHubEffects, makeJobGitHubEffects } from './github'
 
 const pr = { owner: 'trade-platform', repo: 'deployments', number: 5, url: 'https://github.com/trade-platform/deployments/pull/5' }
 
@@ -74,5 +75,24 @@ test('the gh runner surfaces a timeout rejection to the caller', async t => {
   } catch (error) {
     t.ok(String(error).includes('timed out'), 'the rejection reaches the gate')
   }
+  t.end()
+})
+
+// In dual mode the human-gate comment is posted as the role account, so every bot comment comes
+// from one identity (spec 5.7); single mode keeps the operator's gh. Regression caught: the gate
+// comment silently posting under the operator's login in dual mode.
+test('makeJobGitHubEffects posts the gate comment as the role account in dual mode', async t => {
+  const calls: string[] = []
+  const base = {
+    listChangedFiles: async () => ['values.yaml'],
+    postPrComment: async () => {
+      calls.push('operator')
+    },
+  }
+  const approver = { postIssueComment: async () => { calls.push('role-account') } } as unknown as ApproverGitHub
+  await makeJobGitHubEffects({ reviewEngines: ['codex', 'claude'] }, approver, base).postPrComment!(pr, 'human needed')
+  await makeJobGitHubEffects({ reviewEngines: ['codex'] }, undefined, base).postPrComment!(pr, 'human needed')
+  t.deepEqual(calls, ['role-account', 'operator'])
+  t.deepEqual(await makeJobGitHubEffects({ reviewEngines: ['codex', 'claude'] }, approver, base).listChangedFiles!(pr), ['values.yaml'])
   t.end()
 })

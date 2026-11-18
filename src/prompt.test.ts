@@ -1,5 +1,5 @@
 import test from 'tape'
-import { buildPrompt } from './prompt'
+import { buildPrompt, buildReportOnlyPrompt, skillInvocation } from './prompt'
 import { AGENT_NO_MENTION_NOTE } from './agent-note'
 import type { PullRequestRef } from './parse-message'
 
@@ -160,5 +160,75 @@ test('buildPrompt blocks only on review-subverting instructions, not constraints
   const prompt = buildPrompt({ prs: [ref('a', 1)], instructions: '', worktreeRoot })
   t.ok(prompt.includes('unsound or subvert'), 'names the subversion test for blocking')
   t.ok(prompt.includes('suppress or soften findings'), 'gives a concrete review-subverting example')
+  t.end()
+})
+
+const SHA1 = '1'.repeat(40)
+const SHA2 = '2'.repeat(40)
+function reportOnly(engine: 'codex' | 'claude', instructions = '') {
+  return buildReportOnlyPrompt({
+    engine,
+    prs: [{ ref: ref('a', 1), pinnedSha: SHA1 }, { ref: ref('b', 2), pinnedSha: SHA2 }],
+    instructions,
+    worktreeRoot: `${worktreeRoot}/${engine}`,
+  })
+}
+
+// review-pr turns report-only mode on only for the exact phrase plus a pinned SHA per PR
+// (aqua-skills PR 197). Regression caught: a paraphrase that silently runs the normal, writing
+// workflow, which pushes and approves with whatever credential it has.
+test('buildReportOnlyPrompt invokes report-only mode with a pinned SHA per PR', t => {
+  const prompt = reportOnly('codex')
+  t.ok(prompt.startsWith('$review-pr'), 'Codex invokes the skill with $')
+  t.ok(prompt.includes('report-only mode'), 'the exact phrase the skill keys on')
+  t.ok(prompt.includes(`https://github.com/o/a/pull/1 — pinned SHA \`${SHA1}\``))
+  t.ok(prompt.includes(`https://github.com/o/b/pull/2 — pinned SHA \`${SHA2}\``))
+  t.ok(prompt.includes('`head moved`') && prompt.includes('`stale base`'), 'both blocked reasons the skill uses')
+  t.end()
+})
+
+// The daemon owns every GitHub write in dual mode. Any surviving instruction to push, merge, sign,
+// post the no-mention note or approve would contradict report-only mode. Regression caught: v1
+// text leaking into the dual prompt.
+test('buildReportOnlyPrompt drops every write instruction from the single-mode prompt', t => {
+  const prompt = reportOnly('claude', 'please be thorough')
+  for (const banned of ['Sign that merge commit', 'still approve', 'Hidden no-mention note', AGENT_NO_MENTION_NOTE, 'push regression-test\ncommits', 'Automatic Base Merge" section — do not force']) {
+    t.notOk(prompt.includes(banned), `does not contain: ${banned.slice(0, 40)}`)
+  }
+  t.ok(prompt.includes('Push nothing') && prompt.includes('Write nothing to GitHub'))
+  t.ok(prompt.includes('please be thorough'), 'requester instructions are kept')
+  t.end()
+})
+
+// One builder for both engines; only the skill invocation differs (spec 5.6). Regression caught:
+// the two engines being given different rules, so one engine's clean means something else.
+test('buildReportOnlyPrompt is identical for both engines apart from the invocation', t => {
+  const codex = reportOnly('codex').replace(`${worktreeRoot}/codex`, 'ROOT').replace(skillInvocation('codex'), 'INVOKE')
+  const claude = reportOnly('claude').replace(`${worktreeRoot}/claude`, 'ROOT').replace(skillInvocation('claude'), 'INVOKE')
+  t.equal(codex, claude)
+  t.ok(reportOnly('claude').startsWith('Use the `review-pr` skill'), 'Claude names the skill')
+  t.end()
+})
+
+// Each engine has its own worktree root so parallel runs never share a checkout (spec 5.4).
+test('buildReportOnlyPrompt pins the engine-specific worktree root and the output contract', t => {
+  const prompt = reportOnly('claude')
+  t.ok(prompt.includes(`${worktreeRoot}/claude/<repo>-<number>`))
+  t.ok(prompt.includes('environmentProblems') && prompt.includes('Never fold an environment problem into a clean verdict'))
+  t.throws(() => buildReportOnlyPrompt({ engine: 'codex', prs: [], instructions: '', worktreeRoot }), /at least one/)
+  t.end()
+})
+
+// The unattended section and the output contract must agree: a test not run because of the
+// environment (services or network the sandbox denies) is an environment problem, which makes the
+// pass invalid. Regression caught: the summary telling the engine such tests are "skipped and
+// noted", so an engine skips them and returns clean, and the gate approves an untested PR.
+test('buildReportOnlyPrompt treats tests not run because of the environment as an environment problem', t => {
+  const prompt = reportOnly('codex')
+  const flat = prompt.replace(/\s+/g, ' ')
+  t.notOk(flat.includes('skipped and noted'), 'no "skipped and noted" escape hatch')
+  t.ok(flat.includes('Tests not run because of the environment (suites needing a database, NATS or network the sandbox denies) are an environment problem: list each one in `environmentProblems`, and never return `clean` after skipping them'), 'the unattended section routes them to environmentProblems')
+  t.ok(flat.includes('tests NOT RUN because of the environment (an install, toolchain or network failure, or a database, NATS or network the sandbox denies)'), 'the output contract covers sandbox-denied services')
+  t.ok(flat.includes('an engine that skipped tests because of the environment must not return `clean`'), 'the output contract forbids clean after skipping')
   t.end()
 })

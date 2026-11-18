@@ -1,0 +1,39 @@
+{
+  "permissions": {
+    "defaultMode": "dontAsk",
+    "deny": [
+      "__DENY_READ_RULES__",
+      "__DENY_EDIT_RULES__",
+      "Edit(/__WORKSPACE_ROOT__/**)"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true,
+    "allowUnsandboxedCommands": false,
+    "filesystem": {
+      "denyRead": ["__DENY_DIRS__"],
+      "allowWrite": ["__ENGINE_WORKTREE_ROOT__"]
+    },
+    "network": {
+      "allowedDomains": [
+        "github.com",
+        "api.github.com",
+        "codeload.github.com",
+        "*.githubusercontent.com",
+        "registry.npmjs.org",
+        "*.d.codeartifact.us-east-2.amazonaws.com"
+      ]
+    }
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "python3 \"__PROFILE_DIR__/hooks/block-secret-reads.py\"" }
+        ]
+      }
+    ]
+  }
+}

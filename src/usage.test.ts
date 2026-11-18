@@ -117,3 +117,21 @@ test('ReviewFailedError preserves the cause message and carries usage', t => {
   t.ok(err instanceof ReviewFailedError && err instanceof Error)
   t.end()
 })
+
+// Dual mode shows each engine separately, with Claude's cost labelled notional because
+// subscription auth is not billed per call (spec 5.9). Regression caught: one blended token figure
+// that hides which engine spent it, or a cost that reads like a charge.
+test('renderUsageLine shows each engine separately and labels the Claude cost notional', t => {
+  const claude = { inputTokens: 1, outputTokens: 2, cacheReadTokens: 3, cacheWriteTokens: 4, costUsd: 2.1, numTurns: 12, durationMs: 1 }
+  const line = renderUsageLine({
+    tokensUsed: 792_000,
+    attempts: 1,
+    engines: [
+      { engine: 'codex', usage: { tokensUsed: 412_000, activeMs: 252_000, attempts: 1 } },
+      { engine: 'claude', usage: { tokensUsed: 380_000, activeMs: 180_000, attempts: 2, claude } },
+    ],
+  })
+  t.equal(line, '🧮 Codex 412,000 tokens · 4m12s active · 1 attempt | Claude 380,000 tokens ($2.10 notional) · 3m00s active · 2 attempts')
+  t.equal(renderUsageLine({ attempts: 0, engines: [] }), '🧮 no engine ran', 'every PR blocked before the engines')
+  t.end()
+})

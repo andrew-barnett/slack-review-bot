@@ -1,6 +1,6 @@
 import test from 'tape'
 import { SHUTDOWN_GRACE_MS } from './codex'
-import { APPROVER_TOKEN_VAR, DAEMON_SECRET_VARS, ENGINE_TOKEN_VAR, isDualMode, loadConfig, loadReviewConfig, looksLikeUserId, parseMsList, parseEngineOrder, parseEngines, parseSchedule, parseUserIds, scrubDaemonSecrets } from './config'
+import { APPROVER_TOKEN_VAR, assertModeAvailable, DAEMON_SECRET_VARS, DUAL_MODE_AVAILABLE, ENGINE_TOKEN_VAR, isDualMode, loadConfig, loadReviewConfig, looksLikeUserId, parseMsList, parseEngineOrder, parseEngines, parseSchedule, parseUserIds, scrubDaemonSecrets } from './config'
 
 /** The two required keys, so a test can vary only the knob it cares about. */
 const credentials = { SLACK_BOT_TOKEN: 'placeholder', SLACK_APP_TOKEN: 'placeholder' }
@@ -339,5 +339,36 @@ test('scrubDaemonSecrets removes both token variables and nothing else', t => {
   scrubDaemonSecrets(env)
   t.deepEqual(env, { PATH: '/bin' })
   t.deepEqual([...DAEMON_SECRET_VARS].sort(), [APPROVER_TOKEN_VAR, ENGINE_TOKEN_VAR].sort())
+  t.end()
+})
+
+// The three dual-mode reactions need defaults that exist in every workspace (built-in names) and
+// must differ from the pass stamp, or a partial or not-counted result would look like an approval.
+test('loadConfig defaults the dual-mode emoji and lets each be overridden', t => {
+  const c = loadConfig({ ...credentials })
+  t.equal(c.approvalPartialEmoji, 'large_yellow_circle')
+  t.equal(c.approvalNotCountedEmoji, 'white_circle')
+  t.equal(c.headMovedEmoji, 'arrows_counterclockwise')
+  t.notOk([c.approvalPartialEmoji, c.approvalNotCountedEmoji, c.headMovedEmoji].includes(c.passEmoji))
+  t.equal(loadConfig({ ...credentials, HEAD_MOVED_EMOJI: 'repeat' }).headMovedEmoji, 'repeat')
+  t.end()
+})
+
+// The availability seam: dual mode is refused while DUAL_MODE_AVAILABLE is false (issue 64), and
+// tests reach dual paths by passing `available` rather than flipping the constant.
+test('assertModeAvailable refuses dual mode unless it is available', t => {
+  t.equal(DUAL_MODE_AVAILABLE, false, 'dual mode stays off until the issue 64 flip checklist is done')
+  t.throws(() => assertModeAvailable({ reviewEngines: ['codex', 'claude'] }), /issues\/64/)
+  t.doesNotThrow(() => assertModeAvailable({ reviewEngines: ['codex', 'claude'] }, true))
+  t.doesNotThrow(() => assertModeAvailable({ reviewEngines: ['codex'] }))
+  t.end()
+})
+
+// A dual-mode reaction equal to the pass stamp would let a partial, not-counted or head-moved
+// result look like an approval. Regression caught: the clash loading silently.
+test('loadReviewConfig rejects a dual emoji that equals the pass emoji', t => {
+  t.throws(() => loadReviewConfig({ APPROVAL_PARTIAL_EMOJI: 'approved_stamp' }), /APPROVAL_PARTIAL_EMOJI/)
+  t.throws(() => loadReviewConfig({ APPROVAL_NOT_COUNTED_EMOJI: 'ok' , PASS_EMOJI: 'ok' }), /APPROVAL_NOT_COUNTED_EMOJI/)
+  t.throws(() => loadReviewConfig({ HEAD_MOVED_EMOJI: 'approved_stamp' }), /HEAD_MOVED_EMOJI/)
   t.end()
 })

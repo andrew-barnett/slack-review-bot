@@ -6,7 +6,23 @@
 // figures the status reply shows. Kept free of Slack and Codex specifics so the parsing and
 // the formatting are unit-testable on their own.
 
+import type { EngineName } from './config'
+import type { DualReport } from './dual'
 import type { ReviewRunResult } from './schema'
+
+/**
+ * What Claude's stream-JSON `result` event reports about a run (V2 spike, issue 54). `costUsd` is
+ * notional under subscription auth (CLAUDE_CODE_OAUTH_TOKEN): a figure, not a charge.
+ */
+export interface ClaudeUsageDetail {
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  costUsd: number
+  numTurns: number
+  durationMs: number
+}
 
 /**
  * The cost of a single review request, gathered whether it passed, found things, or failed.
@@ -24,12 +40,18 @@ export interface RunUsage {
   activeMs?: number
   /** Number of Codex invocations this review took — >1 means a stall was retried. */
   attempts: number
+  /** Claude's own figures, when this usage is a Claude engine's. */
+  claude?: ClaudeUsageDetail
+  /** Dual mode: each engine's usage. The top-level figures are then the sums across engines. */
+  engines?: { engine: EngineName; usage: RunUsage }[]
 }
 
 /** A completed review: what Codex concluded, and what it cost. */
 export interface ReviewOutcome {
   result: ReviewRunResult
   usage: RunUsage
+  /** Dual mode only: the per-PR gate report the job renders. */
+  dual?: DualReport
 }
 
 /**
@@ -133,10 +155,22 @@ export function formatActive(ms: number): string {
  * than a row of zeros.
  */
 export function renderUsageLine(usage: RunUsage): string {
-  const parts: string[] = [
-    usage.tokensUsed === undefined ? 'tokens n/a' : `${formatTokensExact(usage.tokensUsed)} tokens`,
-  ]
+  // Dual mode reports each engine on its own (spec 5.9), never a blended figure.
+  if (usage.engines) {
+    if (usage.engines.length === 0) return '🧮 no engine ran'
+    return `🧮 ${usage.engines.map(e => `${ENGINE_NAME[e.engine]} ${usageParts(e.usage).join(' · ')}`).join(' | ')}`
+  }
+  return `🧮 ${usageParts(usage).join(' · ')}`
+}
+
+const ENGINE_NAME: Record<EngineName, string> = { codex: 'Codex', claude: 'Claude' }
+
+function usageParts(usage: RunUsage): string[] {
+  let tokens = usage.tokensUsed === undefined ? 'tokens n/a' : `${formatTokensExact(usage.tokensUsed)} tokens`
+  // Subscription auth makes Claude's cost a notional figure, not a charge, so it says so.
+  if (usage.claude) tokens += ` ($${usage.claude.costUsd.toFixed(2)} notional)`
+  const parts = [tokens]
   if (usage.activeMs !== undefined && usage.activeMs > 0) parts.push(`${formatActive(usage.activeMs)} active`)
   parts.push(`${usage.attempts} attempt${usage.attempts === 1 ? '' : 's'}`)
-  return `🧮 ${parts.join(' · ')}`
+  return parts
 }

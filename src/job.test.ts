@@ -1,4 +1,5 @@
 import test from 'tape'
+import type { DualPrReport, DualReport } from './dual'
 import { runJob, type JobDeps, type JobEmoji, type ReviewRequest } from './job'
 import type { PullRequestResult, ReviewRunResult } from './schema'
 import { ReviewFailedError, renderUsageLine, type RunUsage } from './usage'
@@ -10,6 +11,9 @@ const emoji: JobEmoji = {
   findings: 'comments',
   error: 'warning',
   humanReview: 'raising_hand',
+  approvalPartial: 'large_yellow_circle',
+  approvalNotCounted: 'white_circle',
+  headMoved: 'arrows_counterclockwise',
   removeAckOnComplete: false,
 }
 
@@ -512,5 +516,95 @@ test('runJob reports no usage for a skipped request', async t => {
   t.equal(outcome, 'skipped')
   t.deepEqual(rec.usages, [], 'nothing ran, so nothing is recorded')
   t.deepEqual(rec.threads, [], 'and no usage line is posted')
+  t.end()
+})
+
+// --- Dual mode (spec 5.9) ---
+
+function dualReport(...outcomes: DualPrReport['outcome'][]): DualReport {
+  return {
+    prs: outcomes.map((outcome, i) => ({
+      url: `https://github.com/o/r/pull/${i + 1}`,
+      outcome,
+      pinnedSha: 'a'.repeat(40),
+      passes: [],
+      warnings: [],
+    })),
+  }
+}
+
+/** A recorder whose runReview returns a dual outcome. */
+function dualRecorder(report: DualReport, overrides: Partial<JobDeps> = {}) {
+  const usage: RunUsage = { attempts: 1, engines: [] }
+  return recorder(async () => result(), {
+    async runReview() {
+      return { result: result(), usage, dual: report }
+    },
+    ...overrides,
+  })
+}
+
+// Each dual outcome has its own reaction, and blocked and error share the error reaction. The job
+// outcome follows spec 5.9 (blocked counts as an error). Regression caught: a clean-but-not-counted
+// result wearing the approval stamp, which would read as an approval that counts.
+test('runJob reacts to each dual outcome with its own emoji', async t => {
+  const rows: [DualPrReport['outcome'], string, string][] = [
+    ['approved', 'approved_stamp', 'approved'],
+    ['approvedPartial', 'large_yellow_circle', 'approvedPartial'],
+    ['cleanNotCounted', 'white_circle', 'cleanNotCounted'],
+    ['findings', 'comments', 'findings'],
+    ['blocked', 'warning', 'error'],
+    ['error', 'warning', 'error'],
+    ['headMoved', 'arrows_counterclockwise', 'headMoved'],
+  ]
+  for (const [prOutcome, reaction, jobOutcome] of rows) {
+    const rec = dualRecorder(dualReport(prOutcome))
+    const outcome = await runJob(request, emoji, rec.deps)
+    t.equal(outcome, jobOutcome, `${prOutcome} job outcome`)
+    t.deepEqual(rec.added, ['eyes', reaction], `${prOutcome} reaction`)
+    t.equal(rec.threads.length, 1, `${prOutcome} posts the dual thread`)
+  }
+  t.end()
+})
+
+// Issue 32 on the dual path: engines never throw, so a shutdown force-kill reaches the job as a
+// dual outcome (an engine error), not through the catch. Regression caught: the job posting an
+// error reaction and thread for our own deploy, and the replay then posting a second set.
+test('runJob stays silent when a dual outcome arrives during a shutdown', async t => {
+  const usages: RunUsage[] = []
+  const rec = dualRecorder(dualReport('error'), { isShuttingDown: () => true, recordUsage: u => { usages.push(u) } })
+  const outcome = await runJob(request, emoji, rec.deps)
+  t.equal(outcome, 'skipped', 'a shutdown kill is not reported as an error outcome')
+  t.deepEqual(rec.added, ['eyes'], 'no outcome reaction is added')
+  t.deepEqual(rec.removed, [], 'the ack is left in place for the replay')
+  t.deepEqual(rec.threads, [], 'no thread is posted')
+  t.deepEqual(usages, [], 'no usage is reported')
+  t.end()
+})
+
+// A mixed request takes the worst outcome. Regression caught: the approval stamp on a request in
+// which another PR had findings.
+test('runJob takes the worst outcome of a mixed dual request', async t => {
+  const rec = dualRecorder(dualReport('approved', 'findings', 'cleanNotCounted'))
+  t.equal(await runJob(request, emoji, rec.deps), 'findings')
+  t.deepEqual(rec.added, ['eyes', 'comments'])
+  t.ok(rec.threads[0].startsWith('Dual-engine review of 3 pull requests.'))
+  t.end()
+})
+
+// The human-review gate stays terminal in dual mode too: a clean dual result must not stamp a
+// request in which a PR was handed to a person. The thread still reports the reviewed PR.
+test('runJob does not stamp a clean dual result when a PR was gated', async t => {
+  const mixed: ReviewRequest = {
+    ...request,
+    prs: [request.prs[0], { owner: 'trade-platform', repo: 'deployments', number: 5, url: 'https://github.com/trade-platform/deployments/pull/5' }],
+  }
+  const rec = dualRecorder(dualReport('approved'), {
+    async listChangedFiles(p) { return p.repo === 'deployments' ? ['values.yaml'] : [] },
+    async postPrComment() {},
+  })
+  t.equal(await runJob(mixed, emoji, rec.deps), 'skipped')
+  t.notOk(rec.added.includes('approved_stamp'))
+  t.ok(rec.threads.some(text => text.startsWith('Dual-engine review')), 'the dual thread is still posted')
   t.end()
 })

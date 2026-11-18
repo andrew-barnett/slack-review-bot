@@ -1,6 +1,6 @@
 import test from 'tape'
-import { parseReviewResult, reconcileResults, REVIEW_OUTPUT_SCHEMA } from './schema'
-import type { PullRequestResult } from './schema'
+import { parseReviewResult, parseReviewResultV2, reconcileResults, reconcileResultsV2, REVIEW_OUTPUT_SCHEMA, REVIEW_OUTPUT_SCHEMA_V2 } from './schema'
+import type { PullRequestResult, EngineRunResult } from './schema'
 
 function entry(url: string, status: PullRequestResult['status'] = 'passed'): PullRequestResult {
   return { url, status, summary: '', pushedTestCommits: false, reviewUrl: '' }
@@ -127,5 +127,119 @@ test('REVIEW_OUTPUT_SCHEMA is strict-mode clean', t => {
     Object.keys(item.properties).sort(),
     'every property is required'
   )
+  t.end()
+})
+
+const SHA = 'a'.repeat(40)
+function v2(entry: Record<string, unknown>): string {
+  return JSON.stringify({
+    results: [{ url: 'https://github.com/o/r/pull/1', reviewedSha: SHA, verdict: 'clean', findings: [], summary: '', environmentProblems: [], ...entry }],
+  })
+}
+
+// The happy path for schema v2: a clean verdict with a non-blocking finding is allowed (spec 5.6).
+test('parseReviewResultV2 reads a clean result with a non-blocking finding', t => {
+  const r = parseReviewResultV2(v2({ findings: [{ severity: 'non-blocking', file: 'src/a.ts', line: 3, body: 'nit' }] }))
+  t.equal(r.results[0].verdict, 'clean')
+  t.equal(r.results[0].findings[0].severity, 'non-blocking')
+  t.equal(r.results[0].reviewedSha, SHA)
+  t.end()
+})
+
+// The gate's core invariant: clean means zero blocking findings. A result that says both must be a
+// parse error, so it becomes an invalid pass rather than an approval (spec 5.6; issue 59 acceptance).
+test('parseReviewResultV2 rejects clean with a blocking finding', t => {
+  t.throws(
+    () => parseReviewResultV2(v2({ findings: [{ severity: 'blocking', file: '', line: 0, body: 'bug' }] })),
+    /verdict clean with a blocking finding/
+  )
+  t.end()
+})
+
+// reviewedSha is compared with the pinned SHA, so a short or malformed SHA must fail here rather
+// than fail the comparison silently later. A blocked PR may report none.
+test('parseReviewResultV2 enforces the reviewedSha format, except an empty one on blocked', t => {
+  t.throws(() => parseReviewResultV2(v2({ reviewedSha: 'abc123' })), /40-character hex SHA/)
+  t.throws(() => parseReviewResultV2(v2({ reviewedSha: '' })), /40-character hex SHA/, 'clean needs a SHA')
+  t.equal(parseReviewResultV2(v2({ verdict: 'blocked', reviewedSha: '', summary: 'head moved' })).results[0].reviewedSha, '')
+  t.equal(parseReviewResultV2(v2({ reviewedSha: 'A'.repeat(40) })).results[0].reviewedSha, SHA, 'normalised to lower case')
+  t.end()
+})
+
+// Every field is required. A missing environmentProblems must not default to [] — that would turn
+// an engine that lost its environment report into a valid pass.
+test('parseReviewResultV2 rejects missing or mistyped fields', t => {
+  t.throws(() => parseReviewResultV2(v2({ environmentProblems: undefined })), /environmentProblems/)
+  t.throws(() => parseReviewResultV2(v2({ findings: [{ severity: 'major', file: '', line: 0, body: 'x' }] })), /severity/)
+  t.throws(() => parseReviewResultV2(v2({ findings: [{ severity: 'blocking', file: '', line: -1, body: 'x' }] })), /line/)
+  t.throws(() => parseReviewResultV2(v2({ verdict: 'passed' })), /verdict/)
+  t.throws(() => parseReviewResultV2('not json'), /not valid JSON/)
+  t.end()
+})
+
+// A PR the engine never reported must be an invalid pass, not dropped and not clean. Regression
+// caught: one engine silently skipping a PR while the other's clean result approves it.
+test('reconcileResultsV2 turns an unreported PR into an environment problem', t => {
+  const r = reconcileResultsV2(
+    ['https://github.com/o/r/pull/1', 'https://github.com/o/r/pull/2'],
+    parseReviewResultV2(v2({ url: 'https://github.com/O/R/pull/1' }))
+  )
+  t.equal(r.results.length, 2)
+  t.equal(r.results[0].url, 'https://github.com/o/r/pull/1', 'requested spelling restored')
+  t.deepEqual(r.results[1].environmentProblems, ['the engine reported no result for this pull request'])
+  t.end()
+})
+
+// Both engines are handed this schema; a strict-mode violation would fail every dual run.
+test('REVIEW_OUTPUT_SCHEMA_V2 is strict-mode clean at every level', t => {
+  const check = (node: { additionalProperties?: unknown; required?: readonly string[]; properties?: Record<string, unknown> }, where: string) => {
+    t.equal(node.additionalProperties, false, `${where} forbids extra properties`)
+    t.deepEqual([...(node.required ?? [])].sort(), Object.keys(node.properties ?? {}).sort(), `${where} requires every property`)
+  }
+  const item = REVIEW_OUTPUT_SCHEMA_V2.properties.results.items
+  check(REVIEW_OUTPUT_SCHEMA_V2, 'root')
+  check(item, 'result')
+  check(item.properties.findings.items, 'finding')
+  t.end()
+})
+
+// Duplicate engine URLs are a fail-open: the Map silently keeps only the last entry, so
+// conflicting verdicts (e.g. findings then clean for the same PR) change the result. The gate
+// must mark such duplicates blocked so they are never approved. Regression: an earlier findings
+// entry for a PR was silently replaced by a later clean verdict for the same URL in different case.
+test('reconcileResultsV2 marks duplicate URLs as blocked', t => {
+  const findings_result: EngineRunResult = {
+    results: [
+      { url: 'https://github.com/o/r/pull/1', reviewedSha: SHA, verdict: 'findings', findings: [{ severity: 'blocking', file: 'src/a.ts', line: 1, body: 'bug' }], summary: 'has bugs', environmentProblems: [] },
+      { url: 'https://github.com/O/R/pull/1', reviewedSha: SHA, verdict: 'clean', findings: [], summary: '', environmentProblems: [] },
+    ]
+  }
+  const r = reconcileResultsV2(['https://github.com/o/r/pull/1'], findings_result)
+  t.equal(r.results.length, 1)
+  t.equal(r.results[0].verdict, 'blocked', 'duplicate URLs marked blocked')
+  t.equal(r.results[0].reviewedSha, '', 'reviewedSha cleared')
+  t.deepEqual(r.results[0].findings, [], 'findings cleared')
+  t.deepEqual(r.results[0].environmentProblems, ['the engine reported this pull request more than once'], 'environment problem set')
+  t.end()
+})
+
+// Blank (empty or whitespace) environment problems are currently dropped, losing the signal
+// that the engine reported them. This is a fail-open: a blank problem read as "no problems".
+// Keep the problem as a placeholder string so the entry never approves. Regression: an engine
+// that crashed trying to record a problem left `environmentProblems: ["  "]`, which silently
+// became [], making the entry valid when it should block.
+test('parseReviewResultV2 preserves blank environment problems', t => {
+  const r = parseReviewResultV2(v2({ environmentProblems: ['  '] }))
+  t.equal(r.results[0].environmentProblems.length, 1)
+  t.equal(r.results[0].environmentProblems[0], 'the engine reported a blank environment problem', 'blank problem becomes placeholder')
+  t.end()
+})
+
+// URL trailing whitespace should not prevent matching the requested PR. Trim both the parsed
+// URL and the requested URL in reconciliation so "https://github.com/o/r/pull/1 " matches
+// the request for "https://github.com/o/r/pull/1".
+test('parseReviewResultV2 trims the URL', t => {
+  const r = parseReviewResultV2(v2({ url: 'https://github.com/o/r/pull/1 ' }))
+  t.equal(r.results[0].url, 'https://github.com/o/r/pull/1')
   t.end()
 })

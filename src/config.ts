@@ -26,10 +26,22 @@ export const ENGINE_TOKEN_VAR = 'ENGINE_GH_TOKEN'
 export const DAEMON_SECRET_VARS: readonly string[] = [APPROVER_TOKEN_VAR, ENGINE_TOKEN_VAR]
 
 /**
- * Whether dual mode can run in this build. False until the orchestrator lands
- * (https://github.com/andrew-barnett/slack-review-bot/issues/61); startup refuses dual mode while it is.
+ * Whether dual mode may run. The orchestrator exists, but this stays false until the filesystem
+ * boundary for the approver token lands (https://github.com/andrew-barnett/slack-review-bot/issues/64)
+ * and the V1/V3 checks that need the role account's token are done; see the README's flip checklist.
+ * Startup refuses dual mode while it is false. Tests reach dual paths through the `available`
+ * parameter of assertModeAvailable and selectReviewRunner, never by changing this constant.
  */
 export const DUAL_MODE_AVAILABLE = false
+
+/** Throw when dual mode is configured but not available in this build. */
+export function assertModeAvailable(config: Pick<ReviewConfig, 'reviewEngines'>, available: boolean = DUAL_MODE_AVAILABLE): void {
+  if (isDualMode(config) && !available) {
+    throw new Error(
+      'REVIEW_ENGINES=codex,claude is not available yet: it is gated on https://github.com/andrew-barnett/slack-review-bot/issues/64'
+    )
+  }
+}
 
 /**
  * Everything needed to run a review. Deliberately free of Slack credentials so the
@@ -48,6 +60,12 @@ export interface ReviewConfig {
   errorEmoji: string
   /** Emoji posted when a PR is handed to a human instead of reviewed (the deployments gate). */
   humanReviewEmoji: string
+  /** Dual mode: both engines clean and approved, but the approval does not satisfy every rule. */
+  approvalPartialEmoji: string
+  /** Dual mode: both engines clean, but an approval from the role account would not count. */
+  approvalNotCountedEmoji: string
+  /** Dual mode: the PR head moved during the review, so nothing was posted. */
+  headMovedEmoji: string
   /** Remove the ack emoji once a terminal reaction is added. */
   removeAckOnComplete: boolean
   /** Path to the codex binary. */
@@ -370,6 +388,9 @@ export function loadReviewConfig(env: NodeJS.ProcessEnv = process.env): ReviewCo
     findingsEmoji: env.FINDINGS_EMOJI || 'comments',
     errorEmoji: env.ERROR_EMOJI || 'warning',
     humanReviewEmoji: env.HUMAN_REVIEW_EMOJI || 'raising_hand',
+    approvalPartialEmoji: env.APPROVAL_PARTIAL_EMOJI || 'large_yellow_circle',
+    approvalNotCountedEmoji: env.APPROVAL_NOT_COUNTED_EMOJI || 'white_circle',
+    headMovedEmoji: env.HEAD_MOVED_EMOJI || 'arrows_counterclockwise',
     removeAckOnComplete: parseBool(env.REMOVE_ACK_ON_COMPLETE, false),
     codexBin: env.CODEX_BIN || 'codex',
     codexProfile: env.CODEX_PROFILE || 'review-bot',
@@ -409,6 +430,14 @@ export function loadReviewConfig(env: NodeJS.ProcessEnv = process.env): ReviewCo
     engineGhToken: dual ? env[ENGINE_TOKEN_VAR] ?? '' : '',
     claudeBin: env.CLAUDE_BIN || 'claude',
     claudeConfigDir: env.CLAUDE_CONFIG_DIR_REVIEW || path.join(home, '.claude-review-bot'),
+  }
+  // A non-approval must never wear the approval stamp, in any mode.
+  for (const [name, value] of [
+    ['APPROVAL_PARTIAL_EMOJI', config.approvalPartialEmoji],
+    ['APPROVAL_NOT_COUNTED_EMOJI', config.approvalNotCountedEmoji],
+    ['HEAD_MOVED_EMOJI', config.headMovedEmoji],
+  ] as const) {
+    if (value === config.passEmoji) throw new Error(`${name} must differ from PASS_EMOJI (got "${value}")`)
   }
   if (dual) {
     if (!config.approverGhToken) throw new Error(`${APPROVER_TOKEN_VAR} is required when REVIEW_ENGINES=codex,claude`)

@@ -4,9 +4,18 @@
 // the rendering is testable without a running daemon or a Slack connection.
 
 import type { CatchUpRecord, ConnectionState } from './catchup'
+import type { EngineName } from './config'
 import type { JobOutcome } from './job'
 import type { ActivitySnapshot } from './progress'
-import { formatTokensCompact } from './usage'
+import { formatTokensCompact, type RunUsage } from './usage'
+
+/** Dual mode: one engine's spend for this process's life. Claude's cost is notional. */
+export interface EngineTokens {
+  engine: EngineName
+  total: number
+  reviews: number
+  costUsd: number
+}
 
 export interface StatusConfigSummary {
   codexProfile: string
@@ -62,12 +71,17 @@ export interface StatusSnapshot {
    * failures — never skew it); `last` is the most recent reported count, or undefined if none yet.
    */
   tokens: { total: number; reviews: number; last?: number }
+  /** Dual mode: per-engine totals, in the order engines first reported. Empty in single mode. */
+  engineTokens: EngineTokens[]
   config: StatusConfigSummary
 }
 
 export interface Stats {
-  /** `tokensUsed` is omitted for a run that reported none (e.g. a killed run); it is not counted then. */
-  record(outcome: JobOutcome, prs: number, finishedAt: number, tokensUsed?: number): void
+  /**
+   * `tokensUsed` is omitted for a run that reported none (e.g. a killed run); it is not counted then.
+   * `engines` is the dual-mode per-engine breakdown (RunUsage.engines).
+   */
+  record(outcome: JobOutcome, prs: number, finishedAt: number, tokensUsed?: number, engines?: RunUsage['engines']): void
   snapshot(
     now: number,
     active: number,
@@ -79,19 +93,37 @@ export interface Stats {
 /** Counters for the life of one daemon process. Deliberately not persisted: the question
  *  a status request answers is "is this process working", and a restart resets that. */
 export function createStats(startedAt: number): Stats {
-  const counts: Record<JobOutcome, number> = { pass: 0, findings: 0, error: 0, skipped: 0 }
+  const counts: Record<JobOutcome, number> = {
+    pass: 0,
+    findings: 0,
+    error: 0,
+    skipped: 0,
+    approved: 0,
+    approvedPartial: 0,
+    cleanNotCounted: 0,
+    headMoved: 0,
+  }
   let lastReview: StatusSnapshot['lastReview']
   let tokenTotal = 0
   let tokenReviews = 0
   let lastTokens: number | undefined
+  const engineTokens = new Map<EngineName, EngineTokens>()
   return {
-    record(outcome, prs, finishedAt, tokensUsed) {
+    record(outcome, prs, finishedAt, tokensUsed, engines) {
       counts[outcome] += 1
       lastReview = { outcome, finishedAt, prs }
       if (tokensUsed !== undefined) {
         tokenTotal += tokensUsed
         tokenReviews += 1
         lastTokens = tokensUsed
+      }
+      for (const { engine, usage } of engines ?? []) {
+        if (usage.tokensUsed === undefined) continue
+        const entry = engineTokens.get(engine) ?? { engine, total: 0, reviews: 0, costUsd: 0 }
+        entry.total += usage.tokensUsed
+        entry.reviews += 1
+        entry.costUsd += usage.claude?.costUsd ?? 0
+        engineTokens.set(engine, entry)
       }
     },
     snapshot(now, active, queued, config) {
@@ -103,6 +135,7 @@ export function createStats(startedAt: number): Stats {
         counts: { ...counts },
         lastReview,
         tokens: { total: tokenTotal, reviews: tokenReviews, last: lastTokens },
+        engineTokens: [...engineTokens.values()].map(e => ({ ...e })),
         config,
       }
     },
@@ -127,6 +160,31 @@ const OUTCOME_WORD: Record<JobOutcome, string> = {
   // A skip has more than one cause now (a deleted message, or a PR handed to the human-review
   // gate), so the label no longer claims "message gone". Issue #19 will distinguish the reasons.
   skipped: 'skipped',
+  approved: 'approved',
+  approvedPartial: 'approved (partial)',
+  cleanNotCounted: 'clean, approval would not count',
+  headMoved: 'head moved',
+}
+
+const ENGINE_NAME: Record<EngineName, string> = { codex: 'Codex', claude: 'Claude' }
+
+/** The dual-only outcomes, each only when it has happened. */
+function dualCounts(counts: Record<JobOutcome, number>): string {
+  const parts: string[] = []
+  if (counts.approvedPartial) parts.push(`${counts.approvedPartial} approved (partial)`)
+  if (counts.cleanNotCounted) parts.push(`${counts.cleanNotCounted} clean but not counted`)
+  if (counts.headMoved) parts.push(`${counts.headMoved} head moved`)
+  return parts.length ? `, ${parts.join(', ')}` : ''
+}
+
+/** Per-engine totals for the token line, e.g. ` (Codex 5M · Claude 4.2M, $12.30 notional)`. */
+function engineTotals(engines: EngineTokens[]): string {
+  if (!engines.length) return ''
+  const parts = engines.map(e => {
+    const cost = e.engine === 'claude' && e.costUsd > 0 ? `, $${e.costUsd.toFixed(2)} notional` : ''
+    return `${ENGINE_NAME[e.engine]} ${formatTokensCompact(e.total)}${cost}`
+  })
+  return ` (${parts.join(' · ')})`
 }
 
 function plural(n: number, one: string, many = `${one}s`): string {
@@ -232,7 +290,9 @@ export function renderStatus(
   activity?: ActivitySnapshot
 ): string {
   const { counts, config, lastReview } = snapshot
-  const total = counts.pass + counts.findings + counts.error
+  // Dual mode's `approved` is single mode's `pass` (spec 5.9); the dual-only outcomes are listed after.
+  const passed = counts.pass + counts.approved
+  const total = passed + counts.findings + counts.error + counts.approvedPartial + counts.cleanNotCounted + counts.headMoved
   // Skipped is not a verdict — it is a request the bot declined to review (a deleted message) —
   // so it is reported alongside the counts rather than folded into them.
   const skipped = counts.skipped ? `, ${counts.skipped} skipped` : ''
@@ -244,15 +304,15 @@ export function renderStatus(
   lines.push(
     total === 0 && !counts.skipped
       ? '*Reviews* none since start'
-      : `*Reviews* ${counts.pass} passed, ${counts.findings} with findings, ${counts.error} errored${skipped}`
+      : `*Reviews* ${passed} passed, ${counts.findings} with findings, ${counts.error} errored${dualCounts(counts)}${skipped}`
   )
   // Only once something has reported a count: before that the total, average and "last" are all
   // meaningless, and a "0 tokens" line would read as a bug rather than a fresh start.
   const { tokens } = snapshot
-  if (tokens.reviews > 0) {
-    const avg = Math.round(tokens.total / tokens.reviews)
+  if (tokens.reviews > 0 || snapshot.engineTokens.length > 0) {
+    const avg = tokens.reviews > 0 ? Math.round(tokens.total / tokens.reviews) : 0
     const last = tokens.last !== undefined ? ` · ${formatTokensCompact(tokens.last)} last` : ''
-    lines.push(`*Tokens* ${formatTokensCompact(tokens.total)} total${last} · ${formatTokensCompact(avg)} avg`)
+    lines.push(`*Tokens* ${formatTokensCompact(tokens.total)} total${last} · ${formatTokensCompact(avg)} avg${engineTotals(snapshot.engineTokens)}`)
   }
   if (connection) lines.push(renderConnection(connection, snapshot.now))
   if (catchUp) lines.push(renderCatchUp(catchUp, snapshot.now))

@@ -6,6 +6,8 @@
 // effects, and behind an injectable runner so the tests exercise the argument-building and
 // parsing without a real `gh`.
 
+import type { ApproverGitHub } from './approver-github'
+import { isDualMode, type ReviewConfig } from './config'
 import { defaultRunner, GH_COMMAND_TIMEOUT_MS, type GhRunner } from './gh-api'
 import type { JobDeps } from './job'
 import type { PullRequestRef } from './parse-message'
@@ -37,4 +39,19 @@ export function makeGitHubEffects(
       await run(['pr', 'comment', String(pr.number), '--repo', `${pr.owner}/${pr.repo}`, '--body', body])
     },
   }
+}
+
+/**
+ * The job's GitHub effects for the configured mode. In dual mode the human-gate comment is posted
+ * as the role account (spec 5.7), so all of the bot's GitHub output comes from one identity;
+ * listing changed files stays a read with the existing effect.
+ */
+export function makeJobGitHubEffects(
+  config: Pick<ReviewConfig, 'reviewEngines'>,
+  approver: ApproverGitHub | undefined,
+  base: Pick<JobDeps, 'listChangedFiles' | 'postPrComment'> = makeGitHubEffects()
+): Pick<JobDeps, 'listChangedFiles' | 'postPrComment'> {
+  if (!isDualMode(config)) return base
+  if (!approver) throw new Error('dual mode needs the role-account client for the human-gate comment')
+  return { listChangedFiles: base.listChangedFiles, postPrComment: (pr, body) => approver.postIssueComment(pr, body) }
 }

@@ -4,6 +4,8 @@
 // `•`. That syntax only renders for messages posted through the API, which is what the
 // bot does — a report meant to be pasted by hand would need `[text](url)` instead.
 
+import type { DualPrReport, DualReport } from './dual'
+import { ENGINE_LABEL, type PrOutcome } from './dual-gate'
 import type { PullRequestResult, ReviewRunResult } from './schema'
 
 /** Which terminal reaction the outcome earns. */
@@ -30,6 +32,15 @@ function link(result: PullRequestResult): string {
   return `<${result.url}|${shortLabel(result.url)}>`
 }
 
+/**
+ * Neutralise Slack control syntax in untrusted text (engine output, GitHub-derived strings), so
+ * `<!channel>`, `<@U1>` or `<url|label>` cannot ping people or spoof links. `&` goes first so the
+ * entities this adds are not themselves re-escaped.
+ */
+export function escapeSlack(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
 /** Trim a model-written summary to a single sentence for the thread. */
 export function oneSentence(text: string): string {
   const collapsed = text.replace(/\s+/g, ' ').trim()
@@ -44,7 +55,7 @@ export function oneSentence(text: string): string {
 function bulletsFor(results: PullRequestResult[], withSummary: boolean): string {
   return results
     .map(result => {
-      const summary = withSummary ? oneSentence(result.summary) : ''
+      const summary = withSummary ? escapeSlack(oneSentence(result.summary)) : ''
       const reviewLink = result.reviewUrl ? ` <${result.reviewUrl}|(review)>` : ''
       return summary ? `• ${link(result)} — ${summary}${reviewLink}` : `• ${link(result)}${reviewLink}`
     })
@@ -93,4 +104,52 @@ export function renderError(urls: string[], error: unknown): string {
     list,
     `\`\`\`\n${message.slice(0, 2500)}\n\`\`\``,
   ].join('\n\n')
+}
+
+/** Worst first: a mixed request takes the first of these that any PR has (spec 5.9). */
+export const DUAL_SEVERITY: readonly PrOutcome[] = ['error', 'blocked', 'findings', 'headMoved', 'cleanNotCounted', 'approvedPartial', 'approved']
+
+/** The worst outcome across a dual request's PRs; `error` for an empty list. */
+export function worstOutcome(outcomes: PrOutcome[]): PrOutcome {
+  for (const outcome of DUAL_SEVERITY) if (outcomes.includes(outcome)) return outcome
+  return 'error'
+}
+
+const DUAL_OUTCOME_TEXT: Record<PrOutcome, string> = {
+  approved: '*approved*',
+  approvedPartial: '*approved (partial)*',
+  cleanNotCounted: '*clean, approval would not count*',
+  findings: '*findings*',
+  blocked: '*blocked*',
+  error: '*error, not approved*',
+  headMoved: '*head moved during review; re-request*',
+}
+
+const PREFLIGHT_TEXT = { counts: 'counts', partial: 'partial', wontCount: "won't count" } as const
+
+function dualLines(pr: DualPrReport): string[] {
+  const head = [`• <${pr.url}|${shortLabel(pr.url)}> — ${DUAL_OUTCOME_TEXT[pr.outcome]}`]
+  if (pr.eligibility) head.push(`pre-flight ${PREFLIGHT_TEXT[pr.eligibility.verdict]}`)
+  for (const pass of pr.passes) head.push(`${ENGINE_LABEL[pass.engine]}: ${escapeSlack(pass.detail)}`)
+  if (pr.reviewUrl) head.push(`<${pr.reviewUrl}|(review)>`)
+  const lines = [head.join(' · ')]
+  const sub = (text: string) => lines.push(`    ${text}`)
+  if (pr.reason) sub(`_${escapeSlack(pr.reason)}_`)
+  // The runner's reason already says which earlier review stands; this is only the fallback.
+  if (pr.alreadyReviewed && pr.pinnedSha && !pr.reason) sub(`_already reviewed at \`${pr.pinnedSha.slice(0, 7)}\`; nothing new was posted_`)
+  if (pr.eligibility && pr.eligibility.verdict !== 'counts') {
+    for (const reason of pr.eligibility.reasons) sub(`_${escapeSlack(reason)}_`)
+    if (pr.eligibility.missing.length) sub(`_still needed: ${pr.eligibility.missing.map(escapeSlack).join('; ')}_`)
+  }
+  for (const warning of pr.warnings) sub(`:warning: ${escapeSlack(warning)}`)
+  return lines
+}
+
+/**
+ * The dual-mode thread reply, posted for every dual run: per PR, the outcome, the pre-flight
+ * verdict, each engine's state, and the review URL (spec 5.9), then any reason or warning.
+ */
+export function renderDualThread(report: DualReport): string {
+  const total = report.prs.length
+  return [`Dual-engine review of ${total} pull request${total === 1 ? '' : 's'}.`, ...report.prs.flatMap(dualLines)].join('\n')
 }

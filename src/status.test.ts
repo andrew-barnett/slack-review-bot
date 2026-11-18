@@ -307,3 +307,29 @@ test('renderStatus shows no activity block when nothing is running or waiting', 
   t.notOk(text.includes('*Waiting*'), 'and nothing waiting')
   t.end()
 })
+
+// Dual mode reports approvals like passes, lists its own outcomes only when they happened, and
+// breaks tokens down per engine with Claude's cost labelled notional (spec 5.9). Regression caught:
+// dual outcomes vanishing from the counts, or a blended token total with no engine breakdown.
+test('renderStatus counts dual outcomes and shows per-engine token totals', t => {
+  const stats = createStats(0)
+  const claude = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 2.1, numTurns: 1, durationMs: 1 }
+  stats.record('approved', 1, MINUTE, 900_000, [
+    { engine: 'codex', usage: { tokensUsed: 500_000, attempts: 1 } },
+    { engine: 'claude', usage: { tokensUsed: 400_000, attempts: 1, claude } },
+  ])
+  stats.record('cleanNotCounted', 1, 2 * MINUTE)
+  stats.record('pass', 1, 3 * MINUTE)
+  const text = renderStatus(stats.snapshot(4 * MINUTE, 0, 0, config))
+  t.ok(text.includes('*Reviews* 2 passed, 0 with findings, 0 errored, 1 clean but not counted'), text)
+  t.ok(text.includes('(Codex 500K · Claude 400K, $2.10 notional)'), text)
+  t.end()
+})
+
+// The per-engine breakdown must show whenever engines reported tokens, even if the top-level
+// count is zero. Regression caught: the whole Tokens line (and the breakdown) being hidden.
+test('renderStatus shows the engine breakdown when only engineTokens is populated', t => {
+  const snap = { ...createStats(0).snapshot(MINUTE, 0, 0, config), engineTokens: [{ engine: 'codex' as const, total: 500_000, reviews: 1, costUsd: 0 }] }
+  t.ok(renderStatus(snap).includes('(Codex 500K)'))
+  t.end()
+})
