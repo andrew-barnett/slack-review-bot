@@ -673,6 +673,13 @@ All optional except the two tokens.
 | `SHUTDOWN_DRAIN_MS` | `5000` | On SIGINT/SIGTERM, how long to wait for an in-flight review to settle before force-killing it (it then replays on the next start, with no error thread). See [Shutting down](#shutting-down). Keep below the supervisor's kill timeout so children are reaped before a SIGKILL orphans them. |
 | `CODEARTIFACT_REFRESH` | `true` | Refresh the AWS CodeArtifact npm token before each review, so a review's `npm ci` authenticates instead of failing with E401 on a token the long-lived daemon has let expire. See [Private registry auth](#private-registry-auth). Turn off for an install with no private registry. |
 | `CODEARTIFACT_LOGIN_SCRIPT` | *(vendored `scripts/codeartifact-login.sh`)* | Path to the login script the refresh runs. Defaults to the vendored copy resolved relative to the bot; override to point at a different one. |
+| `ENGINE_AUTH` | `subscription` | How the engines reach their models: `subscription` (Codex's ChatGPT login, Claude's `CLAUDE_CODE_OAUTH_TOKEN`) or `bedrock`. Any other value stops startup. See [Engine auth: Bedrock](#engine-auth-bedrock). |
+| `BEDROCK_REGION` | `us-east-2` | Bedrock mode: the region both engines call Bedrock in. Letters, digits and `. _ : -` only. |
+| `CODEX_BEDROCK_MODEL` | `us.openai.gpt-5.5` | Bedrock mode: Codex's model ID. Letters, digits and `. _ : -` only. |
+| `CLAUDE_BEDROCK_MODEL` | `us.anthropic.claude-opus-5-5` | Bedrock mode: Claude Code's model ID. Letters, digits and `. _ : -` only. |
+| `ENGINE_ROLE_ARN` | *(none)* | Bedrock mode: the IAM role the daemon assumes, once per engine attempt, to mint engine credentials. Must be `arn:aws:iam::<12 digits>:role/<name>`. When empty, static `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (and optionally `AWS_SESSION_TOKEN`) must be in the daemon environment instead. |
+| `ENGINE_AWS_PROFILE` | *(none)* | Bedrock mode: the AWS profile the daemon runs `aws sts assume-role` with. Empty uses the AWS CLI's default credential chain. |
+| `CODEX_BEDROCK_CONTEXT_WINDOW` | *(none)* | Bedrock mode, optional: a positive integer passed to Codex as `model_context_window`, overriding the fallback metadata Codex uses for Bedrock model IDs. |
 
 > **Dual mode is not available yet. Do not provision `APPROVER_GH_TOKEN` or `ENGINE_GH_TOKEN` until [slack-review-bot#64](https://github.com/andrew-barnett/slack-review-bot/issues/64) is resolved.** Review children run as the same OS user as the daemon, so they can read the daemon's env file and the operator's `gh` login; withholding the variables from the child's environment is not enough.
 
@@ -727,6 +734,72 @@ is false, and an empty one falls back to the default rather than to false.
 Changing `WORKTREE_ROOT` means editing the template's `writable_roots` and re-running
 `scripts/install-codex-profile.sh` — the daemon passes the root to `--add-dir`, but a
 mismatch between the two is a permissions failure mid-review.
+
+### Engine auth: Bedrock
+
+`ENGINE_AUTH=bedrock` ([slack-review-bot#69](https://github.com/andrew-barnett/slack-review-bot/issues/69))
+makes both engines call their models through AWS Bedrock instead of the operator's
+subscriptions. The default, `ENGINE_AUTH=subscription`, changes nothing: none of the Bedrock
+variables are read or validated. Until dual mode is available, only Codex runs, so bedrock mode
+affects Codex alone.
+
+The variables are `ENGINE_AUTH`, `BEDROCK_REGION`, `CODEX_BEDROCK_MODEL`,
+`CLAUDE_BEDROCK_MODEL`, `ENGINE_ROLE_ARN`, `ENGINE_AWS_PROFILE` and
+`CODEX_BEDROCK_CONTEXT_WINDOW`; see the [Configuration](#configuration) table.
+
+**Credentials.** There are two sources:
+
+- **Role mode** (`ENGINE_ROLE_ARN` set). Before every engine attempt, including a stall retry,
+  the daemon runs `aws sts assume-role` (with `--profile <ENGINE_AWS_PROFILE>` when set). The
+  session lasts the run timeout plus 15 minutes, between 15 minutes and the role's 4-hour
+  maximum. The intended role is `SlackReviewBotEngineRole`, which can invoke Bedrock models and
+  nothing else. If the mint fails, the review fails with STS's reason (for example
+  `AccessDenied` or an expired operator session), and the engine is not run.
+- **Static mode** (`ENGINE_ROLE_ARN` empty). `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and
+  optionally `AWS_SESSION_TOKEN` are read from the daemon environment at startup. This is for a
+  launcher that injects credentials, such as a container. Startup then deletes the three
+  variables from the daemon's environment. Otherwise the approver's `gh` calls and the
+  CodeArtifact login, which needs the operator's own AWS profile, would run as the engine.
+
+Either way, the credentials reach an engine child only through explicit injection. Every
+minted value is also registered with the output redactor. AWS secret keys and session tokens
+printed next to their names are masked as well, so run logs and Slack output do not carry them.
+
+**Codex.** The child gets `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` and
+`AWS_REGION`, with `AWS_PROFILE` and `AWS_DEFAULT_PROFILE` removed. These overrides go right
+after `--profile` and take precedence over it:
+
+```
+-c model_provider="amazon-bedrock-runtime"
+-c model="<CODEX_BEDROCK_MODEL>"
+-c model_providers.amazon-bedrock-runtime.aws.region="<BEDROCK_REGION>"
+-c shell_environment_policy.exclude=["AWS_*"]
+[-c model_context_window=<CODEX_BEDROCK_CONTEXT_WINDOW>]
+```
+
+The last of the four is the security-relevant one. The Codex process still reads the `AWS_*`
+variables and signs its Bedrock calls with them, but every shell command the model runs, and
+any PR test code it starts, gets an environment with no `AWS_*` variables. Codex prints
+"Model metadata for `us.openai.gpt-5.5` not found. Defaulting to fallback metadata"; that
+warning is expected, and `CODEX_BEDROCK_CONTEXT_WINDOW` overrides the fallback context window.
+
+**Claude Code.** The child gets `CLAUDE_CODE_USE_BEDROCK=1`, `AWS_REGION`,
+`ANTHROPIC_MODEL=<CLAUDE_BEDROCK_MODEL>` and the three AWS credential variables.
+`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `AWS_PROFILE` and `AWS_DEFAULT_PROFILE` are
+removed, so exactly one model credential reaches the child.
+
+**Known residual.** Claude Code's Bash tool inherits the environment. In bedrock mode, PR code
+that Claude runs can therefore see the engine credentials. They can only invoke Bedrock models,
+and they expire with the session, after at most 4 hours. The container split
+([slack-review-bot#70](https://github.com/andrew-barnett/slack-review-bot/issues/70)) keeps them
+away from the daemon's other secrets.
+
+**Doctor.** In bedrock mode, `npm run doctor` checks three things. In role mode, `aws` must
+resolve on the agent's PATH. The mint must succeed. Then `aws sts get-caller-identity` runs with
+only the minted credentials, plus `PATH`, `HOME` and `AWS_REGION`, and with `AWS_CONFIG_FILE`
+and `AWS_SHARED_CREDENTIALS_FILE` set to `/dev/null`. In role mode the returned ARN must contain
+`:assumed-role/<role name>/`. In static mode the ARN is reported. The credentials are never
+printed.
 
 ## Swapping the review model
 
