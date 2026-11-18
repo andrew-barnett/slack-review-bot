@@ -9,7 +9,7 @@
     "start": "node dist/app.js",
     "dev": "ts-node --compiler-options '{\"module\":\"commonjs\"}' --transpile-only src/app.ts",
     "review": "ts-node --compiler-options '{\"module\":\"commonjs\"}' --transpile-only src/cli.ts",
-    "test": "ts-node --compiler-options '{\"module\":\"commonjs\"}' --transpile-only -e \"const fs=require('fs');const path=require('path');for(const f of fs.readdirSync('src').filter(n=>n.endsWith('.test.ts')).sort()){require(path.resolve('src',f));}\"",
+    "test": "ts-node --compiler-options '{\"module\":\"commonjs\"}' --transpile-only -e \"const fs=require('fs');const path=require('path');for(const d of ['src','src/jobs']){if(!fs.existsSync(d))continue;for(const f of fs.readdirSync(d).filter(n=>n.endsWith('.test.ts')).sort()){require(path.resolve(d,f));}}\"",
     "test:parse": "ts-node --compiler-options '{\"module\":\"commonjs\"}' --transpile-only src/parse-message.test.ts",
     "test:prompt": "ts-node --compiler-options '{\"module\":\"commonjs\"}' --transpile-only src/prompt.test.ts",
     "test:codex": "ts-node --compiler-options '{\"module\":\"commonjs\"}' --transpile-only src/codex.test.ts",
