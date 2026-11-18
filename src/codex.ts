@@ -6,7 +6,14 @@ import * as os from 'os'
 import * as path from 'path'
 import { CODEX_ENV_ALLOWLIST, CODEX_ENV_ALLOWLIST_PREFIXES, DAEMON_SECRET_VARS } from './config'
 import { type DeadlineDeps, type DeadlineSnapshot } from './deadline'
-import { REVIEW_OUTPUT_SCHEMA, parseReviewResult, type ReviewRunResult } from './schema'
+import {
+  parseReviewResult,
+  parseReviewResultV2,
+  REVIEW_OUTPUT_SCHEMA,
+  REVIEW_OUTPUT_SCHEMA_V2,
+  type EngineRunResult,
+  type ReviewRunResult,
+} from './schema'
 import { parseTokensUsed } from './usage'
 import { redactSecrets } from './redact'
 import {
@@ -80,8 +87,8 @@ export interface CodexRunOptions {
   onProgress?: (line: string, activeMs: number) => void
 }
 
-export interface CodexRunOutcome {
-  result: ReviewRunResult
+export interface CodexRunOutcome<T = ReviewRunResult> {
+  result: T
   /** Raw final message, kept for the run log. */
   rawFinalMessage: string
   /** Codex's reported "tokens used" total, or undefined when it printed none. */
@@ -192,16 +199,35 @@ export function buildCodexArgs(options: {
   ]
 }
 
-export async function runCodexReview(
+export function runCodexReview(
   options: CodexRunOptions,
   spawner: Spawner = spawn,
   /** Injection seam for the deadline's clock and heartbeat, so a test can sleep the machine. */
   clock: Partial<DeadlineDeps> = {}
 ): Promise<CodexRunOutcome> {
+  return runCodexWith(options, REVIEW_OUTPUT_SCHEMA, parseReviewResult, spawner, clock)
+}
+
+/** Dual mode: the same run with output schema v2, for the report-only prompt (spec 5.6). */
+export function runCodexReportOnly(
+  options: CodexRunOptions,
+  spawner: Spawner = spawn,
+  clock: Partial<DeadlineDeps> = {}
+): Promise<CodexRunOutcome<EngineRunResult>> {
+  return runCodexWith(options, REVIEW_OUTPUT_SCHEMA_V2, parseReviewResultV2, spawner, clock)
+}
+
+async function runCodexWith<T>(
+  options: CodexRunOptions,
+  schema: object,
+  parse: (raw: string) => T,
+  spawner: Spawner,
+  clock: Partial<DeadlineDeps>
+): Promise<CodexRunOutcome<T>> {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'slack-review-bot-'))
   const schemaPath = path.join(scratch, 'output-schema.json')
   const outputPath = path.join(scratch, 'final-message.json')
-  fs.writeFileSync(schemaPath, JSON.stringify(REVIEW_OUTPUT_SCHEMA, null, 2))
+  fs.writeFileSync(schemaPath, JSON.stringify(schema, null, 2))
 
   let env = buildChildEnv(process.env, options.envPassthrough)
   if (options.disableGitSigning) env = withGitSigningDisabled(env)
@@ -276,9 +302,9 @@ export async function runCodexReview(
       )
     }
 
-    let result: ReviewRunResult
+    let result: T
     try {
-      result = parseReviewResult(rawFinalMessage)
+      result = parse(rawFinalMessage)
     } catch (error) {
       // The run finished and cost tokens/time, but its final message is malformed or
       // schema-invalid. Surface it as an output failure that still carries the usage, rather

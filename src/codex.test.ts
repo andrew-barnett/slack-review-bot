@@ -17,6 +17,7 @@ import {
   describeStall,
   describeTimeout,
   deniedPassthrough,
+  runCodexReportOnly,
   runCodexReview,
   OUTPUT_FLUSH_LIMIT,
   TRANSCRIPT_TAIL_LIMIT,
@@ -1042,5 +1043,33 @@ test('runCodexReview never gives the child the approver or engine token', async 
 test('runCodexReview leaves GH_TOKEN untouched in single mode', async t => {
   const seen = await spawnedEnvWith({ GH_TOKEN: 'operator-placeholder' }, {})
   t.equal(seen?.GH_TOKEN, 'operator-placeholder')
+  t.end()
+})
+
+// Dual mode hands Codex schema v2 and parses v2. Regression caught: the report-only run writing
+// the v1 schema file, so Codex returns v1 output and every dual pass fails to parse.
+test('runCodexReportOnly writes schema v2 and parses a v2 final message', async t => {
+  const child = new FakeChild()
+  let outputPath = ''
+  let schemaPath = ''
+  let schema: { properties?: { results?: { items?: { required?: string[] } } } } = {}
+  const spawner = ((_bin: string, args: string[]) => {
+    outputPath = args[args.indexOf('--output-last-message') + 1]
+    schemaPath = args[args.indexOf('--output-schema') + 1]
+    schema = JSON.parse(fs.readFileSync(schemaPath, 'utf8'))
+    return child
+  }) as unknown as Spawner
+  const run = runCodexReportOnly(runOptions(), spawner, fakeClock().deps)
+  await settle()
+  fs.writeFileSync(
+    outputPath,
+    JSON.stringify({
+      results: [{ url: 'https://github.com/o/r/pull/1', reviewedSha: 'e'.repeat(40), verdict: 'clean', findings: [], summary: '', environmentProblems: [] }],
+    })
+  )
+  child.emit('close', 0)
+  const outcome = await run
+  t.ok(schema.properties?.results?.items?.required?.includes('reviewedSha'), 'the v2 schema was handed to Codex')
+  t.equal(outcome.result.results[0].verdict, 'clean')
   t.end()
 })
