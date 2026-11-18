@@ -1,0 +1,178 @@
+// Approval-eligibility pre-flight (spec section 5.2). The evaluator is pure: given facts about a
+// PR, it predicts whether an approval from the role account would satisfy the base branch's
+// rules. The fetch layer that gathers the facts is at the bottom of this file.
+
+import type { LatestPush, Permission, ReviewFact } from './approver-github'
+import { ownersFor, parseCodeowners } from './codeowners'
+
+export type EligibilityVerdict = 'counts' | 'partial' | 'wontCount'
+export interface Eligibility { verdict: EligibilityVerdict; reasons: string[]; missing: string[]; lastPushApproval: boolean; dismissStale: boolean }
+export interface PullRequestRules { requiredApprovals: number; requireCodeOwnerReview: boolean; requireLastPushApproval: boolean; dismissStaleReviews: boolean }
+export interface EligibilityFacts {
+  botLogin: string
+  prAuthor: string
+  changedFiles: string[]
+  botPermission: Permission | null                         // null = unreadable
+  ruleSources: { name: string; rules: PullRequestRules | null }[]   // rules null = unreadable source
+  codeowners: string | null                                 // '' = no file; null = unreadable
+  codeownersErrors: number | null                           // null = unreadable
+  reviews: ReviewFact[] | null                              // null = unreadable
+  reviewerPermissions: Record<string, Permission | null>   // keyed by lower-case login
+  teamMembership: Record<string, boolean | null>           // key `${team lower}|${login lower}`, e.g. '@acme/pay|role-bot'
+  latestPush: LatestPush | null                            // null = unreadable or not needed (see rule 7)
+}
+
+export const NO_RULES: PullRequestRules = {
+  requiredApprovals: 0,
+  requireCodeOwnerReview: false,
+  requireLastPushApproval: false,
+  dismissStaleReviews: false,
+}
+
+const WRITE_OR_ABOVE: ReadonlySet<string> = new Set(['admin', 'maintain', 'write'])
+const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase()
+
+export function mergeRules(all: PullRequestRules[]): PullRequestRules {
+  return all.reduce(
+    (acc, r) => ({
+      requiredApprovals: Math.max(acc.requiredApprovals, r.requiredApprovals),
+      requireCodeOwnerReview: acc.requireCodeOwnerReview || r.requireCodeOwnerReview,
+      requireLastPushApproval: acc.requireLastPushApproval || r.requireLastPushApproval,
+      dismissStaleReviews: acc.dismissStaleReviews || r.dismissStaleReviews,
+    }),
+    NO_RULES
+  )
+}
+
+type Params = Record<string, unknown>
+const num = (v: unknown) => (typeof v === 'number' ? v : 0)
+const bool = (v: unknown) => v === true
+
+export function rulesFromRulesets(rules: unknown[]): PullRequestRules {
+  return mergeRules(
+    rules
+      .filter((r): r is { type: string; parameters?: Params } => (r as { type?: string })?.type === 'pull_request')
+      .map(r => {
+        const p = r.parameters ?? {}
+        return {
+          requiredApprovals: num(p.required_approving_review_count),
+          requireCodeOwnerReview: bool(p.require_code_owner_review),
+          requireLastPushApproval: bool(p.require_last_push_approval),
+          dismissStaleReviews: bool(p.dismiss_stale_reviews_on_push),
+        }
+      })
+  )
+}
+
+export function rulesFromClassic(protection: unknown | null): PullRequestRules {
+  const reviews = (protection as { required_pull_request_reviews?: Params } | null)?.required_pull_request_reviews
+  if (!reviews) return NO_RULES
+  return {
+    requiredApprovals: num(reviews.required_approving_review_count),
+    requireCodeOwnerReview: bool(reviews.require_code_owner_reviews),
+    requireLastPushApproval: bool(reviews.require_last_push_approval),
+    dismissStaleReviews: bool(reviews.dismiss_stale_reviews),
+  }
+}
+
+/** Whether `login` is one of `owners`, directly or through an active team membership. */
+function ownedBy(owners: string[], login: string, membership: EligibilityFacts['teamMembership']): boolean | null {
+  let unknown = false
+  for (const owner of owners) {
+    if (!owner.startsWith('@')) continue // email owners cannot be resolved; never counted
+    if (owner.includes('/')) {
+      const member = membership[`${owner.toLowerCase()}|${login.toLowerCase()}`]
+      if (member === true) return true
+      if (member === null || member === undefined) unknown = true
+    } else if (same(owner.slice(1), login)) {
+      return true
+    }
+  }
+  return unknown ? null : false
+}
+
+const MAX_LISTED_PATHS = 5
+
+export function evaluateEligibility(f: EligibilityFacts): Eligibility {
+  const unreadable: string[] = []
+  for (const source of f.ruleSources) if (!source.rules) unreadable.push(source.name)
+  const rules = mergeRules(f.ruleSources.flatMap(s => (s.rules ? [s.rules] : [])))
+  const base = { lastPushApproval: rules.requireLastPushApproval, dismissStale: rules.dismissStaleReviews }
+  const wont = (reasons: string[]): Eligibility => ({ verdict: 'wontCount', reasons, missing: [], ...base })
+
+  // Rule 3: bot validity. These are definitive even if other sources are unreadable.
+  const invalid: string[] = []
+  if (same(f.botLogin, f.prAuthor)) invalid.push('the bot account authored this PR')
+  if (f.botPermission && !WRITE_OR_ABOVE.has(f.botPermission)) {
+    invalid.push(`the bot account has ${f.botPermission} permission; a counting approval needs write or higher`)
+  }
+  if (rules.requireLastPushApproval && f.latestPush && same(f.latestPush.actor, f.botLogin)) {
+    invalid.push('the bot account made the latest push, and this branch requires the latest push to be approved by someone else')
+  }
+  if (invalid.length) return wont(invalid)
+
+  // Rule 7: everything the remaining rules need must be readable.
+  if (f.botPermission === null) unreadable.push('bot permission')
+  if (f.reviews === null) unreadable.push('PR reviews')
+  if (rules.requireLastPushApproval && !f.latestPush) unreadable.push('latest pusher')
+  if (rules.requireCodeOwnerReview) {
+    if (f.codeowners === null) unreadable.push('CODEOWNERS')
+    if (f.codeownersErrors === null) unreadable.push('CODEOWNERS errors')
+    else if (f.codeownersErrors > 0) unreadable.push(`CODEOWNERS (${f.codeownersErrors} error(s) reported by GitHub)`)
+  }
+
+  // Rule 2: eligible existing approvals.
+  const approvals: ReviewFact[] = []
+  for (const r of f.reviews ?? []) {
+    if (r.state !== 'APPROVED' || same(r.login, f.botLogin) || same(r.login, f.prAuthor)) continue
+    const permission = f.reviewerPermissions[r.login.toLowerCase()]
+    if (permission === null || permission === undefined) {
+      unreadable.push(`permission of ${r.login}`)
+      continue
+    }
+    if (WRITE_OR_ABOVE.has(permission)) approvals.push(r)
+  }
+
+  // Rule 4: owner coverage.
+  type OwnerPath = { path: string; owners: string[]; byOthers: boolean; byBot: boolean }
+  const ownerPaths: OwnerPath[] = []
+  if (rules.requireCodeOwnerReview && f.codeowners !== null) {
+    const parsed = parseCodeowners(f.codeowners)
+    for (const path of f.changedFiles) {
+      const owners = ownersFor(parsed, path)
+      if (!owners || owners.length === 0) continue
+      const others = approvals.map(a => ownedBy(owners, a.login, f.teamMembership))
+      const bot = ownedBy(owners, f.botLogin, f.teamMembership)
+      if (bot === null || others.some(o => o === null)) unreadable.push(`team membership for ${owners.join(' ')}`)
+      ownerPaths.push({ path, owners, byOthers: others.some(o => o === true), byBot: bot === true })
+    }
+  }
+
+  if (unreadable.length) return wont([...new Set(unreadable)].map(u => `could not verify: ${u}`))
+
+  // Rule 5: remaining requirements with and without the bot.
+  const shortfallWithout = Math.max(0, rules.requiredApprovals - approvals.length)
+  const shortfallWith = Math.max(0, rules.requiredApprovals - approvals.length - 1)
+  const unsatisfiedWithout = ownerPaths.filter(p => !p.byOthers)
+  const unsatisfiedWith = unsatisfiedWithout.filter(p => !p.byBot)
+  const lastPushSatisfiedWithout =
+    !rules.requireLastPushApproval ||
+    approvals.some(a => f.latestPush && !same(a.login, f.latestPush.actor) && a.submittedAt > f.latestPush.at)
+
+  const missing: string[] = []
+  if (shortfallWith > 0) missing.push(`${shortfallWith} more approval${shortfallWith === 1 ? '' : 's'}`)
+  const byOwners = new Map<string, string[]>()
+  for (const p of unsatisfiedWith) byOwners.set(p.owners.join(' or '), [...(byOwners.get(p.owners.join(' or ')) ?? []), p.path])
+  for (const [owners, paths] of byOwners) {
+    const shown = paths.slice(0, MAX_LISTED_PATHS).join(', ')
+    const more = paths.length > MAX_LISTED_PATHS ? ` and ${paths.length - MAX_LISTED_PATHS} more` : ''
+    missing.push(`${owners} for ${shown}${more}`)
+  }
+
+  // Rule 6: verdict.
+  if (missing.length === 0) return { verdict: 'counts', reasons: [], missing: [], ...base }
+  const reduced =
+    shortfallWith < shortfallWithout || unsatisfiedWith.length < unsatisfiedWithout.length || !lastPushSatisfiedWithout
+  if (reduced) return { verdict: 'partial', reasons: ['the bot approval satisfies some but not all requirements'], missing, ...base }
+  return { verdict: 'wontCount', reasons: ['the bot approval would not satisfy any remaining requirement'], missing, ...base }
+}
