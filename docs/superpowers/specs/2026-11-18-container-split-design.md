@@ -140,10 +140,10 @@ Replaces today's daemon LaunchAgent. It runs under the operator's account and is
 3. **SIGTERM: drain first, then stop workers.**
    1. Stop the worker loops from starting new workers, but leave running workers alone.
    2. Send SIGTERM to the orchestrator only, and wait for it to exit. While it drains under the contract in https://github.com/andrew-barnett/slack-review-bot/issues/32, in-flight jobs must keep their workers. Killing a worker mid-drain would turn an unfinished review into "worker lost" and settle its cursor entry as an error, so the request would never be replayed.
-   3. If the orchestrator escalates to a forced shutdown, it cancels its jobs itself (the `409` path in 3.3), so workers exit on their own.
-   4. After the orchestrator exits, SIGTERM any worker that is still running, wait up to 30 s, then SIGKILL it and exit.
+   3. The orchestrator moves from draining to forced on its own: when its `SHUTDOWN_DRAIN_MS` deadline passes, it sets `shutdown.forced`. A repeated signal is a no-op in `app.ts` and is **not** a forced-shutdown trigger. Forced shutdown cancels its jobs (the `409` path in 3.3), so workers exit on their own, and leaves the killed reviews' cursors unsettled so they replay.
+   4. Only after the orchestrator process has exited, SIGTERM any worker that is still running, wait up to 30 s, then SIGKILL it and exit. Once the orchestrator is gone, nothing is left to turn a missing worker into a settled "worker lost" error.
 
-   A second SIGTERM to the launcher skips straight to step 4 for workers, and forwards a second SIGTERM to the orchestrator, which is its existing forced-shutdown trigger.
+   **The launcher never stops a worker while the orchestrator is alive**, whatever signals it receives. A repeated SIGTERM to the launcher is ignored. Its only escalation is a hard bound: if the orchestrator hasn't exited after `SHUTDOWN_DRAIN_MS` + `SHUTDOWN_GRACE_MS` + 30 s, the launcher runs `docker kill` on the orchestrator first, waits for it to exit, and only then does step 4.
 
 #### 3.6.1 Secret delivery over stdin
 
