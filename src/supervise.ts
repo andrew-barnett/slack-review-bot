@@ -169,6 +169,12 @@ export interface SuperviseOptions {
    * the CLI passes nothing, and it must never be relied on for correctness.
    */
   onProgress?: (line: string, activeMs: number) => void
+  /**
+   * Called with every raw stdout chunk, before redaction and before the transcript tail is bounded.
+   * For an engine whose result arrives on stdout (Claude's stream-JSON `result` event), so a large
+   * final event is never cut by TRANSCRIPT_TAIL_LIMIT. The text stays in memory: it is never logged.
+   */
+  onStdout?: (text: string) => void
 }
 
 export interface SupervisedExit {
@@ -293,13 +299,22 @@ export function superviseChild(
     // chunks, so a chunk-split or over-long PEM key never leaks its body (issue #31).
     const stdoutRedactor = createOutputRedactor()
     const stderrRedactor = createOutputRedactor()
-    const captureFrom = (redactor: { push(t: string): string }) => (chunk: Buffer) => {
+    const captureFrom = (redactor: { push(t: string): string }, raw?: (text: string) => void) => (chunk: Buffer) => {
       // Reset the stall clock on every raw chunk, before redacting: a run slowly writing one long
       // line is active, not silent (markActivity must see it even when nothing publishes yet).
       deadline.markActivity()
-      publish(redactor.push(chunk.toString('utf8')))
+      const text = chunk.toString('utf8')
+      if (raw) {
+        // A parser failure must never take the run down; the caller sees a missing result instead.
+        try {
+          raw(text)
+        } catch {
+          // Ignored on purpose.
+        }
+      }
+      publish(redactor.push(text))
     }
-    child.stdout?.on('data', captureFrom(stdoutRedactor))
+    child.stdout?.on('data', captureFrom(stdoutRedactor, options.onStdout))
     child.stderr?.on('data', captureFrom(stderrRedactor))
 
     // Flush both redactors when the stream ends, so the final line (and its token footer) reaches

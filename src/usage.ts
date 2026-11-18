@@ -6,7 +6,22 @@
 // figures the status reply shows. Kept free of Slack and Codex specifics so the parsing and
 // the formatting are unit-testable on their own.
 
+import type { EngineName } from './config'
 import type { ReviewRunResult } from './schema'
+
+/**
+ * What Claude's stream-JSON `result` event reports about a run (V2 spike, issue 54). `costUsd` is
+ * notional under subscription auth (CLAUDE_CODE_OAUTH_TOKEN): a figure, not a charge.
+ */
+export interface ClaudeUsageDetail {
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  costUsd: number
+  numTurns: number
+  durationMs: number
+}
 
 /**
  * The cost of a single review request, gathered whether it passed, found things, or failed.
@@ -24,6 +39,10 @@ export interface RunUsage {
   activeMs?: number
   /** Number of Codex invocations this review took — >1 means a stall was retried. */
   attempts: number
+  /** Claude's own figures, when this usage is a Claude engine's. */
+  claude?: ClaudeUsageDetail
+  /** Dual mode: each engine's usage. The top-level figures are then the sums across engines. */
+  engines?: { engine: EngineName; usage: RunUsage }[]
 }
 
 /** A completed review: what Codex concluded, and what it cost. */

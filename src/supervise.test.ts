@@ -100,3 +100,31 @@ test('superviseChild returns the child output as the transcript', async t => {
   t.ok(exit.transcript.includes('hello'), 'output reaches the transcript')
   t.end()
 })
+
+// Claude's result arrives on stdout and can exceed the bounded transcript tail, so the engine reads
+// raw stdout through onStdout. Only stdout is delivered, and a throwing parser must not take the run
+// down. Regression caught: stderr noise reaching the result parser, or a parser bug crashing a review.
+test('superviseChild hands raw stdout, and only stdout, to onStdout', async t => {
+  const child = new FakeChild()
+  const spawner = (() => child) as unknown as Spawner
+  const seen: string[] = []
+  const run = superviseChild(
+    {
+      bin: 'x', args: [], cwd: '/', env: {}, timeoutMs: 60_000, logName: 'n', runId: 'r', logPrefix: 'claude',
+      onStdout: text => {
+        seen.push(text)
+        throw new Error('parser bug')
+      },
+    },
+    spawner,
+    { setInterval: () => 1 as unknown as ReturnType<typeof setInterval>, clearInterval: () => {} }
+  )
+  child.stdout.write('{"type":"result"}\n')
+  child.stderr.write('warning on stderr\n')
+  await new Promise(resolve => setImmediate(resolve))
+  child.emit('close', 0)
+  const exit = await run
+  t.deepEqual(seen, ['{"type":"result"}\n'])
+  t.equal(exit.code, 0, 'the run still completes')
+  t.end()
+})
