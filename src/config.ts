@@ -431,6 +431,14 @@ export function loadReviewConfig(env: NodeJS.ProcessEnv = process.env): ReviewCo
     claudeBin: env.CLAUDE_BIN || 'claude',
     claudeConfigDir: env.CLAUDE_CONFIG_DIR_REVIEW || path.join(home, '.claude-review-bot'),
   }
+  // A non-approval must never wear the approval stamp, in any mode.
+  for (const [name, value] of [
+    ['APPROVAL_PARTIAL_EMOJI', config.approvalPartialEmoji],
+    ['APPROVAL_NOT_COUNTED_EMOJI', config.approvalNotCountedEmoji],
+    ['HEAD_MOVED_EMOJI', config.headMovedEmoji],
+  ] as const) {
+    if (value === config.passEmoji) throw new Error(`${name} must differ from PASS_EMOJI (got "${value}")`)
+  }
   if (dual) {
     if (!config.approverGhToken) throw new Error(`${APPROVER_TOKEN_VAR} is required when REVIEW_ENGINES=codex,claude`)
     if (!config.engineGhToken) throw new Error(`${ENGINE_TOKEN_VAR} is required when REVIEW_ENGINES=codex,claude`)

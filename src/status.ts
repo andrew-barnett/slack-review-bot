@@ -309,8 +309,8 @@ export function renderStatus(
   // Only once something has reported a count: before that the total, average and "last" are all
   // meaningless, and a "0 tokens" line would read as a bug rather than a fresh start.
   const { tokens } = snapshot
-  if (tokens.reviews > 0) {
-    const avg = Math.round(tokens.total / tokens.reviews)
+  if (tokens.reviews > 0 || snapshot.engineTokens.length > 0) {
+    const avg = tokens.reviews > 0 ? Math.round(tokens.total / tokens.reviews) : 0
     const last = tokens.last !== undefined ? ` · ${formatTokensCompact(tokens.last)} last` : ''
     lines.push(`*Tokens* ${formatTokensCompact(tokens.total)} total${last} · ${formatTokensCompact(avg)} avg${engineTotals(snapshot.engineTokens)}`)
   }

@@ -32,6 +32,15 @@ function link(result: PullRequestResult): string {
   return `<${result.url}|${shortLabel(result.url)}>`
 }
 
+/**
+ * Neutralise Slack control syntax in untrusted text (engine output, GitHub-derived strings), so
+ * `<!channel>`, `<@U1>` or `<url|label>` cannot ping people or spoof links. `&` goes first so the
+ * entities this adds are not themselves re-escaped.
+ */
+export function escapeSlack(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
 /** Trim a model-written summary to a single sentence for the thread. */
 export function oneSentence(text: string): string {
   const collapsed = text.replace(/\s+/g, ' ').trim()
@@ -46,7 +55,7 @@ export function oneSentence(text: string): string {
 function bulletsFor(results: PullRequestResult[], withSummary: boolean): string {
   return results
     .map(result => {
-      const summary = withSummary ? oneSentence(result.summary) : ''
+      const summary = withSummary ? escapeSlack(oneSentence(result.summary)) : ''
       const reviewLink = result.reviewUrl ? ` <${result.reviewUrl}|(review)>` : ''
       return summary ? `• ${link(result)} — ${summary}${reviewLink}` : `• ${link(result)}${reviewLink}`
     })
@@ -121,18 +130,18 @@ const PREFLIGHT_TEXT = { counts: 'counts', partial: 'partial', wontCount: "won't
 function dualLines(pr: DualPrReport): string[] {
   const head = [`• <${pr.url}|${shortLabel(pr.url)}> — ${DUAL_OUTCOME_TEXT[pr.outcome]}`]
   if (pr.eligibility) head.push(`pre-flight ${PREFLIGHT_TEXT[pr.eligibility.verdict]}`)
-  for (const pass of pr.passes) head.push(`${ENGINE_LABEL[pass.engine]}: ${pass.detail}`)
+  for (const pass of pr.passes) head.push(`${ENGINE_LABEL[pass.engine]}: ${escapeSlack(pass.detail)}`)
   if (pr.reviewUrl) head.push(`<${pr.reviewUrl}|(review)>`)
   const lines = [head.join(' · ')]
   const sub = (text: string) => lines.push(`    ${text}`)
-  if (pr.reason) sub(`_${pr.reason}_`)
+  if (pr.reason) sub(`_${escapeSlack(pr.reason)}_`)
   // The runner's reason already says which earlier review stands; this is only the fallback.
   if (pr.alreadyReviewed && pr.pinnedSha && !pr.reason) sub(`_already reviewed at \`${pr.pinnedSha.slice(0, 7)}\`; nothing new was posted_`)
   if (pr.eligibility && pr.eligibility.verdict !== 'counts') {
-    for (const reason of pr.eligibility.reasons) sub(`_${reason}_`)
-    if (pr.eligibility.missing.length) sub(`_still needed: ${pr.eligibility.missing.join('; ')}_`)
+    for (const reason of pr.eligibility.reasons) sub(`_${escapeSlack(reason)}_`)
+    if (pr.eligibility.missing.length) sub(`_still needed: ${pr.eligibility.missing.map(escapeSlack).join('; ')}_`)
   }
-  for (const warning of pr.warnings) sub(`:warning: ${warning}`)
+  for (const warning of pr.warnings) sub(`:warning: ${escapeSlack(warning)}`)
   return lines
 }
 

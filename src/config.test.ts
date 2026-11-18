@@ -363,3 +363,12 @@ test('assertModeAvailable refuses dual mode unless it is available', t => {
   t.doesNotThrow(() => assertModeAvailable({ reviewEngines: ['codex'] }))
   t.end()
 })
+
+// A dual-mode reaction equal to the pass stamp would let a partial, not-counted or head-moved
+// result look like an approval. Regression caught: the clash loading silently.
+test('loadReviewConfig rejects a dual emoji that equals the pass emoji', t => {
+  t.throws(() => loadReviewConfig({ APPROVAL_PARTIAL_EMOJI: 'approved_stamp' }), /APPROVAL_PARTIAL_EMOJI/)
+  t.throws(() => loadReviewConfig({ APPROVAL_NOT_COUNTED_EMOJI: 'ok' , PASS_EMOJI: 'ok' }), /APPROVAL_NOT_COUNTED_EMOJI/)
+  t.throws(() => loadReviewConfig({ HEAD_MOVED_EMOJI: 'approved_stamp' }), /HEAD_MOVED_EMOJI/)
+  t.end()
+})

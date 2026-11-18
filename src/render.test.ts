@@ -164,3 +164,35 @@ test('worstOutcome picks the worst outcome present', t => {
   t.equal(worstOutcome([]), 'error', 'nothing to report is not a pass')
   t.end()
 })
+
+// Engine and GitHub text must not reach Slack as control syntax. Regression caught: a
+// `<!channel>` or `<@U1>` in engine output pinging people, or `<url|label>` spoofing a link,
+// while the bot's own PR link must stay a real link.
+test('renderDualThread escapes untrusted text but keeps the bot link', t => {
+  const evil = '<!channel> <@U1> <https://x|y> & more'
+  const text = renderDualThread({
+    prs: [
+      {
+        url: 'https://github.com/o/r/pull/1',
+        outcome: 'blocked',
+        passes: [{ engine: 'codex', state: 'error', detail: evil }],
+        warnings: [evil],
+        reason: evil,
+        eligibility: { verdict: 'partial', reasons: [evil], missing: [evil], lastPushApproval: false, dismissStale: false },
+      },
+    ],
+  })
+  t.notOk(text.includes('<!channel>') || text.includes('<@U1>') || text.includes('<https://x|y>'))
+  t.ok(text.includes('&lt;!channel&gt; &lt;@U1&gt; &lt;https://x|y&gt; &amp; more'))
+  t.ok(text.includes('<https://github.com/o/r/pull/1|o/r#1>'))
+  t.end()
+})
+
+// The same guard for single mode's model-written summary (renderThread).
+test('renderThread escapes a summary containing Slack control syntax', t => {
+  const text = renderThread({ results: [pr('https://github.com/o/r/pull/1', 'findings', '<!channel> look <@U1>')] } as ReviewRunResult)
+  t.notOk(text.includes('<!channel>') || text.includes('<@U1>'))
+  t.ok(text.includes('&lt;!channel&gt;'))
+  t.ok(text.includes('<https://github.com/o/r/pull/1|o/r#1>'))
+  t.end()
+})

@@ -325,3 +325,11 @@ test('renderStatus counts dual outcomes and shows per-engine token totals', t =>
   t.ok(text.includes('(Codex 500K · Claude 400K, $2.10 notional)'), text)
   t.end()
 })
+
+// The per-engine breakdown must show whenever engines reported tokens, even if the top-level
+// count is zero. Regression caught: the whole Tokens line (and the breakdown) being hidden.
+test('renderStatus shows the engine breakdown when only engineTokens is populated', t => {
+  const snap = { ...createStats(0).snapshot(MINUTE, 0, 0, config), engineTokens: [{ engine: 'codex' as const, total: 500_000, reviews: 1, costUsd: 0 }] }
+  t.ok(renderStatus(snap).includes('(Codex 500K)'))
+  t.end()
+})
