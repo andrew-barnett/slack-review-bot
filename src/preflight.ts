@@ -2,8 +2,9 @@
 // PR, it predicts whether an approval from the role account would satisfy the base branch's
 // rules. The fetch layer that gathers the facts is at the bottom of this file.
 
-import type { LatestPush, Permission, ReviewFact } from './approver-github'
+import type { ApproverGitHub, LatestPush, Permission, PullRequestInfo, ReviewFact } from './approver-github'
 import { ownersFor, parseCodeowners, unsupportedLines } from './codeowners'
+import type { PullRequestRef } from './parse-message'
 
 export type EligibilityVerdict = 'counts' | 'partial' | 'wontCount'
 export interface Eligibility { verdict: EligibilityVerdict; reasons: string[]; missing: string[]; lastPushApproval: boolean; dismissStale: boolean }
@@ -201,4 +202,112 @@ export function evaluateEligibility(f: EligibilityFacts): Eligibility {
     shortfallWith < shortfallWithout || unsatisfiedWith.length < unsatisfiedWithout.length || !lastPushSatisfiedWithout
   if (reduced) return { verdict: 'partial', reasons: ['the bot approval satisfies some but not all requirements', ...changeReasons], missing, ...base }
   return { verdict: 'wontCount', reasons: ['the bot approval would not satisfy any remaining requirement', ...changeReasons], missing, ...base }
+}
+
+/** Where GitHub looks for CODEOWNERS, in its order of precedence. */
+export const CODEOWNERS_PATHS = ['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS'] as const
+
+/** Resolve a read to its value, or null when it fails; the evaluator reports null as unreadable. */
+async function attempt<T>(read: () => Promise<T>): Promise<T | null> {
+  try {
+    return await read()
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Gather every fact `evaluateEligibility` needs, with the approver token, read-only. Never
+ * rejects: a failed read becomes null and is reported as unreadable by the evaluator.
+ */
+export async function gatherEligibilityFacts(
+  gh: ApproverGitHub,
+  pr: PullRequestRef,
+  info: PullRequestInfo,
+  changedFiles: string[],
+  botLogin: string
+): Promise<EligibilityFacts> {
+  const [rulesets, classic, botPermission, reviews] = await Promise.all([
+    attempt(() => gh.branchRules(pr, info.base)),
+    attempt(async () => rulesFromClassic(await gh.classicProtection(pr, info.base))),
+    attempt(() => gh.permission(pr, botLogin)),
+    attempt(() => gh.reviews(pr)),
+  ])
+  const ruleSources = [
+    { name: 'rulesets', rules: rulesets === null ? null : rulesFromRulesets(rulesets) },
+    { name: 'classic protection', rules: classic },
+  ]
+  const rules = mergeRules(ruleSources.flatMap(s => (s.rules ? [s.rules] : [])))
+
+  // CODEOWNERS: the first file that exists, read from the base branch.
+  let codeowners: string | null = ''
+  if (rules.requireCodeOwnerReview) {
+    for (const candidate of CODEOWNERS_PATHS) {
+      // fileAt resolves null for a missing file (try the next location) and rejects on any other
+      // failure (CODEOWNERS unreadable). Not wrapped in attempt(), which would conflate the two.
+      try {
+        const text = await gh.fileAt(pr, candidate, info.base)
+        if (text === null) continue
+        codeowners = text
+      } catch {
+        codeowners = null
+      }
+      break
+    }
+  }
+  const codeownersErrors = rules.requireCodeOwnerReview ? await attempt(() => gh.codeownersErrorCount(pr, info.base)) : 0
+
+  // Permissions of every other reviewer whose review the evaluator weighs: approvers (do they
+  // count?) and change requesters (does the request block?). The bot's own reviews are excluded.
+  const approvers = (reviews ?? []).filter(r => r.state === 'APPROVED')
+  const reviewerLogins = new Map<string, string>()
+  for (const r of reviews ?? []) {
+    if ((r.state === 'APPROVED' || r.state === 'CHANGES_REQUESTED') && r.login.toLowerCase() !== botLogin.toLowerCase()) {
+      reviewerLogins.set(r.login.toLowerCase(), r.login)
+    }
+  }
+  const reviewerPermissions: Record<string, Permission | null> = {}
+  await Promise.all(
+    [...reviewerLogins].map(async ([key, login]) => {
+      reviewerPermissions[key] = await attempt(() => gh.permission(pr, login))
+    })
+  )
+
+  // Team membership: only teams that own a changed path, for the bot and each approver.
+  const teamMembership: Record<string, boolean | null> = {}
+  if (rules.requireCodeOwnerReview && codeowners) {
+    const parsed = parseCodeowners(codeowners)
+    const teams = new Set<string>()
+    for (const file of changedFiles) for (const owner of ownersFor(parsed, file) ?? []) if (owner.startsWith('@') && owner.includes('/')) teams.add(owner)
+    const candidates = [botLogin, ...approvers.map(a => a.login)]
+    await Promise.all(
+      [...teams].flatMap(team =>
+        candidates.map(async login => {
+          const [org, slug] = team.slice(1).split('/')
+          teamMembership[`${team.toLowerCase()}|${login.toLowerCase()}`] = await attempt(() => gh.isTeamMember(org, slug, login))
+        })
+      )
+    )
+  }
+
+  // Latest pusher: needed only under the last-push rule; unreadable for a fork head or a stale record.
+  let latestPush: LatestPush | null = null
+  if (rules.requireLastPushApproval && info.headRepo === info.baseRepo) {
+    const push = await attempt(() => gh.latestPush(pr, info.headRef))
+    latestPush = push && push.afterSha === info.headSha ? push : null
+  }
+
+  return {
+    botLogin,
+    prAuthor: info.author,
+    changedFiles,
+    botPermission,
+    ruleSources,
+    codeowners,
+    codeownersErrors,
+    reviews,
+    reviewerPermissions,
+    teamMembership,
+    latestPush,
+  }
 }

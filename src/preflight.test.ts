@@ -1,6 +1,6 @@
 import test from 'tape'
-import type { ReviewFact } from './approver-github'
-import { evaluateEligibility, mergeRules, NO_RULES, rulesFromClassic, rulesFromRulesets, type EligibilityFacts, type PullRequestRules } from './preflight'
+import type { ApproverGitHub, PullRequestInfo, ReviewFact } from './approver-github'
+import { evaluateEligibility, gatherEligibilityFacts, mergeRules, NO_RULES, rulesFromClassic, rulesFromRulesets, type EligibilityFacts, type PullRequestRules } from './preflight'
 
 const rules = (r: Partial<PullRequestRules>): PullRequestRules => ({ ...NO_RULES, ...r })
 
@@ -293,5 +293,126 @@ test('last-push ordering uses parsed timestamps', t => {
     latestPush: { actor: 'dev', at: '2026-11-17T09:00:00Z', afterSha: 'h' },
   }))
   t.equal(e.verdict, 'wontCount')
+  t.end()
+})
+
+const prRef = { owner: 'acme', repo: 'svc', number: 1, url: 'https://github.com/acme/svc/pull/1' }
+const info: PullRequestInfo = { author: 'dev', base: 'main', baseRepo: 'acme/svc', headRef: 'feat/x', headSha: 'h1', headRepo: 'acme/svc', state: 'open', draft: false }
+
+/** A fake ApproverGitHub with sensible defaults; each test overrides what it exercises. */
+function fakeGh(over: Partial<ApproverGitHub> = {}): ApproverGitHub {
+  const unused = async () => { throw new Error('not used in pre-flight') }
+  return {
+    login: async () => 'role-bot',
+    getPullRequest: async () => info,
+    permission: async () => 'write',
+    branchRules: async () => [],
+    classicProtection: async () => null,
+    fileAt: async () => null,
+    codeownersErrorCount: async () => 0,
+    isTeamMember: async () => false,
+    reviews: async () => [],
+    latestPush: async () => null,
+    commentableLines: unused,
+    updateBranch: unused,
+    postReview: unused,
+    botReviews: unused,
+    decision: unused,
+    ...over,
+  } as ApproverGitHub
+}
+
+// A failing read must become "unreadable" in the facts, so the evaluator says wontCount and names
+// it. The fetch layer must never reject, or one flaky call would crash the review.
+test('a failing read becomes null instead of rejecting', async t => {
+  const f = await gatherEligibilityFacts(fakeGh({ classicProtection: async () => { throw new Error('HTTP 403') } }), prRef, info, ['a.ts'], 'role-bot')
+  t.equal(f.ruleSources.find(s => s.name === 'classic protection')?.rules, null)
+  t.end()
+})
+
+// CODEOWNERS lives in one of three places; GitHub uses the first that exists in that order.
+test('CODEOWNERS is read from the first location that exists, at the base branch', async t => {
+  const asked: string[] = []
+  const f = await gatherEligibilityFacts(
+    fakeGh({
+      // CODEOWNERS is only read when code-owner review is required.
+      branchRules: async () => [{ type: 'pull_request', parameters: { require_code_owner_review: true } }],
+      fileAt: async (_pr, p, ref) => { asked.push(`${p}@${ref}`); return p === 'CODEOWNERS' ? '* @x' : null },
+    }),
+    prRef, info, ['a.ts'], 'role-bot'
+  )
+  t.deepEqual(asked, ['.github/CODEOWNERS@main', 'CODEOWNERS@main'])
+  t.equal(f.codeowners, '* @x')
+  t.end()
+})
+
+// Review Focus 4: a latest-push record for a different SHA than the head is stale and must read
+// as unreadable, not as the latest push.
+test('a latest-push record that does not match the head is treated as unreadable', async t => {
+  const f = await gatherEligibilityFacts(
+    fakeGh({
+      branchRules: async () => [{ type: 'pull_request', parameters: { require_last_push_approval: true } }],
+      latestPush: async () => ({ actor: 'dev', at: '2026-11-17T09:00:00Z', afterSha: 'old' }),
+    }),
+    prRef, info, ['a.ts'], 'role-bot'
+  )
+  t.equal(f.latestPush, null)
+  t.equal(evaluateEligibility(f).verdict, 'wontCount')
+  t.end()
+})
+
+// The latest pusher cannot be read for a head branch in a fork, so it is unreadable when needed.
+test('the latest push of a fork head is unreadable', async t => {
+  let called = false
+  const f = await gatherEligibilityFacts(
+    fakeGh({
+      branchRules: async () => [{ type: 'pull_request', parameters: { require_last_push_approval: true } }],
+      latestPush: async () => { called = true; return null },
+    }),
+    prRef, { ...info, headRepo: 'someone/svc' }, ['a.ts'], 'role-bot'
+  )
+  t.equal(f.latestPush, null)
+  t.notOk(called, 'not queried for a fork')
+  t.end()
+})
+
+// Team membership is looked up only for teams that own a changed path, and for each candidate
+// (the bot and every approver), with keys matching the evaluator's format.
+test('team membership is fetched for owning teams and candidates only', async t => {
+  const asked: string[] = []
+  const f = await gatherEligibilityFacts(
+    fakeGh({
+      branchRules: async () => [{ type: 'pull_request', parameters: { require_code_owner_review: true, required_approving_review_count: 1 } }],
+      fileAt: async (_pr, p) => (p === '.github/CODEOWNERS' ? ['/src/ @Acme/Pay', '/other/ @acme/ops'].join('\n') : null),
+      reviews: async () => [{ login: 'Alice', state: 'APPROVED', submittedAt: '2026-11-17T09:00:00Z' }],
+      isTeamMember: async (org, team, login) => { asked.push(`${org}/${team}/${login}`); return login === 'role-bot' },
+    }),
+    prRef, info, ['src/a.ts'], 'role-bot'
+  )
+  t.deepEqual(asked.sort(), ['Acme/Pay/Alice', 'Acme/Pay/role-bot'])
+  t.equal(f.teamMembership['@acme/pay|role-bot'], true)
+  t.equal(f.reviewerPermissions['alice'], 'write')
+  t.equal(evaluateEligibility(f).verdict, 'counts')
+  t.end()
+})
+
+// Regression: the evaluator looks up the permission of every outstanding change requester (a
+// write+ request blocks the merge). Without fetching it here, every change request would be
+// reported as an unreadable permission. The bot's own review is excluded.
+test('permissions are fetched for change requesters, not only approvers', async t => {
+  const asked: string[] = []
+  const f = await gatherEligibilityFacts(
+    fakeGh({
+      reviews: async () => [
+        { login: 'Carol', state: 'CHANGES_REQUESTED', submittedAt: '2026-11-17T09:00:00Z' },
+        { login: 'Role-Bot', state: 'CHANGES_REQUESTED', submittedAt: '2026-11-17T09:00:00Z' },
+      ],
+      permission: async (_pr, login) => { asked.push(login); return 'maintain' },
+    }),
+    prRef, info, ['a.ts'], 'role-bot'
+  )
+  t.equal(f.reviewerPermissions['carol'], 'maintain')
+  t.notOk('role-bot' in f.reviewerPermissions, 'the bot review is not looked up')
+  t.deepEqual(asked.filter(l => l !== 'role-bot'), ['Carol'])
   t.end()
 })
