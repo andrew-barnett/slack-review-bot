@@ -29,6 +29,11 @@
 - `APPROVER_GH_TOKEN` must **never** reach an engine child (Codex or Claude), by name or by value. Engines get `ENGINE_GH_TOKEN` as `GH_TOKEN`; `GITHUB_TOKEN` and `GH_ENTERPRISE_TOKEN` are removed. Every GitHub write (review, update-branch, issue comment) is made by the daemon through `ApproverGitHub`.
 - The engines never write to GitHub: the prompt invokes `review-pr` in report-only mode with a pinned 40-hex SHA per PR, and the engine token is read-only.
 - Each engine works under its own worktree root, `path.join(WORKTREE_ROOT, <engine>)`, so parallel runs never share a checkout or `node_modules`.
+- **Idempotency (spec 5.8).** Before posting, the bot's own reviews at the pinned SHA are read. Only reviews that still stand count: `APPROVED`, `COMMENTED` or `CHANGES_REQUESTED`.
+  - **A standing review exists:** nothing is posted, and the reported outcome describes what is on GitHub, not what would have been posted. `approved` / `approvedPartial` are reported only when an `APPROVED` review stands. A clean result over a standing `COMMENT` reports `cleanNotCounted` and says the earlier review stands. Findings over a standing approval report `findings` with a warning that the approval is still in effect.
+  - **The earlier review was `DISMISSED`:** it does not block a re-request, so the bot posts a fresh review at the same SHA. R4 and spec 5.2 treat GitHub's review state as authoritative, so a dismissed approval no longer counts. Re-approving therefore is not a double approval, and the re-request is a human asking again.
+  - **The earlier review is `PENDING`:** it was never submitted and is ignored.
+- Usage is charged across every attempt, like active time. Tokens and the Claude breakdown from a failed (stalled) attempt are added to the successful attempt's. A count is unknown only when no attempt reported one.
 - An engine never throws out of `run()`: a timeout, a stall on every attempt, a crash, or unparseable output becomes `EngineRunOutcome.error` (redacted), which the gate reads as an invalid pass.
 - Every `gh` call keeps `GH_COMMAND_TIMEOUT_MS` and SIGKILL; request bodies go to `gh api` on stdin, never argv.
 - Log messages use constant event names with variable data in the fields object (the existing `log(event, fields)` style). Never log a token.
@@ -2001,7 +2006,9 @@ git commit -m "feat(claude): install and verify the isolated Claude profile (ref
   - `interface EngineRunOutcome { engine; results; usage: RunUsage; error? }`
   - `interface Engine { name; run(input) }`
   - `engineWorktreeRoot(root, engine): string`
-  - `runWithStallRetries(engine, input, schedule, attemptOnce, deps?)` (never throws)
+  - `runWithStallRetries(engine, input, schedule, attemptOnce, deps?)` (never throws; tokens and the Claude breakdown summed across every attempt)
+  - `class AttemptFailure(message, stalled, activeMs, tokensUsed?, claude?)`
+  - `addClaudeUsage(a, b): ClaudeUsageDetail | undefined`
   - `interface EngineDeps extends RetryDeps { registry?; runCodex?; runClaude? }`
   - `makeCodexEngine(config, deps?): Engine`
   - `makeClaudeEngine(config, deps?): Engine`
@@ -2062,7 +2069,7 @@ import test from 'tape'
 import { CodexStalledError, CodexTimeoutError, type CodexRunOptions, type runCodexReportOnly } from './codex'
 import { ClaudeRunError, type ClaudeRunOptions, type runClaudeReview } from './claude'
 import { loadReviewConfig } from './config'
-import { engineWorktreeRoot, makeClaudeEngine, makeCodexEngine, type EngineRunInput } from './engine'
+import { AttemptFailure, engineWorktreeRoot, makeClaudeEngine, makeCodexEngine, runWithStallRetries, type EngineRunInput } from './engine'
 import type { EngineRunResult } from './schema'
 
 const SHA = 'd'.repeat(40)
@@ -2184,6 +2191,52 @@ test('an engine gives up after stalling on every attempt', async t => {
   const out = await makeClaudeEngine(config, { runClaude }).run(input)
   t.match(out.error ?? '', /stalled on every attempt \(2\)/)
   t.equal(out.usage.activeMs, 200)
+  t.end()
+})
+
+// Spend is charged across attempts, like active time. Regression caught: a stalled attempt's
+// tokens dropped from the usage of the retry that succeeded, under-reporting the review's cost.
+test('runWithStallRetries adds a failed attempt\'s tokens to the successful attempt\'s', async t => {
+  let calls = 0
+  const out = await runWithStallRetries('codex', input, [60000, 120000], async () => {
+    calls += 1
+    if (calls === 1) throw new AttemptFailure('stalled', true, 10, 100)
+    return { result: { results: [clean(URL1), clean(URL2)] }, activeMs: 20, tokensUsed: 200 }
+  })
+  t.equal(out.error, undefined)
+  t.equal(out.usage.tokensUsed, 300)
+  t.equal(out.usage.activeMs, 30)
+  t.end()
+})
+
+// A successful attempt that reports no token count must not erase what the failed attempts
+// already spent: unknown plus known is the known part, never unknown.
+test('runWithStallRetries keeps known spend when the successful attempt omits it', async t => {
+  let calls = 0
+  const out = await runWithStallRetries('codex', input, [60000, 120000], async () => {
+    calls += 1
+    if (calls === 1) throw new AttemptFailure('stalled', true, 10, 100)
+    return { result: { results: [clean(URL1), clean(URL2)] }, activeMs: 20 }
+  })
+  t.equal(out.usage.tokensUsed, 100)
+  t.end()
+})
+
+// The Claude breakdown (input, output, cache, cost, turns) is summed across attempts the same way,
+// so the per-engine usage line and the status totals agree with the token total.
+test('the Claude engine sums the usage breakdown across a stalled attempt and the retry', async t => {
+  const first = { inputTokens: 10, outputTokens: 20, cacheReadTokens: 30, cacheWriteTokens: 40, costUsd: 0.5, numTurns: 1, durationMs: 100 }
+  const second = { inputTokens: 1, outputTokens: 2, cacheReadTokens: 3, cacheWriteTokens: 4, costUsd: 0.25, numTurns: 2, durationMs: 50 }
+  let calls = 0
+  const runClaude = (async () => {
+    calls += 1
+    if (calls === 1) throw new ClaudeRunError('Claude produced no output', 'stall', 100, first)
+    return { result: { results: [clean(URL1), clean(URL2)] }, usage: second, tokensUsed: 10, activeMs: 200, permissionDenials: 0 }
+  }) as unknown as typeof runClaudeReview
+  const out = await makeClaudeEngine(config, { runClaude }).run(input)
+  t.equal(out.error, undefined)
+  t.deepEqual(out.usage.claude, { inputTokens: 11, outputTokens: 22, cacheReadTokens: 33, cacheWriteTokens: 44, costUsd: 0.75, numTurns: 3, durationMs: 150 })
+  t.equal(out.usage.tokensUsed, 110, 'the failed attempt\'s 100 tokens plus the retry\'s 10')
   t.end()
 })
 
@@ -2365,10 +2418,35 @@ export class AttemptFailure extends Error {
     message: string,
     readonly stalled: boolean,
     readonly activeMs: number,
-    readonly tokensUsed?: number
+    readonly tokensUsed?: number,
+    /** Claude's usage breakdown as far as the failed attempt got. */
+    readonly claude?: ClaudeUsageDetail
   ) {
     super(message)
     this.name = 'AttemptFailure'
+  }
+}
+
+/** Sum two optional token counts; unknown only when both are unknown. */
+function addTokens(a: number | undefined, b: number | undefined): number | undefined {
+  return a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0)
+}
+
+/** Sum two optional Claude usage breakdowns field by field; unknown only when both are unknown. */
+export function addClaudeUsage(
+  a: ClaudeUsageDetail | undefined,
+  b: ClaudeUsageDetail | undefined
+): ClaudeUsageDetail | undefined {
+  if (!a) return b
+  if (!b) return a
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    cacheReadTokens: a.cacheReadTokens + b.cacheReadTokens,
+    cacheWriteTokens: a.cacheWriteTokens + b.cacheWriteTokens,
+    costUsd: a.costUsd + b.costUsd,
+    numTurns: a.numTurns + b.numTurns,
+    durationMs: a.durationMs + b.durationMs,
   }
 }
 
@@ -2393,23 +2471,29 @@ export async function runWithStallRetries(
   const attempts = schedule.length > 0 ? schedule.length : 1
   const baseRunId = `${input.runId}.${engine}`
   let charged = 0
+  // Spend is charged across every attempt, like active time: a stalled attempt's tokens were
+  // consumed even though its result was discarded.
   let tokens: number | undefined
+  let claude: ClaudeUsageDetail | undefined
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const runId = attempt === 0 ? baseRunId : `${baseRunId}.retry${attempt}`
     if (deps.refreshAuth) await deps.refreshAuth()
     try {
       const ok = await attemptOnce(schedule[attempt], runId)
       charged += ok.activeMs
+      tokens = addTokens(tokens, ok.tokensUsed)
+      claude = addClaudeUsage(claude, ok.claude)
       return {
         engine,
         results: reconcileResultsV2(urls, ok.result).results,
-        usage: { tokensUsed: ok.tokensUsed, activeMs: charged, attempts: attempt + 1, ...(ok.claude ? { claude: ok.claude } : {}) },
+        usage: { tokensUsed: tokens, activeMs: charged, attempts: attempt + 1, ...(claude ? { claude } : {}) },
       }
     } catch (error) {
       const failure =
         error instanceof AttemptFailure ? error : new AttemptFailure(error instanceof Error ? error.message : String(error), false, 0)
       charged += failure.activeMs
-      if (failure.tokensUsed !== undefined) tokens = (tokens ?? 0) + failure.tokensUsed
+      tokens = addTokens(tokens, failure.tokensUsed)
+      claude = addClaudeUsage(claude, failure.claude)
       if (failure.stalled && attempt < attempts - 1) {
         deps.log?.('engine.retry', { engine, runId: baseRunId, attempt: attempt + 1, of: attempts })
         continue
@@ -2419,7 +2503,7 @@ export async function runWithStallRetries(
       return {
         engine,
         results: [],
-        usage: { tokensUsed: tokens, activeMs: charged > 0 ? charged : undefined, attempts: attempt + 1 },
+        usage: { tokensUsed: tokens, activeMs: charged > 0 ? charged : undefined, attempts: attempt + 1, ...(claude ? { claude } : {}) },
         error: redactSecrets(message),
       }
     }
@@ -2523,7 +2607,7 @@ export function makeClaudeEngine(config: ReviewConfig, deps: EngineDeps = {}): E
           } catch (error) {
             if (error instanceof ClaudeRunError) {
               const tokens = error.usage ? totalTokens(error.usage) : undefined
-              throw new AttemptFailure(error.message, error.kind === 'stall', error.activeMs, tokens)
+              throw new AttemptFailure(error.message, error.kind === 'stall', error.activeMs, tokens, error.usage)
             }
             throw error
           }
@@ -3145,6 +3229,7 @@ git commit -m "feat(gate): schedule engines in parallel or serial (refs andrew-b
   - `eligibilityFor(deps, pr, info, botLogin): Promise<{ eligibility; rulesReadable }>`
   - `preparePr(deps, pr, botLogin)`
   - `finishPr(deps, prepared, passes, botLogin)`
+  - `alreadyReviewedOutcome(decision, standing, pinnedSha): { outcome; reason; warnings }` (the honest outcome when a standing bot review at the pinned SHA skips posting; `DISMISSED` and `PENDING` reviews do not stand)
   - `combineUsage(outcomes): RunUsage`
   - `makeDualReviewRunner(deps): (request) => Promise<ReviewOutcome>`
 
@@ -3310,6 +3395,46 @@ test('dual runner skips posting when the bot already reviewed the pinned SHA', a
   const out = await run(deps(w))
   t.deepEqual(w.posted, [])
   t.equal(out.dual!.prs[0].alreadyReviewed, true)
+  t.equal(out.dual!.prs[0].outcome, 'approved', 'the standing approval is real, so approved is honest')
+  t.match(out.dual!.prs[0].reason ?? '', /already reviewed at aaaaaaa \(APPROVED\); that review stands/)
+  t.end()
+})
+
+// The skip must report what is on GitHub, not what would have been posted. Regression caught: an
+// earlier cleanNotCounted COMMENT at this SHA, then a permission change and a clean re-request,
+// reported `approved` (approval reaction, CLI success) although no approval was ever posted.
+test('dual runner never reports approved over a standing COMMENT at the pinned SHA', async t => {
+  const w = world([OLD], { botReviews: async () => [{ login: 'role-bot', commitId: OLD, state: 'COMMENTED' }] })
+  const out = await run(deps(w))
+  const pr = out.dual!.prs[0]
+  t.deepEqual(w.posted, [], 'nothing is posted')
+  t.equal(pr.alreadyReviewed, true)
+  t.equal(pr.outcome, 'cleanNotCounted', 'clean, but no approval exists at this SHA')
+  t.match(pr.reason ?? '', /\(COMMENTED\); that review stands.*No approval exists at this SHA/)
+  t.end()
+})
+
+// A dismissed approval no longer counts (GitHub's state is authoritative, spec 5.2), so it does not
+// block a re-request: the bot approves again at the same SHA. Regression caught: a dismissed
+// approval silently making the PR unapprovable until a new commit.
+test('dual runner re-posts when its earlier review at the pinned SHA was dismissed', async t => {
+  const w = world([OLD], { botReviews: async () => [{ login: 'role-bot', commitId: OLD, state: 'DISMISSED' }] })
+  const out = await run(deps(w))
+  t.deepEqual(w.posted.map(p => [p.event, p.commitId]), [['APPROVE', OLD]])
+  t.equal(out.dual!.prs[0].outcome, 'approved')
+  t.notOk(out.dual!.prs[0].alreadyReviewed)
+  t.end()
+})
+
+// The other direction: findings now, but an earlier approval at this SHA stands. Nothing is
+// posted (no double review) and Slack warns that the approval is still in effect.
+test('dual runner warns when findings meet a standing approval at the pinned SHA', async t => {
+  const w = world([OLD], { botReviews: async () => [{ login: 'role-bot', commitId: OLD, state: 'APPROVED' }] })
+  const out = await run(deps(w, [engine('codex', 'findings'), engine('claude')]))
+  const pr = out.dual!.prs[0]
+  t.deepEqual(w.posted, [])
+  t.equal(pr.outcome, 'findings')
+  t.match(pr.warnings.join('\n'), /earlier approval by the bot at aaaaaaa still stands/)
   t.end()
 })
 
@@ -3463,7 +3588,7 @@ Modify `src/engine.test.ts` (apply exactly):
 ```diff
 --- a/src/engine.test.ts
 +++ b/src/engine.test.ts
-@@ -138,3 +138,15 @@ test('an engine turns a crash into a redacted error', async t => {
+@@ -184,3 +184,15 @@ test('an engine turns a crash into a redacted error', async t => {
    t.notOk((out.error ?? '').includes('ghp_'), 'the token is redacted')
    t.end()
  })
@@ -3500,9 +3625,9 @@ Create `src/dual.ts`:
 // review with the approver token, and read the decision back. Implements the same
 // `runReview(request)` contract single mode does, so the job, queue and Slack frame are unchanged.
 
-import type { ApproverGitHub, PullRequestInfo } from './approver-github'
+import type { ApproverGitHub, BotReview, PullRequestInfo } from './approver-github'
 import type { EngineSchedule } from './config'
-import { composeReview, decide, type EnginePass, type PrOutcome } from './dual-gate'
+import { composeReview, decide, type EnginePass, type GateDecision, type PrOutcome } from './dual-gate'
 import type { Engine, EngineRunOutcome } from './engine'
 import { runEngines } from './engine-schedule'
 import { GhApiError, GH_COMMAND_TIMEOUT_MS } from './gh-api'
@@ -3662,6 +3787,44 @@ export async function preparePr(deps: DualDeps, pr: PullRequestRef, botLogin: st
   return { kind: 'ready', pr, pinnedSha: info.headSha.toLowerCase(), eligibility }
 }
 
+/**
+ * Bot review states that still stand on GitHub. A `DISMISSED` review is excluded: GitHub's own state
+ * is authoritative (spec 5.2), a dismissed approval no longer counts, and a re-request is a human
+ * asking again, so the bot may post a fresh review at the same SHA. That is not a double approval,
+ * because the earlier one is no longer in effect. A `PENDING` review was never submitted.
+ */
+const STANDING_STATES: ReadonlySet<string> = new Set(['APPROVED', 'COMMENTED', 'CHANGES_REQUESTED'])
+
+/**
+ * What to report when a standing bot review already exists at the pinned SHA, so nothing is posted.
+ * The outcome must describe what is on GitHub, not what would have been posted. An approval
+ * is reported only when an `APPROVED` review stands. If the gate would approve now but the
+ * standing review is a comment, for example an earlier `cleanNotCounted` before a permission
+ * change, nothing on GitHub approves the PR. That reports as `cleanNotCounted`: both engines
+ * are clean, and no counting approval exists.
+ */
+export function alreadyReviewedOutcome(
+  decision: GateDecision,
+  standing: BotReview[],
+  pinnedSha: string
+): { outcome: PrOutcome; reason: string; warnings: string[] } {
+  const states = [...new Set(standing.map(r => r.state))].join(', ')
+  const approvedStands = standing.some(r => r.state === 'APPROVED')
+  const stands = `already reviewed at ${short(pinnedSha)} (${states}); that review stands and nothing new was posted`
+  if (decision.event === 'APPROVE' && !approvedStands) {
+    return {
+      outcome: 'cleanNotCounted',
+      reason: `${stands}. No approval exists at this SHA; push a new commit to get one`,
+      warnings: [],
+    }
+  }
+  const warnings =
+    decision.event === 'COMMENT' && approvedStands
+      ? [`an earlier approval by the bot at ${short(pinnedSha)} still stands, although this review found ${decision.outcome === 'findings' ? 'blocking findings' : 'that the approval would not count'}`]
+      : []
+  return { outcome: decision.outcome, reason: stands, warnings }
+}
+
 /** Steps 5-8 of spec section 4: combine, head check, idempotency, post, read-back. */
 export async function finishPr(
   deps: DualDeps,
@@ -3688,9 +3851,8 @@ export async function finishPr(
 
   try {
     const earlier = await deps.gh.botReviews(pr, botLogin)
-    if (earlier.some(r => r.commitId.toLowerCase() === pinnedSha)) {
-      return { ...report, outcome: decision.outcome, alreadyReviewed: true }
-    }
+    const standing = earlier.filter(r => r.commitId.toLowerCase() === pinnedSha && STANDING_STATES.has(r.state))
+    if (standing.length) return { ...report, ...alreadyReviewedOutcome(decision, standing, pinnedSha), alreadyReviewed: true }
   } catch (error) {
     // Without the check a re-request could double-approve; post nothing instead.
     deps.log('dual.idempotency.failed', { pr: pr.url, error: errText(error) })
@@ -3839,7 +4001,7 @@ Modify `src/engine.ts` (apply exactly):
  }
  
  export interface EngineRunOutcome {
-@@ -131,8 +133,6 @@ export async function runWithStallRetries(
+@@ -162,8 +164,6 @@ export async function runWithStallRetries(
  
  export interface EngineDeps extends RetryDeps {
    registry?: ChildRegistry
@@ -3848,7 +4010,7 @@ Modify `src/engine.ts` (apply exactly):
    /** Injection seams for tests. */
    runCodex?: typeof runCodexReportOnly
    runClaude?: typeof runClaudeReview
-@@ -148,8 +148,8 @@ function prompt(engine: EngineName, input: EngineRunInput): string {
+@@ -179,8 +179,8 @@ function prompt(engine: EngineName, input: EngineRunInput): string {
    })
  }
  
@@ -3859,7 +4021,7 @@ Modify `src/engine.ts` (apply exactly):
  
  export function makeCodexEngine(config: ReviewConfig, deps: EngineDeps = {}): Engine {
    const runCodex = deps.runCodex ?? runCodexReportOnly
-@@ -177,7 +177,7 @@ export function makeCodexEngine(config: ReviewConfig, deps: EngineDeps = {}): En
+@@ -208,7 +208,7 @@ export function makeCodexEngine(config: ReviewConfig, deps: EngineDeps = {}): En
                logDir: config.runLogDir,
                runId,
                log: deps.log,
@@ -3868,7 +4030,7 @@ Modify `src/engine.ts` (apply exactly):
              })
              return { result: o.result, activeMs: o.activeMs, tokensUsed: o.tokensUsed }
            } catch (error) {
-@@ -218,7 +218,7 @@ export function makeClaudeEngine(config: ReviewConfig, deps: EngineDeps = {}): E
+@@ -249,7 +249,7 @@ export function makeClaudeEngine(config: ReviewConfig, deps: EngineDeps = {}): E
                logDir: config.runLogDir,
                runId,
                log: deps.log,
@@ -4111,7 +4273,7 @@ Modify `src/render.test.ts` (apply exactly):
  import type { PullRequestResult, ReviewRunResult } from './schema'
  
  function pr(url: string, status: PullRequestResult['status'], summary = ''): PullRequestResult {
-@@ -101,3 +101,45 @@ test('renderError names the unreviewed PRs and includes the failure', t => {
+@@ -101,3 +101,66 @@ test('renderError names the unreviewed PRs and includes the failure', t => {
    t.ok(text.includes('Codex exited with code 1'))
    t.end()
  })
@@ -4145,6 +4307,27 @@ Modify `src/render.test.ts` (apply exactly):
 +  t.ok(text.includes('_still needed: 1 more approval_'))
 +  t.ok(text.includes(':warning: pre-flight predicted more approvals were needed'))
 +  t.ok(text.includes('• <https://github.com/o/r/pull/2|o/r#2> — *blocked*\n    _update-branch was refused (HTTP 422)_'))
++  t.end()
++})
++
++// An idempotency skip says once, in the runner's reason, which earlier review stands. Regression
++// caught: the generic "already reviewed" line repeated under it.
++test('renderDualThread states an already-reviewed skip once', t => {
++  const text = renderDualThread({
++    prs: [
++      {
++        url: 'https://github.com/o/r/pull/1',
++        outcome: 'cleanNotCounted',
++        pinnedSha: 'a'.repeat(40),
++        passes: [],
++        alreadyReviewed: true,
++        reason: 'already reviewed at aaaaaaa (COMMENTED); that review stands and nothing new was posted',
++        warnings: [],
++      },
++    ],
++  })
++  t.equal(text.split('already reviewed').length - 1, 1)
++  t.ok(text.includes('*clean, approval would not count*'))
 +  t.end()
 +})
 +
@@ -4446,7 +4629,7 @@ Modify `src/render.ts` (apply exactly):
  import type { PullRequestResult, ReviewRunResult } from './schema'
  
  /** Which terminal reaction the outcome earns. */
-@@ -94,3 +96,50 @@ export function renderError(urls: string[], error: unknown): string {
+@@ -94,3 +96,51 @@ export function renderError(urls: string[], error: unknown): string {
      `\`\`\`\n${message.slice(0, 2500)}\n\`\`\``,
    ].join('\n\n')
  }
@@ -4480,7 +4663,8 @@ Modify `src/render.ts` (apply exactly):
 +  const lines = [head.join(' · ')]
 +  const sub = (text: string) => lines.push(`    ${text}`)
 +  if (pr.reason) sub(`_${pr.reason}_`)
-+  if (pr.alreadyReviewed && pr.pinnedSha) sub(`_already reviewed at \`${pr.pinnedSha.slice(0, 7)}\`; nothing new was posted_`)
++  // The runner's reason already says which earlier review stands; this is only the fallback.
++  if (pr.alreadyReviewed && pr.pinnedSha && !pr.reason) sub(`_already reviewed at \`${pr.pinnedSha.slice(0, 7)}\`; nothing new was posted_`)
 +  if (pr.eligibility && pr.eligibility.verdict !== 'counts') {
 +    for (const reason of pr.eligibility.reasons) sub(`_${reason}_`)
 +    if (pr.eligibility.missing.length) sub(`_still needed: ${pr.eligibility.missing.join('; ')}_`)
