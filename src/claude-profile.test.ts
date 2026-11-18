@@ -118,6 +118,32 @@ test('check-claude-profile rejects a missing deny rule for an operator secret di
   t.end()
 })
 
+// The engine's Edit/Write tools run in-process, outside the Bash sandbox's allowWrite pin, so the
+// profile dir needs its own Edit deny. Regression caught: untrusted PR content steering the engine
+// to rewrite its own settings.json, hook or skill, disabling the sandbox and denies for later runs.
+test('install-claude-profile denies Edit/Write into the profile dir', t => {
+  const { dir, run } = sandboxHome()
+  t.equal(run().status, 0)
+  const s = JSON.parse(fs.readFileSync(path.join(dir, 'settings.json'), 'utf8'))
+  t.ok(s.permissions.deny.includes(`Edit(/${dir}/**)`), 'Edit denied inside the profile dir')
+  t.ok(s.permissions.deny.includes(`Edit(/${dir})`), 'Edit denied on the profile dir itself')
+  t.notOk(s.permissions.deny.includes(`Read(/${dir}/**)`), 'the profile stays readable so Claude can load it')
+  t.end()
+})
+
+// The checker derives its required rules from the same rendering, so dropping either profile Edit
+// rule must fail --check. Regression caught: a hand-edited profile that silently reopens itself.
+test('check-claude-profile rejects a missing profile-dir Edit deny', t => {
+  for (const suffix of ['/**)', ')']) {
+    const out = checkMutated((s, dir) => {
+      s.permissions.deny = s.permissions.deny.filter((r: string) => r !== `Edit(/${dir}${suffix}`)
+    })
+    t.equal(out.status, 1, `missing Edit(/<profile>${suffix} fails`)
+    t.match(out.stderr, /permissions\.deny does not include Edit\(\/\/.*profile/)
+  }
+  t.end()
+})
+
 // excludedCommands run outside the sandbox, silently voiding denyRead and the write pin.
 test('check-claude-profile rejects sandbox.excludedCommands', t => {
   const out = checkMutated(s => (s.sandbox.excludedCommands = ['git']))

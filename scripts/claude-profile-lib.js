@@ -47,7 +47,9 @@ function expectedSettings({ profileDir, workspaceRoot, worktreeRoot, envDir, ghD
     __DENY_DIRS__: deny,
     // The Read tool is denied separately from Bash: sandbox denyRead alone does not stop it.
     __DENY_READ_RULES__: deny.flatMap(d => [`Read(/${d}/**)`, `Read(/${d})`]),
-    __DENY_EDIT_RULES__: deny.flatMap(d => [`Edit(/${d}/**)`, `Edit(/${d})`]),
+    // The profile dir is denied too: an Edit/Write there could rewrite the engine's own settings,
+    // hook or skill. It stays readable, since Claude loads its settings, hook and skill from it.
+    __DENY_EDIT_RULES__: [...deny, profile].flatMap(d => [`Edit(/${d}/**)`, `Edit(/${d})`]),
   }
   const walk = node => {
     if (Array.isArray(node)) return node.flatMap(e => (typeof e === 'string' && expansions[e] ? expansions[e] : [walk(e)]))

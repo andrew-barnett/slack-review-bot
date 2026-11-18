@@ -702,6 +702,7 @@ only in its own PR, after every item below is done and recorded on that issue:
    - No GitHub write is made by the engine: the throwaway PR gains no review, comment or push except the daemon's own single review.
    - Smoke test: the `Read` deny rules also stop the `Grep` and `Glob` tools from reading the denied directories (for example, instruct a `Grep` of a string over `~/.config/gh`). This is unverified; the profile denies `Read` in both the permission rules and the sandbox, and neither is known to cover `Grep` or `Glob`.
    - Smoke test: the `review-pr` skill source does not resolve (realpath) under `~/.claude` or `~/.codex`. Check with `realpath ~/.claude/skills/review-pr` and with `realpath` of each file it links to. Those directories are read-denied, so if the skill's files resolve there the engine cannot read its own skill.
+   - Smoke test: an Edit/Write into the profile dir is denied. Instruct the engine to create a file in the profile dir (`CLAUDE_CONFIG_DIR_REVIEW`, default `~/.claude-review-bot`, or the installer's `--dir`) with the Write tool and to edit its `settings.json` with the Edit tool. Expected: both are refused, they appear in the final `result` line's `permission_denials`, and `scripts/install-claude-profile.sh --check` still exits 0 afterwards.
    - Smoke test: a non-default `GH_CONFIG_DIR` that only the daemon's launchd environment sets is seen by the doctor's `claude profile` check. The installer reads `GH_CONFIG_DIR` from its own environment, and `npm run doctor` run from a shell may not have it; run doctor with the same `GH_CONFIG_DIR` as the LaunchAgent and confirm the profile's read-deny list names that directory.
 9. Then open the PR that sets `DUAL_MODE_AVAILABLE = true`.
 
@@ -709,6 +710,7 @@ The Claude profile (`claude/review-bot.settings.json.template`, rendered by the 
 deliberately narrow:
 
 - **Writes.** `sandbox.filesystem.allowWrite` is exactly `<WORKTREE_ROOT>/claude`. Package caches are redirected under that root through the child's environment (`XDG_CACHE_HOME`, `npm_config_cache`, `npm_config_store_dir`), so no grant to the operator's own caches is needed.
+- **Profile.** `Edit(...)` rules deny the in-process Edit and Write tools inside the profile dir itself, so the engine cannot rewrite its own settings, hook or skill. The profile stays readable, since Claude loads it.
 - **Reads.** Read is denied in both layers (the sandbox `denyRead` list for Bash, and `Read(...)` permission rules for the in-process Read tool) for `~/.ssh`, `~/.aws`, `~/.npmrc`, `~/.claude`, `~/.codex`, `~/.gnupg`, the `gh` config dir and the bot's env dir.
 - **Check.** `--check` compares the installed `settings.json` to the rendering by value. It allows the runtime state Claude Code writes into its config dir (`.claude.json`, `backups/`, `projects/`, `sessions/` and similar) but rejects MCP servers in `.claude.json`, and any other unknown file.
 
