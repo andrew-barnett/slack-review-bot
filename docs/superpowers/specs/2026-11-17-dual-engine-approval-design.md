@@ -97,7 +97,7 @@ The code is split into a pure evaluator and a fetch layer.
 | changed file paths | existing `listChangedFiles` (names only) |
 | bot permission | `GET /repos/{o}/{r}/collaborators/{bot}/permission` |
 | ruleset rules on base | `GET /repos/{o}/{r}/rules/branches/{base}` |
-| classic protection on base | `GET /repos/{o}/{r}/branches/{base}/protection`, **readability to be verified** (V1) |
+| classic protection on base | `GET /repos/{o}/{r}/branches/{base}/protection`, readable with Administration: read (V1) |
 | CODEOWNERS | first of `.github/CODEOWNERS`, `CODEOWNERS`, `docs/CODEOWNERS` at `ref={base}` via the contents API |
 | CODEOWNERS validity | `GET /repos/{o}/{r}/codeowners/errors?ref={base}` |
 | team membership | `GET /orgs/{org}/teams/{slug}/memberships/{bot}` (state `active`) for each `@org/team` owner the evaluator needs |
@@ -326,7 +326,7 @@ Until the skill ships report-only mode, dual mode stays behind `REVIEW_ENGINES`,
 
 ## 8. Verification items (spike before the dependent sub-issues)
 
-- **V1.** With the role PAT, what is readable: `branches/{b}/protection` (classic protection normally needs admin), `rules/branches/{b}`, team memberships (`read:org`, and secret teams), `codeowners/errors`, the repository activity API for the latest pusher? If classic protection is unreadable to a write-level account, rule 7 would make every classically protected repo `wontCount`. The fallback is decided with the user before 5.2 is built. Candidates: GraphQL `baseRef.branchProtectionRule` readability, or classifying "classic protection unreadable" as `partial` with a reason instead of `wontCount`.
+- **V1.** Settled in part (https://github.com/andrew-barnett/slack-review-bot/issues/54): the role account has admin, so classic branch protection is readable. Still to confirm with the real fine-grained token: Administration: read suffices for classic protection, secret-team membership reads, `codeowners/errors`, and the repository activity API for the latest pusher.
 - **V2.** Claude Code headless: structured-output flag, stream-JSON progress events, the permission mode that never prompts, sandbox config for the worktree root, and auth (a subscription token from `claude setup-token` passed as `CLAUDE_CODE_OAUTH_TOKEN`, or an API key). Bedrock and Vertex are excluded, because their cloud keys would sit in the engine env. `--json-schema` is confirmed present in Claude Code 2.1.284.
 - **V3.** Whether update-branch attributes the push to the token user, and how it interacts with `require_last_push_approval` and `dismiss_stale_reviews_on_push`.
 - **V4.** How `doctor` can confirm the engine token is read-only without writing anything: fine-grained token permissions, or classic `X-OAuth-Scopes`.

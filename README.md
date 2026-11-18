@@ -656,6 +656,13 @@ All optional except the two tokens.
 | `USAGE_REPLY_ENABLED` | `true` | Post a per-review usage line (tokens, active time, attempts) as a thread reply on every completed review. Off silences the reply; the `status` token totals are kept either way. |
 | `SLACK_REQUEST_TIMEOUT_MS` | `30000` | Per-request timeout for the bot's Slack Web API calls. The WebClient defaults to no timeout, so a wedged `conversations.history` could hang the catch-up forever; this caps it, paired with a five-minute bounded retry policy. |
 | `CODEX_ENV_PASSTHROUGH` | *(none)* | Extra environment variable names (comma/space separated) to pass through to the Codex child on top of the built-in allowlist. Keep minimal — anything added is visible to model-generated commands and untrusted PR code. |
+| `REVIEW_ENGINES` | `codex` | `codex` (single engine, today's behaviour) or `codex,claude` (dual-engine approval gate; not available until the orchestrator ships). |
+| `ENGINE_SCHEDULE` | `parallel` | Dual mode: `parallel` or `serial`. |
+| `ENGINE_ORDER` | `codex,claude` | Dual mode, serial: the order the engines run in. |
+| `APPROVER_GH_TOKEN` | *(none)* | Dual mode: the role account's fine-grained PAT (Administration: read, Contents: write, Pull requests: write, Metadata: read, org Members: read). Held by the daemon only; never passed to a review child, and dropped even if named in `CODEX_ENV_PASSTHROUGH`. |
+| `ENGINE_GH_TOKEN` | *(none)* | Dual mode: the role account's read-only token, given to review engines as `GH_TOKEN`. Must differ from `APPROVER_GH_TOKEN`. |
+| `CLAUDE_BIN` | `claude` | Dual mode: the Claude Code binary. |
+| `CLAUDE_CONFIG_DIR_REVIEW` | `~/.claude-review-bot` | Dual mode: the dedicated Claude config dir for the engine. |
 | `SHUTDOWN_DRAIN_MS` | `5000` | On SIGINT/SIGTERM, how long to wait for an in-flight review to settle before force-killing it (it then replays on the next start, with no error thread). See [Shutting down](#shutting-down). Keep below the supervisor's kill timeout so children are reaped before a SIGKILL orphans them. |
 | `CODEARTIFACT_REFRESH` | `true` | Refresh the AWS CodeArtifact npm token before each review, so a review's `npm ci` authenticates instead of failing with E401 on a token the long-lived daemon has let expire. See [Private registry auth](#private-registry-auth). Turn off for an install with no private registry. |
 | `CODEARTIFACT_LOGIN_SCRIPT` | *(vendored `scripts/codeartifact-login.sh`)* | Path to the login script the refresh runs. Defaults to the vendored copy resolved relative to the bot; override to point at a different one. |
