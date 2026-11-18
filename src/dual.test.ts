@@ -329,6 +329,78 @@ test('dual runner treats an unlistable diff as wontCount and comments instead of
   t.end()
 })
 
+// Narrow approve race: the head can move after the first re-read, during the idempotency and diff
+// reads. Regression caught: an APPROVE at the old pinned SHA after a push in that window. Heads are
+// [pre-flight, first check, pre-post check].
+test('dual runner posts nothing when the head moves between the first check and posting', async t => {
+  const w = world([OLD, OLD, NEW])
+  const out = await run(deps(w))
+  t.equal(out.dual!.prs[0].outcome, 'headMoved')
+  t.match(out.dual!.prs[0].reason ?? '', /aaaaaaa → bbbbbbb/)
+  t.deepEqual(w.posted, [])
+  t.end()
+})
+
+// A failed pre-post head read cannot confirm the pinned SHA, so nothing is posted.
+test('dual runner posts nothing when the pre-post head read fails', async t => {
+  let call = 0
+  const w = world([OLD], {
+    getPullRequest: async () => {
+      if (++call === 3) throw new Error('HTTP 502')
+      return info(OLD)
+    },
+  })
+  const out = await run(deps(w))
+  t.equal(out.dual!.prs[0].outcome, 'error')
+  t.match(out.dual!.prs[0].reason ?? '', /just before posting/)
+  t.deepEqual(w.posted, [])
+  t.end()
+})
+
+// The same PR pasted twice (URL case differs) must be reviewed, posted and reported once.
+// Regression caught: a double review and a double approval attempt for one PR.
+test('dual runner reviews a PR listed twice only once', async t => {
+  const w = world()
+  const codex = engine('codex')
+  const dup: ReviewRequest = { ...request, prs: [request.prs[0], { ...request.prs[0], url: URL1.toUpperCase() }] }
+  const out = await makeDualReviewRunner(deps(w, [codex, engine('claude')]))(dup)
+  t.equal(codex.calls[0].prs.length, 1)
+  t.equal(out.dual!.prs.length, 1)
+  t.equal(w.posted.length, 1)
+  t.end()
+})
+
+// One PR's unexpected failure must not lose the other PR's report or the usage. Regression caught:
+// a throw in finishPr for PR 2 rejecting the whole run after PR 1 had already been approved.
+test('dual runner isolates a throw while finishing one PR', async t => {
+  const URL2 = 'https://github.com/o/r/pull/2'
+  const two: ReviewRequest = { ...request, prs: [request.prs[0], { owner: 'o', repo: 'r', number: 2, url: URL2 }] }
+  const w = world([OLD], {
+    postReview: async (pr: { number: number }) => {
+      if (pr.number === 2) throw new Error('boom')
+      return { id: 1, url: 'https://github.com/o/r/pull/1#pullrequestreview-1' }
+    },
+  } as Partial<ApproverGitHub>)
+  const d = deps(w, undefined, {
+    log: event => {
+      if (event === 'dual.post.failed') throw new Error('log sink broke')
+    },
+  })
+  const out = await makeDualReviewRunner(d)(two)
+  t.deepEqual(out.dual!.prs.map(p => p.outcome), ['approved', 'error'], 'PR 1 keeps its report')
+  t.equal(out.usage.tokensUsed, 200, 'usage survives')
+  t.end()
+})
+
+// A failed behindBy compare skips the update; the user must see that base freshness was unchecked.
+test('dual runner warns when the base freshness could not be checked', async t => {
+  const w = world([OLD], { behindBy: async () => { throw new Error('HTTP 502') } })
+  const out = await run(deps(w))
+  t.match(out.dual!.prs[0].warnings.join('\n'), /could not check whether the base moved/)
+  t.deepEqual(w.updates, [])
+  t.end()
+})
+
 // Per-engine usage survives the combination for the Slack usage line and the status totals.
 test('combineUsage sums tokens and active time and keeps each engine', t => {
   const u = combineUsage([

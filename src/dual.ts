@@ -56,7 +56,7 @@ export interface DualDeps {
 }
 
 type Prepared =
-  | { kind: 'ready'; pr: PullRequestRef; pinnedSha: string; eligibility: Eligibility }
+  | { kind: 'ready'; pr: PullRequestRef; pinnedSha: string; eligibility: Eligibility; warnings: string[] }
   | { kind: 'blocked'; pr: PullRequestRef; reason: string; eligibility?: Eligibility }
 
 const errText = (error: unknown) => (error instanceof Error ? error.message : String(error))
@@ -123,12 +123,14 @@ export async function preparePr(deps: DualDeps, pr: PullRequestRef, botLogin: st
   const first = await eligibilityFor(deps, pr, info, botLogin)
   let eligibility = first.eligibility
 
+  const warnings: string[] = []
   let behind: number | undefined
   try {
     behind = await deps.gh.behindBy(pr, info.base, info.headSha)
   } catch (error) {
     // Unknown: the engines still check the base themselves and report `stale base`.
     deps.log('dual.compare.failed', { pr: pr.url, error: errText(error) })
+    warnings.push('could not check whether the base moved, so the branch was not updated and base freshness is unchecked')
   }
   if (behind !== undefined && behind > 0) {
     if (eligibility.lastPushApproval) {
@@ -163,7 +165,7 @@ export async function preparePr(deps: DualDeps, pr: PullRequestRef, botLogin: st
     // unverified, so this re-run is also what keeps a wrong assumption failing closed.
     eligibility = (await eligibilityFor(deps, pr, info, botLogin)).eligibility
   }
-  return { kind: 'ready', pr, pinnedSha: info.headSha.toLowerCase(), eligibility }
+  return { kind: 'ready', pr, pinnedSha: info.headSha.toLowerCase(), eligibility, warnings }
 }
 
 /**
@@ -212,7 +214,7 @@ export async function finishPr(
   botLogin: string
 ): Promise<DualPrReport> {
   const { pr, pinnedSha, eligibility } = prepared
-  const report: DualPrReport = { url: pr.url, outcome: 'error', pinnedSha, eligibility, passes, warnings: [] }
+  const report: DualPrReport = { url: pr.url, outcome: 'error', pinnedSha, eligibility, passes, warnings: [...prepared.warnings] }
 
   let live: string
   try {
@@ -231,7 +233,10 @@ export async function finishPr(
   try {
     const earlier = await deps.gh.botReviews(pr, botLogin)
     const standing = earlier.filter(r => r.commitId.toLowerCase() === pinnedSha && STANDING_STATES.has(r.state))
-    if (standing.length) return { ...report, ...alreadyReviewedOutcome(decision, standing, pinnedSha), alreadyReviewed: true }
+    if (standing.length) {
+      const skipped = alreadyReviewedOutcome(decision, standing, pinnedSha)
+      return { ...report, ...skipped, warnings: [...report.warnings, ...skipped.warnings], alreadyReviewed: true }
+    }
   } catch (error) {
     // Without the check a re-request could double-approve; post nothing instead.
     deps.log('dual.idempotency.failed', { pr: pr.url, error: errText(error) })
@@ -246,6 +251,16 @@ export async function finishPr(
     report.warnings.push('could not read the diff lines, so every finding is in the review body')
   }
   const { body, comments } = composeReview({ pinnedSha, passes, eligibility, outcome: decision.outcome, commentable })
+  // Narrow the approve race: a push during the reads above must not get an APPROVE at the old SHA.
+  try {
+    const current = (await deps.gh.getPullRequest(pr)).headSha.toLowerCase()
+    if (current !== pinnedSha) {
+      return { ...report, outcome: 'headMoved', reason: `head moved during review (${short(pinnedSha)} → ${short(current)}); re-request` }
+    }
+  } catch (error) {
+    deps.log('dual.head.reread_failed', { pr: pr.url, error: errText(error) })
+    return { ...report, outcome: 'error', reason: 'could not re-read the head just before posting; nothing was posted' }
+  }
   try {
     const posted = await deps.gh.postReview(pr, { commitId: pinnedSha, event: decision.event, body, comments })
     report.reviewUrl = posted.url
@@ -302,6 +317,14 @@ export function makeDualReviewRunner(deps: DualDeps): (request: ReviewRequest) =
   return async request => {
     const runId = deps.runIdFor(request)
     const key = `${request.message.channel}/${request.message.ts}`
+    // The same PR pasted twice must be reviewed and reported once.
+    const seen = new Set<string>()
+    const prList = request.prs.filter(pr => {
+      const id = pr.url.toLowerCase()
+      if (seen.has(id)) return false
+      seen.add(id)
+      return true
+    })
     const reports = new Map<string, DualPrReport>()
     let outcomes: EngineRunOutcome[] = []
 
@@ -312,12 +335,12 @@ export function makeDualReviewRunner(deps: DualDeps): (request: ReviewRequest) =
       deps.log('dual.login.failed', { runId, error: errText(error) })
     }
     if (!botLogin) {
-      for (const pr of request.prs) {
+      for (const pr of prList) {
         reports.set(pr.url, { url: pr.url, outcome: 'error', passes: [], warnings: [], reason: 'could not authenticate as the role account (APPROVER_GH_TOKEN)' })
       }
     } else {
       const prepared: Prepared[] = []
-      for (const pr of request.prs) prepared.push(await preparePr(deps, pr, botLogin))
+      for (const pr of prList) prepared.push(await preparePr(deps, pr, botLogin))
       const ready = prepared.filter((p): p is Extract<Prepared, { kind: 'ready' }> => p.kind === 'ready')
       for (const p of prepared) {
         if (p.kind === 'blocked') reports.set(p.pr.url, { url: p.pr.url, outcome: 'blocked', eligibility: p.eligibility, passes: [], warnings: [], reason: p.reason })
@@ -332,11 +355,19 @@ export function makeDualReviewRunner(deps: DualDeps): (request: ReviewRequest) =
           onProgress: deps.reviews ? (line, activeMs) => deps.reviews!.output(key, line, activeMs) : undefined,
         })
         outcomes = run.outcomes
-        for (const r of ready) reports.set(r.pr.url, await finishPr(deps, r, run.passes.get(r.pr.url) ?? [], botLogin))
+        for (const r of ready) {
+          try {
+            reports.set(r.pr.url, await finishPr(deps, r, run.passes.get(r.pr.url) ?? [], botLogin))
+          } catch (error) {
+            // One PR's failure must not lose the other PRs' reports or the usage.
+            deps.log('dual.finish.failed', { runId, pr: r.pr.url, error: errText(error) })
+            reports.set(r.pr.url, { url: r.pr.url, outcome: 'error', pinnedSha: r.pinnedSha, eligibility: r.eligibility, passes: run.passes.get(r.pr.url) ?? [], warnings: [...r.warnings], reason: 'finishing the review failed unexpectedly; nothing was posted' })
+          }
+        }
       }
     }
 
-    const prs = request.prs.map(pr => reports.get(pr.url)!)
+    const prs = prList.map(pr => reports.get(pr.url)!)
     deps.log('dual.done', { runId, outcomes: prs.map(r => `${r.url}=${r.outcome}`) })
     return { result: { results: prs.map(legacyResult) }, usage: combineUsage(outcomes), dual: { prs } }
   }
