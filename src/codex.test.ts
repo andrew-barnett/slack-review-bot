@@ -1028,7 +1028,7 @@ async function spawnedEnvWith(vars: Record<string, string>, options: Record<stri
 test('runCodexReview never gives the child the approver or engine token', async t => {
   const seen = await spawnedEnvWith(
     { APPROVER_GH_TOKEN: 'approver-placeholder', ENGINE_GH_TOKEN: 'engine-placeholder' },
-    { envPassthrough: ['APPROVER_GH_TOKEN'] }
+    { envPassthrough: ['APPROVER_GH_TOKEN', 'ENGINE_GH_TOKEN'] }
   )
   t.ok(seen, 'the child was spawned')
   t.notOk('APPROVER_GH_TOKEN' in (seen ?? {}), 'the approver token is absent')
