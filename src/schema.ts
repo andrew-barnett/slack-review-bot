@@ -328,12 +328,15 @@ function validateResultV2(entry: unknown, index: number): EnginePrResult {
     throw new Error(`${where} has verdict clean with a blocking finding`)
   }
   return {
-    url: item.url,
+    url: item.url.trim(),
     reviewedSha,
     verdict,
     findings,
     summary: item.summary.trim(),
-    environmentProblems: (item.environmentProblems as string[]).map(p => p.trim()).filter(Boolean),
+    environmentProblems: (item.environmentProblems as string[]).map(p => {
+      const trimmed = p.trim()
+      return trimmed || 'the engine reported a blank environment problem'
+    }),
   }
 }
 
@@ -341,13 +344,36 @@ function validateResultV2(entry: unknown, index: number): EnginePrResult {
  * Force an engine's results to cover exactly the requested PRs, in order. A PR the engine did not
  * report gets an entry with an environment problem, so it reads as an invalid pass (spec 5.8),
  * never as clean and never silently dropped. Extra entries for URLs nobody asked about are dropped:
- * the gate acts only on requested PRs.
+ * the gate acts only on requested PRs. Duplicate URLs (case-insensitive) are marked blocked to
+ * prevent a conflicting verdict from silently overwriting an earlier one.
  */
 export function reconcileResultsV2(requestedUrls: string[], result: EngineRunResult): EngineRunResult {
-  const byUrl = new Map(result.results.map(entry => [entry.url.toLowerCase(), entry]))
+  // Track which URLs we've seen (case-insensitive) and detect duplicates.
+  const urlCount = new Map<string, number>()
+  const byUrl = new Map<string, EnginePrResult>()
+  for (const entry of result.results) {
+    const lowerUrl = entry.url.toLowerCase()
+    urlCount.set(lowerUrl, (urlCount.get(lowerUrl) ?? 0) + 1)
+    byUrl.set(lowerUrl, entry)
+  }
+
   return {
     results: requestedUrls.map(url => {
-      const found = byUrl.get(url.toLowerCase())
+      const lowerUrl = url.toLowerCase()
+      const found = byUrl.get(lowerUrl)
+
+      // If the engine reported this URL more than once, mark it blocked.
+      if (found && (urlCount.get(lowerUrl) ?? 0) > 1) {
+        return {
+          url,
+          reviewedSha: '',
+          verdict: 'blocked',
+          findings: [],
+          summary: '',
+          environmentProblems: ['the engine reported this pull request more than once'],
+        }
+      }
+
       if (found) return { ...found, url }
       return {
         url,

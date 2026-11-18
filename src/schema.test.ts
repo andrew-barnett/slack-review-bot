@@ -1,6 +1,6 @@
 import test from 'tape'
 import { parseReviewResult, parseReviewResultV2, reconcileResults, reconcileResultsV2, REVIEW_OUTPUT_SCHEMA, REVIEW_OUTPUT_SCHEMA_V2 } from './schema'
-import type { PullRequestResult } from './schema'
+import type { PullRequestResult, EngineRunResult } from './schema'
 
 function entry(url: string, status: PullRequestResult['status'] = 'passed'): PullRequestResult {
   return { url, status, summary: '', pushedTestCommits: false, reviewUrl: '' }
@@ -200,5 +200,46 @@ test('REVIEW_OUTPUT_SCHEMA_V2 is strict-mode clean at every level', t => {
   check(REVIEW_OUTPUT_SCHEMA_V2, 'root')
   check(item, 'result')
   check(item.properties.findings.items, 'finding')
+  t.end()
+})
+
+// Duplicate engine URLs are a fail-open: the Map silently keeps only the last entry, so
+// conflicting verdicts (e.g. findings then clean for the same PR) change the result. The gate
+// must mark such duplicates blocked so they are never approved. Regression: an earlier findings
+// entry for a PR was silently replaced by a later clean verdict for the same URL in different case.
+test('reconcileResultsV2 marks duplicate URLs as blocked', t => {
+  const findings_result: EngineRunResult = {
+    results: [
+      { url: 'https://github.com/o/r/pull/1', reviewedSha: SHA, verdict: 'findings', findings: [{ severity: 'blocking', file: 'src/a.ts', line: 1, body: 'bug' }], summary: 'has bugs', environmentProblems: [] },
+      { url: 'https://github.com/O/R/pull/1', reviewedSha: SHA, verdict: 'clean', findings: [], summary: '', environmentProblems: [] },
+    ]
+  }
+  const r = reconcileResultsV2(['https://github.com/o/r/pull/1'], findings_result)
+  t.equal(r.results.length, 1)
+  t.equal(r.results[0].verdict, 'blocked', 'duplicate URLs marked blocked')
+  t.equal(r.results[0].reviewedSha, '', 'reviewedSha cleared')
+  t.deepEqual(r.results[0].findings, [], 'findings cleared')
+  t.deepEqual(r.results[0].environmentProblems, ['the engine reported this pull request more than once'], 'environment problem set')
+  t.end()
+})
+
+// Blank (empty or whitespace) environment problems are currently dropped, losing the signal
+// that the engine reported them. This is a fail-open: a blank problem read as "no problems".
+// Keep the problem as a placeholder string so the entry never approves. Regression: an engine
+// that crashed trying to record a problem left `environmentProblems: ["  "]`, which silently
+// became [], making the entry valid when it should block.
+test('parseReviewResultV2 preserves blank environment problems', t => {
+  const r = parseReviewResultV2(v2({ environmentProblems: ['  '] }))
+  t.equal(r.results[0].environmentProblems.length, 1)
+  t.equal(r.results[0].environmentProblems[0], 'the engine reported a blank environment problem', 'blank problem becomes placeholder')
+  t.end()
+})
+
+// URL trailing whitespace should not prevent matching the requested PR. Trim both the parsed
+// URL and the requested URL in reconciliation so "https://github.com/o/r/pull/1 " matches
+// the request for "https://github.com/o/r/pull/1".
+test('parseReviewResultV2 trims the URL', t => {
+  const r = parseReviewResultV2(v2({ url: 'https://github.com/o/r/pull/1 ' }))
+  t.equal(r.results[0].url, 'https://github.com/o/r/pull/1')
   t.end()
 })
