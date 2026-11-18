@@ -154,14 +154,73 @@ test('parsePatchLines returns RIGHT-side added and context lines', t => {
 
 // The latest-push record must be for the current head. The activity API can lag, and a stale
 // record would misjudge require_last_push_approval (Review Focus 4). The fetch layer compares
-// afterSha with the head; this test pins that the field is populated.
+// afterSha with the head; this test pins that the field is populated and that the query carries
+// no activity_type filter.
 test('latestPush returns actor, time and after-SHA of the newest push', async t => {
   const { calls, run } = recorder({
-    'repos/o/r/activity?ref=refs%2Fheads%2Ffeat%2Fx&activity_type=push&per_page=1':
-      '[{"actor":{"login":"dev"},"timestamp":"2026-11-17T10:00:00Z","after":"c0ffee"}]',
+    'repos/o/r/activity?ref=refs%2Fheads%2Ffeat%2Fx&per_page=1':
+      '[{"activity_type":"push","actor":{"login":"dev"},"timestamp":"2026-11-17T10:00:00Z","after":"c0ffee"}]',
   })
   const push = await makeApproverGitHub('tok', run).latestPush(pr, 'feat/x')
   t.deepEqual(push, { actor: 'dev', at: '2026-11-17T10:00:00Z', afterSha: 'c0ffee' })
-  t.ok(calls[0].args.includes('repos/o/r/activity?ref=refs%2Fheads%2Ffeat%2Fx&activity_type=push&per_page=1'))
+  t.ok(calls[0].args.includes('repos/o/r/activity?ref=refs%2Fheads%2Ffeat%2Fx&per_page=1'))
+  t.end()
+})
+
+// A force push is reported as `force_push`. Plan 1 filtered on activity_type=push, which skipped it
+// and named an older pusher as the latest (V1 spike). Regression caught: a force-pushed branch
+// reading as "pushed by someone else", so the last-push rule is misjudged.
+test('latestPush accepts a force push as the latest push', async t => {
+  const { run } = recorder({
+    'repos/o/r/activity?ref=refs%2Fheads%2Ffeat%2Fx&per_page=1':
+      '[{"activity_type":"force_push","actor":{"login":"dev"},"timestamp":"2026-11-17T11:00:00Z","after":"beef"}]',
+  })
+  t.deepEqual(await makeApproverGitHub('tok', run).latestPush(pr, 'feat/x'), { actor: 'dev', at: '2026-11-17T11:00:00Z', afterSha: 'beef' })
+  t.end()
+})
+
+// Any other newest activity (a merge, a branch creation) says nothing reliable about who pushed
+// the head, so it reads as no record and the pre-flight reports the latest pusher as unverifiable.
+// Regression caught: a pr_merge actor being taken for the latest pusher.
+test('latestPush returns null when the newest activity is not a push', async t => {
+  const { run } = recorder({
+    'repos/o/r/activity?ref=refs%2Fheads%2Ffeat%2Fx&per_page=1':
+      '[{"activity_type":"pr_merge","actor":{"login":"dev"},"timestamp":"2026-11-17T11:00:00Z","after":"beef"}]',
+  })
+  t.equal(await makeApproverGitHub('tok', run).latestPush(pr, 'feat/x'), null)
+  t.end()
+})
+
+// update-branch runs only when the base has moved (spec 5.3), measured by behind_by. A slash in
+// the base name must stay a path separator. Regression caught: `release/1.2` sent as `release%2F1.2`.
+test('behindBy reads behind_by from the compare API, keeping slashes in the base', async t => {
+  const sha = 'a'.repeat(40)
+  const { calls, run } = recorder({ [`repos/o/r/compare/release/1.2...${sha}`]: '{"behind_by":3,"ahead_by":1}' })
+  t.equal(await makeApproverGitHub('tok', run).behindBy(pr, 'release/1.2', sha), 3)
+  t.deepEqual(calls[0].args, ['api', `repos/o/r/compare/release/1.2...${sha}`])
+  t.end()
+})
+
+// A compare response without behind_by must not read as "not behind": that would skip a needed
+// branch update. It rejects, and the orchestrator treats the base as unknown.
+test('behindBy rejects a response with no behind_by', async t => {
+  const sha = 'b'.repeat(40)
+  const { run } = recorder({ [`repos/o/r/compare/main...${sha}`]: '{}' })
+  await makeApproverGitHub('tok', run).behindBy(pr, 'main', sha).then(
+    () => t.fail('should reject'),
+    error => t.match(String(error), /behind_by/)
+  )
+  t.end()
+})
+
+// In dual mode the human-gate comment is posted as the role account (spec 5.7), with the body on
+// stdin and the approver token per call. Regression caught: the comment going out under the
+// operator's own login, or its body passing through argv.
+test('postIssueComment posts the body on stdin with the approver token', async t => {
+  const { calls, run } = recorder({ 'repos/o/r/issues/5/comments': '{"id":1}' })
+  await makeApproverGitHub('approver-placeholder', run).postIssueComment(pr, 'human review needed')
+  t.deepEqual(calls[0].args, ['api', 'repos/o/r/issues/5/comments', '--method', 'POST', '--input', '-'])
+  t.deepEqual(JSON.parse(calls[0].opts?.input ?? '{}'), { body: 'human review needed' })
+  t.equal(calls[0].opts?.env?.GH_TOKEN, 'approver-placeholder')
   t.end()
 })

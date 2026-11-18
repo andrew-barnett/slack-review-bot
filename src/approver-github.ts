@@ -24,7 +24,12 @@ export interface ApproverGitHub {
   codeownersErrorCount(pr: PullRequestRef, ref: string): Promise<number | null>
   isTeamMember(org: string, team: string, login: string): Promise<boolean>
   reviews(pr: PullRequestRef): Promise<ReviewFact[]>
-  latestPush(pr: PullRequestRef, headRef: string): Promise<LatestPush | null>          // null = no record
+  /** The newest push or force push on the head ref; null when the newest activity is anything else, or there is none. */
+  latestPush(pr: PullRequestRef, headRef: string): Promise<LatestPush | null>
+  /** How many commits the base branch has that `headSha` lacks (`behind_by` of the compare API). */
+  behindBy(pr: PullRequestRef, base: string, headSha: string): Promise<number>
+  /** Post a PR-level (issue) comment as the role account; the body goes over stdin. */
+  postIssueComment(pr: PullRequestRef, body: string): Promise<void>
   commentableLines(pr: PullRequestRef): Promise<Map<string, Set<number>>>
   updateBranch(pr: PullRequestRef, expectedHeadSha: string): Promise<{ ok: true } | { ok: false; status: number | undefined }>
   postReview(pr: PullRequestRef, review: { commitId: string; event: 'APPROVE' | 'COMMENT'; body: string; comments: ReviewComment[] }): Promise<PostedReview>
@@ -168,13 +173,28 @@ export function makeApproverGitHub(token: string, run: GhRunner = defaultRunner(
       return out
     },
     async latestPush(pr, headRef) {
+      // No activity_type filter: a force push is reported as `force_push`, not `push`, so a
+      // filtered query would skip it and report an older push as the latest (V1 spike, issue 54).
+      // Read the newest activity of any type and accept it only when it is a push of either kind.
       const ref = encodeURIComponent(`refs/heads/${headRef}`)
-      const items = await ghApi<{ actor: { login: string } | null; timestamp: string; after: string }[]>(
+      const items = await ghApi<{ activity_type: string; actor: { login: string } | null; timestamp: string; after: string }[]>(
         asApprover,
-        `${repoPath(pr)}/activity?ref=${ref}&activity_type=push&per_page=1`
+        `${repoPath(pr)}/activity?ref=${ref}&per_page=1`
       )
       const top = items[0]
-      return top && top.actor ? { actor: top.actor.login, at: top.timestamp, afterSha: top.after } : null
+      if (!top || !top.actor) return null
+      if (top.activity_type !== 'push' && top.activity_type !== 'force_push') return null
+      return { actor: top.actor.login, at: top.timestamp, afterSha: top.after }
+    },
+    async behindBy(pr, base, headSha) {
+      // Branch names may contain slashes; encode each segment, never the separators.
+      const baseRef = base.split('/').map(encodeURIComponent).join('/')
+      const r = await ghApi<{ behind_by?: number }>(asApprover, `${repoPath(pr)}/compare/${baseRef}...${headSha}`)
+      if (typeof r?.behind_by !== 'number') throw new Error('compare response has no behind_by')
+      return r.behind_by
+    },
+    async postIssueComment(pr, body) {
+      await ghApi(asApprover, `${repoPath(pr)}/issues/${pr.number}/comments`, { method: 'POST', body: { body } })
     },
     async commentableLines(pr) {
       const files = await ghApiLines<{ filename: string; patch?: string }>(asApprover, `${repoPath(pr)}/pulls/${pr.number}/files?per_page=100`)
