@@ -302,3 +302,25 @@ test('resolveBedrockAuth throws when no credential source is configured', async 
   }
   t.end()
 })
+
+// STS rejects a second AssumeRole hop above one hour even if the target role allows four hours.
+test('resolveBedrockAuth supports an assumed-role source with the default run timeout', async t => {
+  const response = stsExec()
+  const exec: Exec = async (file, args) => {
+    const seconds = Number(args[args.indexOf('--duration-seconds') + 1])
+    if (seconds > 3600) {
+      throw Object.assign(new Error('ValidationError'), {
+        code: 254,
+        stderr: 'The requested DurationSeconds exceeds the 1 hour session limit for roles assumed by role chaining.',
+      })
+    }
+    return response.exec(file, args)
+  }
+  try {
+    const auth = await resolveBedrockAuth(bedrockConfig({ ENGINE_AWS_PROFILE: 'operator-role' }), 'codex', 'chained', exec)
+    t.equal(auth.credentials.accessKeyId, KEY_ID, 'credentials reach the engine')
+  } catch (error) {
+    t.fail((error as Error).message)
+  }
+  t.end()
+})
