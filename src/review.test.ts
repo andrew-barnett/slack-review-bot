@@ -324,6 +324,77 @@ test('makeReviewRunner runs without a refresh hook', async t => {
   t.end()
 })
 
+// ENGINE_AUTH (issue #69): single mode mints Bedrock credentials per attempt, after the registry
+// refresh, keyed by the attempt's runId, so a stall retry gets a fresh session.
+test('makeReviewRunner resolves Bedrock auth before every attempt and passes it to Codex', async t => {
+  const order: string[] = []
+  const engineAuth = async (engine: 'codex' | 'claude', runId: string) => {
+    order.push(`auth:${engine}:${runId}`)
+    return { region: 'us-east-2', model: 'm', credentials: { accessKeyId: runId, secretAccessKey: 'fake-secret-' + 'xyz' } }
+  }
+  const seen: string[] = []
+  let calls = 0
+  const fakeRun: typeof runCodexReview = async opts => {
+    order.push('codex')
+    seen.push(opts.bedrock?.credentials.accessKeyId ?? 'none')
+    calls += 1
+    if (calls < 2) throw stall(opts.stallTimeoutMs)
+    return passed()
+  }
+  const runner = makeReviewRunner(config([1000, 2000]), () => {}, fakeRun, undefined, undefined, async () => {
+    order.push('refresh')
+  }, engineAuth)
+  await runner(request)
+  t.deepEqual(order, ['refresh', 'auth:codex:C1-11', 'codex', 'refresh', 'auth:codex:C1-11.retry1', 'codex'])
+  t.deepEqual(seen, ['C1-11', 'C1-11.retry1'], 'each attempt runs with its own credentials')
+  t.end()
+})
+
+// A failed mint is terminal: no Codex run, no retry, and a failure carrying the (credential-free)
+// reason, so the Slack thread says why instead of the review silently using the subscription.
+test('makeReviewRunner fails the review without running Codex when auth fails', async t => {
+  let runs = 0
+  let resolves = 0
+  const fakeRun: typeof runCodexReview = async () => {
+    runs += 1
+    return passed()
+  }
+  const engineAuth = async () => {
+    resolves += 1
+    throw new Error('could not assume the engine role: ExpiredToken')
+  }
+  const runner = makeReviewRunner(config([1000, 2000]), () => {}, fakeRun, undefined, undefined, undefined, engineAuth)
+  try {
+    await runner(request)
+    t.fail('should throw')
+  } catch (error) {
+    t.ok(error instanceof ReviewFailedError, 'a review failure')
+    t.match(String((error as ReviewFailedError).cause ?? error), /ExpiredToken/)
+    t.equal((error as ReviewFailedError).usage.attempts, 1)
+  }
+  t.equal(runs, 0, 'Codex never ran')
+  t.equal(resolves, 1, 'not retried')
+  t.end()
+})
+
+// The daemon wires one resolver for every mode; the selector must thread it to the single-mode
+// runner, or bedrock mode would silently run on the subscription.
+test('selectReviewRunner threads engineAuth to the single-mode runner', async t => {
+  let asked = 0
+  const runner = selectReviewRunner(
+    { ...loadReviewConfig({ HOME: '/home/u', RUN_LOG_DIR: '', STALL_BACKOFF_MS: '' }), codexBin: '/nonexistent/codex-for-test' },
+    {
+      engineAuth: async () => {
+        asked += 1
+        throw new Error('stop before spawning')
+      },
+    }
+  )
+  await runner(request).catch(() => undefined)
+  t.equal(asked, 1, 'the resolver was called')
+  t.end()
+})
+
 // --- Mode selection and dual wiring ---
 
 const dualConfig = loadReviewConfig({

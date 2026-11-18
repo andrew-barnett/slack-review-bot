@@ -12,7 +12,9 @@ import {
 import { makeApproverGitHub, type ApproverGitHub } from './approver-github'
 import { assertModeAvailable, DUAL_MODE_AVAILABLE, isDualMode, type ReviewConfig } from './config'
 import { makeDualReviewRunner } from './dual'
-import { makeClaudeEngine, makeCodexEngine, type EngineDeps } from './engine'
+import type { BedrockAuth } from './bedrock-auth'
+import { makeClaudeEngine, makeCodexEngine, type EngineAuthResolver, type EngineDeps } from './engine'
+import { redactSecrets } from './redact'
 import { makeGitHubEffects } from './github'
 import type { ReviewRequest } from './job'
 import type { PullRequestRef } from './parse-message'
@@ -47,7 +49,13 @@ export function makeReviewRunner(
    * Best-effort — it never throws — and wired only by the daemon/CLI; when unset (unit tests)
    * the step is skipped, so the runner needs no live AWS to be tested.
    */
-  refreshAuth?: () => Promise<void>
+  refreshAuth?: () => Promise<void>,
+  /**
+   * ENGINE_AUTH: resolve the attempt's model auth (Bedrock credentials, or undefined for the
+   * subscription). Called per attempt, so a stall retry gets a fresh session. When unset (unit
+   * tests) the run uses the subscription, exactly as before.
+   */
+  engineAuth?: EngineAuthResolver
 ): (request: ReviewRequest) => Promise<ReviewOutcome> {
   return async request => {
     const key = progressKey(request)
@@ -86,6 +94,19 @@ export function makeReviewRunner(
       // so this is a cheap no-op until the token actually needs re-minting. Best-effort: never throws.
       if (refreshAuth) await refreshAuth()
 
+      // Mint the attempt's Bedrock credentials (bedrock mode only). A failure here is terminal, like
+      // a crash: re-minting with the same operator credentials will not fix an AccessDenied.
+      let bedrock: BedrockAuth | undefined
+      try {
+        bedrock = engineAuth ? await engineAuth('codex', runId) : undefined
+      } catch (error) {
+        log?.('review.auth-failed', { runId: baseRunId, attempt: attempt + 1 })
+        throw new ReviewFailedError(
+          { activeMs: chargedActiveMs > 0 ? chargedActiveMs : undefined, attempts: attempt + 1 },
+          new Error(redactSecrets(error instanceof Error ? error.message : String(error)))
+        )
+      }
+
       try {
         const outcome = await runCodex({
           prompt,
@@ -98,6 +119,7 @@ export function makeReviewRunner(
           disableGitSigning: config.disableGitSigning,
           envPassthrough: config.codexEnvPassthrough,
           engineGhToken: isDualMode(config) ? config.engineGhToken : undefined,
+          bedrock,
           registry,
           logDir: config.runLogDir,
           runId,
@@ -191,6 +213,8 @@ export interface RunnerDeps {
   /** Shared by every engine child, so a shutdown drains both of a parallel run's children. */
   registry?: ChildRegistry
   refreshAuth?: () => Promise<void>
+  /** ENGINE_AUTH: per-attempt model auth for every engine. Absent means the subscriptions. */
+  engineAuth?: EngineAuthResolver
   /** Dual mode: the role-account client. Built from APPROVER_GH_TOKEN when absent. */
   gh?: ApproverGitHub
   /** Dual mode: changed file names for the pre-flight. Defaults to the existing gh effect. */
@@ -212,7 +236,7 @@ export function selectReviewRunner(
   available: boolean = DUAL_MODE_AVAILABLE
 ): (request: ReviewRequest) => Promise<ReviewOutcome> {
   if (!isDualMode(config)) {
-    return makeReviewRunner(config, deps.log, runCodexReview, deps.reviews, deps.registry, deps.refreshAuth)
+    return makeReviewRunner(config, deps.log, runCodexReview, deps.reviews, deps.registry, deps.refreshAuth, deps.engineAuth)
   }
   assertModeAvailable(config, available)
   // A second guard behind config loading: the engines must get a read-only token distinct from the
@@ -228,6 +252,7 @@ export function selectReviewRunner(
     log,
     registry: deps.registry,
     refreshAuth: deps.refreshAuth ? serialized(deps.refreshAuth) : undefined,
+    engineAuth: deps.engineAuth,
   }
   const makers = { codex: makeCodexEngine, claude: makeClaudeEngine }
   return makeDualReviewRunner({

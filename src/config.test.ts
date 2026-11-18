@@ -372,3 +372,121 @@ test('loadReviewConfig rejects a dual emoji that equals the pass emoji', t => {
   t.throws(() => loadReviewConfig({ HEAD_MOVED_EMOJI: 'approved_stamp' }), /HEAD_MOVED_EMOJI/)
   t.end()
 })
+
+// Engine auth (issue #69). Fixture key values are assembled at runtime, never committed literals.
+const ENGINE_ROLE = 'arn:aws:iam::123456789012:role/SlackReviewBotEngineRole'
+const STATIC_KEYS = {
+  AWS_ACCESS_KEY_ID: 'AKIA' + 'TESTTESTTESTTEST',
+  AWS_SECRET_ACCESS_KEY: 'fake-secret-' + 'abcdefabcdef',
+}
+
+// The running daemon must not change: unset ENGINE_AUTH means the subscriptions, with the Bedrock
+// defaults present but inert and nothing captured from AWS variables that happen to be set.
+test('loadReviewConfig defaults to subscription auth and captures nothing', t => {
+  const c = loadReviewConfig({ ...STATIC_KEYS })
+  t.equal(c.engineAuth, 'subscription')
+  t.equal(c.bedrockRegion, 'us-east-2')
+  t.equal(c.codexBedrockModel, 'us.openai.gpt-5.5')
+  t.equal(c.claudeBedrockModel, 'us.anthropic.claude-opus-5-5')
+  t.equal(c.engineRoleArn, '')
+  t.equal(c.engineAwsProfile, '')
+  t.equal(c.engineAwsStatic, undefined, 'no static credentials in subscription mode')
+  t.equal(c.codexBedrockContextWindow, undefined)
+  t.end()
+})
+
+// A typo such as ENGINE_AUTH=bedrok must stop startup and say what is allowed, not silently fall
+// back to the subscription the operator meant to move off.
+test('loadReviewConfig rejects an unknown ENGINE_AUTH naming the allowed values', t => {
+  t.throws(() => loadReviewConfig({ ENGINE_AUTH: 'bedrok' }), /ENGINE_AUTH must be one of "subscription", "bedrock"/)
+  t.end()
+})
+
+// A subscription install with a stale, invalid Bedrock value must still start: validation is
+// bedrock-only, so the default mode's behaviour cannot regress.
+test('loadReviewConfig ignores invalid Bedrock values in subscription mode', t => {
+  t.doesNotThrow(() => loadReviewConfig({ ENGINE_ROLE_ARN: 'nonsense', BEDROCK_REGION: 'us east"', CODEX_BEDROCK_CONTEXT_WINDOW: 'x' }))
+  t.end()
+})
+
+// Role mode: every knob is read, and the static AWS variables are not captured even if present,
+// because the role is the credential source.
+test('loadReviewConfig reads bedrock role mode', t => {
+  const c = loadReviewConfig({
+    ENGINE_AUTH: 'bedrock',
+    ENGINE_ROLE_ARN: ENGINE_ROLE,
+    ENGINE_AWS_PROFILE: 'operator',
+    BEDROCK_REGION: 'us-west-2',
+    CODEX_BEDROCK_MODEL: 'us.openai.gpt-5.5-mini',
+    CLAUDE_BEDROCK_MODEL: 'us.anthropic.claude-sonnet-5',
+    CODEX_BEDROCK_CONTEXT_WINDOW: '272000',
+    ...STATIC_KEYS,
+  })
+  t.equal(c.engineAuth, 'bedrock')
+  t.equal(c.engineRoleArn, ENGINE_ROLE)
+  t.equal(c.engineAwsProfile, 'operator')
+  t.equal(c.bedrockRegion, 'us-west-2')
+  t.equal(c.codexBedrockModel, 'us.openai.gpt-5.5-mini')
+  t.equal(c.claudeBedrockModel, 'us.anthropic.claude-sonnet-5')
+  t.equal(c.codexBedrockContextWindow, 272000)
+  t.equal(c.engineAwsStatic, undefined, 'role mode does not capture static keys')
+  t.end()
+})
+
+// A malformed ARN must fail before it reaches `aws sts`, and the error must not echo the value,
+// which could be a secret pasted into the wrong variable.
+test('loadReviewConfig rejects a malformed ENGINE_ROLE_ARN without echoing it', t => {
+  for (const bad of ['arn:aws:iam::123:role/x', 'arn:aws:iam::123456789012:user/x', 'paste-of-something-secret']) {
+    try {
+      loadReviewConfig({ ENGINE_AUTH: 'bedrock', ENGINE_ROLE_ARN: bad })
+      t.fail(`should reject ${bad}`)
+    } catch (error) {
+      t.ok(/ENGINE_ROLE_ARN is not an IAM role ARN/.test((error as Error).message))
+      t.notOk((error as Error).message.includes(bad), 'value not echoed')
+    }
+  }
+  t.end()
+})
+
+// Static mode (the future container case): with no role, both keys must be present, and an
+// optional session token is captured too.
+test('loadReviewConfig captures static engine credentials when no role is set', t => {
+  const c = loadReviewConfig({ ENGINE_AUTH: 'bedrock', ...STATIC_KEYS, AWS_SESSION_TOKEN: 'fake-session-' + 'abcdef' })
+  t.deepEqual(c.engineAwsStatic, {
+    accessKeyId: STATIC_KEYS.AWS_ACCESS_KEY_ID,
+    secretAccessKey: STATIC_KEYS.AWS_SECRET_ACCESS_KEY,
+    sessionToken: 'fake-session-abcdef',
+  })
+  t.throws(() => loadReviewConfig({ ENGINE_AUTH: 'bedrock', AWS_ACCESS_KEY_ID: STATIC_KEYS.AWS_ACCESS_KEY_ID }), /ENGINE_ROLE_ARN, or static/)
+  t.throws(() => loadReviewConfig({ ENGINE_AUTH: 'bedrock' }), /ENGINE_ROLE_ARN, or static/)
+  t.end()
+})
+
+// Region and model IDs are spliced into Codex's TOML `-c` overrides; a quote or space would let a
+// config value inject an extra override (for example a sandbox change).
+test('loadReviewConfig rejects region and model IDs unsafe for TOML', t => {
+  const base = { ENGINE_AUTH: 'bedrock', ENGINE_ROLE_ARN: ENGINE_ROLE }
+  t.throws(() => loadReviewConfig({ ...base, BEDROCK_REGION: 'us-east-2"' }), /BEDROCK_REGION/)
+  t.throws(() => loadReviewConfig({ ...base, CODEX_BEDROCK_MODEL: 'x", sandbox_mode="danger' }), /CODEX_BEDROCK_MODEL/)
+  t.throws(() => loadReviewConfig({ ...base, CLAUDE_BEDROCK_MODEL: 'a b' }), /CLAUDE_BEDROCK_MODEL/)
+  t.throws(() => loadReviewConfig({ ...base, CODEX_BEDROCK_CONTEXT_WINDOW: '0' }), /CODEX_BEDROCK_CONTEXT_WINDOW/)
+  t.throws(() => loadReviewConfig({ ...base, CODEX_BEDROCK_CONTEXT_WINDOW: '12k' }), /CODEX_BEDROCK_CONTEXT_WINDOW/)
+  t.end()
+})
+
+// Static engine keys must leave the daemon's environment once captured, or the approver's gh calls
+// and the CodeArtifact login (which needs the operator's own profile) would run as the engine role.
+// In every other mode the AWS variables are the operator's and must be left alone.
+test('scrubDaemonSecrets removes static engine keys only when they were captured', t => {
+  const captured = loadReviewConfig({ ENGINE_AUTH: 'bedrock', ...STATIC_KEYS, AWS_SESSION_TOKEN: 'fake-session-' + 'abcdef' })
+  const env: NodeJS.ProcessEnv = { ...STATIC_KEYS, AWS_SESSION_TOKEN: 'x', AWS_PROFILE: 'operator', PATH: '/bin' }
+  scrubDaemonSecrets(env, captured)
+  t.deepEqual(env, { AWS_PROFILE: 'operator', PATH: '/bin' }, 'the three key variables are gone')
+
+  for (const config of [loadReviewConfig({}), loadReviewConfig({ ENGINE_AUTH: 'bedrock', ENGINE_ROLE_ARN: ENGINE_ROLE })]) {
+    const kept: NodeJS.ProcessEnv = { ...STATIC_KEYS, PATH: '/bin' }
+    scrubDaemonSecrets(kept, config)
+    t.deepEqual(kept, { ...STATIC_KEYS, PATH: '/bin' }, `${config.engineAuth}/${config.engineRoleArn ? 'role' : 'none'}: AWS variables untouched`)
+  }
+  t.end()
+})

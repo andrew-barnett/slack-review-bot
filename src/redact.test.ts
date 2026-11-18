@@ -1,5 +1,5 @@
 import test from 'tape'
-import { redactSecrets, createOutputRedactor } from './redact'
+import { redactSecrets, createOutputRedactor, HELD_SECRET_LIMIT, registerHeldSecret } from './redact'
 
 // Credential-shaped fixtures are assembled at runtime (join/concat) rather than written as literals,
 // so no contiguous secret pattern sits in the committed source to trip GitHub push protection. The
@@ -174,5 +174,65 @@ test('createOutputRedactor flushes a trailing line but never an open key body', 
   const begin = '-----BEGIN RSA ' + 'PRIVATE KEY-----'
   r2.push(`${begin}\nKEYBODYCCCC\n`)
   t.notOk(r2.flush().includes('KEYBODYCCCC'), 'an open block emits no body on flush')
+  t.end()
+})
+
+// Bedrock mode (issue #69): STS hands out temporary keys whose ID starts ASIA, not AKIA. A rule that
+// only knew AKIA would publish every engine-role key ID verbatim.
+test('redactSecrets masks a temporary (ASIA) AWS access key ID', t => {
+  const id = 'ASIA' + 'ABCDEFGHIJKLMNOP'
+  const out = redactSecrets(`key ${id} here`, {})
+  t.notOk(out.includes(id), 'the key ID is gone')
+  t.ok(out.includes('[redacted:aws-key-id]'), 'replaced by the AWS placeholder')
+  t.end()
+})
+
+// Bedrock mode: Claude's Bash tool inherits the engine's AWS variables, so a PR that runs `env` or
+// prints its config can surface the secret key and session token, which have no recognisable shape.
+// The name=value, name: value, and STS JSON forms must each lose the value but keep the name.
+test('redactSecrets masks AWS secret key and session token values by their names', t => {
+  const secret = ['wJalrXUtnFEMI', 'K7MDENG', 'bPxRfiCYEXAMPLEKEY'].join('/')
+  const session = 'IQoJb3JpZ2luX2VjE' + 'AAAAAAAAAAAAAAAAAAAAAAAAAAAA+BBBBBBB/CCCCCCC=='
+  const cases: Array<[string, string]> = [
+    [`AWS_SECRET_ACCESS_KEY=${secret}`, 'env form'],
+    [`aws_secret_access_key = ${secret}`, 'ini form'],
+    [`export AWS_SESSION_TOKEN="${session}"`, 'quoted export'],
+    [`"SecretAccessKey": "${secret}",`, 'STS JSON secret'],
+    [`"SessionToken": "${session}"`, 'STS JSON session token'],
+  ]
+  for (const [input, label] of cases) {
+    const out = redactSecrets(input, {})
+    t.notOk(out.includes(secret) || out.includes(session), `${label}: value removed`)
+    t.ok(out.includes('[redacted:aws-secret]'), `${label}: placeholder present`)
+    t.ok(/SECRET_ACCESS_KEY|secret_access_key|SESSION_TOKEN|SecretAccessKey|SessionToken/.test(out), `${label}: name kept`)
+    // Idempotent: redacting the redacted text changes nothing.
+    t.equal(redactSecrets(out, {}), out, `${label}: idempotent`)
+  }
+  t.end()
+})
+
+// Minted engine credentials never live in the daemon's environment, so the env-value layer cannot
+// see them. A registered value must be masked anywhere it appears, even with no name next to it
+// (`echo $AWS_SESSION_TOKEN`), or a bare print of the token would reach Slack.
+test('registerHeldSecret masks a registered value with no name beside it', t => {
+  const value = 'held-engine-credential-' + 'zzzzyyyyxxxx'
+  t.ok(redactSecrets(`out ${value} end`, {}).includes(value), 'not masked before registration')
+  registerHeldSecret(value)
+  const out = redactSecrets(`out ${value} end`, {})
+  t.notOk(out.includes(value), 'masked after registration')
+  t.equal(out, 'out [redacted:env] end', 'replaced by the literal-value placeholder')
+  t.end()
+})
+
+// The registry is bounded: a daemon that runs for months mints a credential per attempt, and an
+// unbounded list would grow forever and slow every redaction. Short values are ignored, as in the
+// env layer, so a stray short string cannot blank out ordinary output.
+test('registerHeldSecret is bounded and ignores short values', t => {
+  registerHeldSecret('short')
+  t.equal(redactSecrets('a short word', {}), 'a short word', 'a short value is not registered')
+  const first = 'first-registered-value-' + '0000000000'
+  registerHeldSecret(first)
+  for (let i = 0; i < HELD_SECRET_LIMIT; i += 1) registerHeldSecret(`filler-registered-value-${i}-pad`)
+  t.ok(redactSecrets(first, {}).includes(first), 'the oldest value was evicted')
   t.end()
 })

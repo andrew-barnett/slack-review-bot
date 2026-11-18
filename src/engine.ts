@@ -11,6 +11,7 @@ import {
   runCodexReportOnly,
   type ChildRegistry,
 } from './codex'
+import type { BedrockAuth } from './bedrock-auth'
 import { ClaudeRunError, runClaudeReview, totalTokens } from './claude'
 import type { EngineName, ReviewConfig } from './config'
 import type { PullRequestRef } from './parse-message'
@@ -162,7 +163,32 @@ export async function runWithStallRetries(
   return { engine, results: [], usage: { attempts }, error: 'the engine ran no attempts' }
 }
 
+/**
+ * Resolve an engine attempt's model auth: Bedrock credentials in bedrock mode, undefined in
+ * subscription mode. Called once per attempt, so a stall retry gets a fresh session.
+ */
+export type EngineAuthResolver = (engine: EngineName, runId: string) => Promise<BedrockAuth | undefined>
+
+/**
+ * Resolve the attempt's auth, turning a failure into a non-retryable attempt failure. The message
+ * is the resolver's own (credential-free by construction) and is redacted again at the outcome.
+ */
+async function attemptAuth(
+  resolve: EngineAuthResolver | undefined,
+  engine: EngineName,
+  runId: string
+): Promise<BedrockAuth | undefined> {
+  if (!resolve) return undefined
+  try {
+    return await resolve(engine, runId)
+  } catch (error) {
+    throw new AttemptFailure(redactSecrets(error instanceof Error ? error.message : String(error)), false, 0)
+  }
+}
+
 export interface EngineDeps extends RetryDeps {
+  /** ENGINE_AUTH: per-attempt model auth. Absent (tests, subscription) means no Bedrock. */
+  engineAuth?: EngineAuthResolver
   registry?: ChildRegistry
   /** Injection seams for tests. */
   runCodex?: typeof runCodexReportOnly
@@ -192,6 +218,7 @@ export function makeCodexEngine(config: ReviewConfig, deps: EngineDeps = {}): En
         input,
         config.stallBackoffMs,
         async (stallTimeoutMs, runId) => {
+          const bedrock = await attemptAuth(deps.engineAuth, 'codex', runId)
           try {
             const o = await runCodex({
               prompt: prompt('codex', input),
@@ -204,6 +231,7 @@ export function makeCodexEngine(config: ReviewConfig, deps: EngineDeps = {}): En
               disableGitSigning: config.disableGitSigning,
               envPassthrough: config.codexEnvPassthrough,
               engineGhToken: config.engineGhToken,
+              bedrock,
               registry: deps.registry,
               logDir: config.runLogDir,
               runId,
@@ -233,6 +261,7 @@ export function makeClaudeEngine(config: ReviewConfig, deps: EngineDeps = {}): E
         input,
         config.stallBackoffMs,
         async (stallTimeoutMs, runId) => {
+          const bedrock = await attemptAuth(deps.engineAuth, 'claude', runId)
           try {
             const o = await runClaude({
               prompt: prompt('claude', input),
@@ -245,6 +274,7 @@ export function makeClaudeEngine(config: ReviewConfig, deps: EngineDeps = {}): E
               disableGitSigning: config.disableGitSigning,
               envPassthrough: config.codexEnvPassthrough,
               engineGhToken: config.engineGhToken,
+              bedrock,
               registry: deps.registry,
               logDir: config.runLogDir,
               runId,

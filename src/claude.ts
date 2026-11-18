@@ -8,6 +8,7 @@
 import { spawn } from 'child_process'
 import * as fs from 'fs'
 import * as path from 'path'
+import { withBedrockClaudeEnv, type BedrockAuth } from './bedrock-auth'
 import { buildChildEnv, withEngineGhToken, withGitSigningDisabled } from './codex'
 import { type DeadlineDeps } from './deadline'
 import { redactSecrets } from './redact'
@@ -42,6 +43,11 @@ export interface ClaudeRunOptions {
   envPassthrough?: string[]
   /** The read-only engine token, set as the child's GH_TOKEN. Claude runs only in dual mode. */
   engineGhToken: string
+  /**
+   * ENGINE_AUTH=bedrock: this attempt's Bedrock region, model and minted credentials, replacing the
+   * OAuth token as the child's only credential. Undefined in subscription mode.
+   */
+  bedrock?: BedrockAuth
   registry?: ChildRegistry
   logDir?: string
   runId: string
@@ -106,6 +112,8 @@ export function buildClaudeEnv(
     disableGitSigning: boolean
     /** This engine's worktree root; package caches are redirected beneath it. */
     cacheRoot?: string
+    /** Bedrock mode: swap the OAuth token for Bedrock and the minted AWS credentials. */
+    bedrock?: BedrockAuth
   }
 ): NodeJS.ProcessEnv {
   let env = buildChildEnv(base, [...(options.envPassthrough ?? []), CLAUDE_TOKEN_VAR])
@@ -121,6 +129,8 @@ export function buildClaudeEnv(
     env.npm_config_store_dir = path.join(cache, 'pnpm-store')
   }
   if (options.disableGitSigning) env = withGitSigningDisabled(env)
+  // Exactly one model credential reaches the child: Bedrock removes the OAuth token and API key.
+  if (options.bedrock) env = withBedrockClaudeEnv(env, options.bedrock)
   return withEngineGhToken(env, options.engineGhToken)
 }
 
@@ -222,6 +232,7 @@ export async function runClaudeReview(
     envPassthrough: options.envPassthrough,
     disableGitSigning: options.disableGitSigning,
     cacheRoot: options.worktreeRoot,
+    bedrock: options.bedrock,
   })
   const args = buildClaudeArgs({
     prompt: options.prompt,

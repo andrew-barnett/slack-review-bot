@@ -148,6 +148,33 @@ test('buildClaudeEnv passes the Claude credential and engine token, never the ap
   t.end()
 })
 
+// Bedrock (issue #69): with Bedrock auth the OAuth token must be gone (it would otherwise win and
+// bill the subscription), the Bedrock switches and minted keys must be present, and the read-only
+// engine token must still be the child's GH_TOKEN. Without bedrock the env is exactly as before.
+test('buildClaudeEnv swaps the OAuth token for Bedrock when bedrock is set', t => {
+  const base = { PATH: '/usr/bin', CLAUDE_CODE_OAUTH_TOKEN: 'claude-placeholder', AWS_PROFILE: 'operator' }
+  const bedrock = {
+    region: 'us-east-2',
+    model: 'us.anthropic.claude-opus-5-5',
+    credentials: { accessKeyId: 'ASIA' + 'TESTTESTTESTTEST', secretAccessKey: 'fake-secret-' + 'xyzxyzxyzxyz', sessionToken: 'fake-session-' + 'xyzxyz' },
+  }
+  const opts = { configDir: '/cfg', engineGhToken: 'engine-placeholder', disableGitSigning: false, envPassthrough: ['AWS_PROFILE'] }
+  const env = buildClaudeEnv(base, { ...opts, bedrock })
+  t.notOk('CLAUDE_CODE_OAUTH_TOKEN' in env, 'OAuth token removed')
+  t.notOk('AWS_PROFILE' in env, 'profile removed even when passed through')
+  t.equal(env.CLAUDE_CODE_USE_BEDROCK, '1')
+  t.equal(env.ANTHROPIC_MODEL, 'us.anthropic.claude-opus-5-5')
+  t.equal(env.AWS_REGION, 'us-east-2')
+  t.equal(env.AWS_SECRET_ACCESS_KEY, bedrock.credentials.secretAccessKey)
+  t.equal(env.GH_TOKEN, 'engine-placeholder', 'engine token still applied last')
+  t.equal(env.CLAUDE_CONFIG_DIR, '/cfg', 'the dedicated profile is kept')
+
+  const plain = buildClaudeEnv(base, opts)
+  t.equal(plain.CLAUDE_CODE_OAUTH_TOKEN, 'claude-placeholder', 'subscription mode keeps the OAuth token')
+  t.notOk('CLAUDE_CODE_USE_BEDROCK' in plain, 'and has no Bedrock switch')
+  t.end()
+})
+
 // A stream-JSON event can arrive split across chunks, and many non-result events come first.
 // Only a complete `result` line counts, and the last one wins.
 test('createResultCollector reassembles a split result line and ignores other events', t => {
