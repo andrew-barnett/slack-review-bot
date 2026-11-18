@@ -103,7 +103,7 @@ The code is split into a pure evaluator and a fetch layer.
 | team membership | `GET /orgs/{org}/teams/{slug}/memberships/{bot}` (state `active`) for each `@org/team` owner the evaluator needs |
 | current approvals | GraphQL `pullRequest.latestOpinionatedReviews` (author, state, commit oid, submittedAt) |
 | other approvers' eligibility | `GET /repos/{o}/{r}/collaborators/{login}/permission` for each other approver or change requester, plus team membership as for the bot when evaluating owner coverage |
-| latest pusher of the head branch | `GET /repos/{o}/{r}/activity?ref=refs/heads/{head}&activity_type=push&per_page=1` (actor, after-SHA, timestamp). Needed only when `require_last_push_approval` is set. A head branch in a fork is not readable this way, so the result is "cannot verify". Readability is checked in V1. |
+| latest pusher of the head branch | `GET /repos/{o}/{r}/activity?ref=refs/heads/{head}&per_page=1` with no `activity_type` filter (actor, after-SHA, timestamp). The newest entry counts only when it is a `push` or a `force_push`; the API reports a force push separately (https://github.com/andrew-barnett/slack-review-bot/issues/54), so filtering on `push` would miss a later force push. Any other newest activity reads as "cannot verify". Needed only when `require_last_push_approval` is set. A head branch in a fork is not readable this way, so the result is "cannot verify". Readability is checked in V1. |
 
 **Evaluator.** `evaluateEligibility(facts) -> Eligibility`, a pure function:
 
@@ -301,7 +301,7 @@ In dual mode, `doctor` also checks:
 - `claude` resolves under the launchd PATH, and the dedicated config dir exists with the hook and skill;
 - `APPROVER_GH_TOKEN` and `ENGINE_GH_TOKEN` both authenticate (`GET /user`) as the same role login;
 - the role login differs from the operator's `gh` login;
-- the engine token **cannot write**: the token type and permissions are inspected (method to be verified in V4), and doctor never performs a write to test it;
+- the engine token **cannot write**: `POST /repos/{o}/{r}/pulls/{n}/reviews` with an invalid `event`, on the PR named by the doctor-only `DOCTOR_PROBE_PR`. A 403 passes (no write access); a 422 fails (write access; the body was rejected, so nothing is created); anything else, or `DOCTOR_PROBE_PR` unset, fails. The probe can never create a review (V4);
 - the approver token is absent from the environment the child would receive (a dry-run `buildChildEnv`).
 
 ## 6. Error handling summary
@@ -327,9 +327,9 @@ Until the skill ships report-only mode, dual mode stays behind `REVIEW_ENGINES`,
 ## 8. Verification items (spike before the dependent sub-issues)
 
 - **V1.** Settled in part (https://github.com/andrew-barnett/slack-review-bot/issues/54): the role account has admin, so classic branch protection is readable. Still to confirm with the real fine-grained token: Administration: read suffices for classic protection, secret-team membership reads, `codeowners/errors`, and the repository activity API for the latest pusher.
-- **V2.** Claude Code headless: structured-output flag, stream-JSON progress events, the permission mode that never prompts, sandbox config for the worktree root, and auth (a subscription token from `claude setup-token` passed as `CLAUDE_CODE_OAUTH_TOKEN`, or an API key). Bedrock and Vertex are excluded, because their cloud keys would sit in the engine env. `--json-schema` is confirmed present in Claude Code 2.1.284.
+- **V2.** Settled (https://github.com/andrew-barnett/slack-review-bot/issues/54): `claude -p <prompt> --output-format stream-json --verbose --json-schema <schema> --permission-mode dontAsk --allowedTools <list>`; the structured output is `structured_output` on the final `{"type":"result"}` line, which also carries `usage`, `total_cost_usd`, `num_turns`, `is_error` and `permission_denials`; every stdout line is progress. Isolation is a dedicated `CLAUDE_CONFIG_DIR`; auth is `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`, passed by exact name. Bedrock and Vertex are excluded, because their cloud keys would sit in the engine env. The sandbox grants writes only to `<WORKTREE_ROOT>/claude` (package caches are redirected under it) and denies reads in both the sandbox and the permission rules. Still to confirm in the end-to-end smoke run before the flip: the sandbox write and network settings in practice, that the Read deny rules also stop Grep and Glob, and that the `review-pr` skill does not resolve under `~/.claude` or `~/.codex`.
 - **V3.** Whether update-branch attributes the push to the token user, and how it interacts with `require_last_push_approval` and `dismiss_stale_reviews_on_push`.
-- **V4.** How `doctor` can confirm the engine token is read-only without writing anything: fine-grained token permissions, or classic `X-OAuth-Scopes`.
+- **V4.** Settled (https://github.com/andrew-barnett/slack-review-bot/issues/54): `doctor` posts a review with an invalid `event` as the engine token. A read-only token gets 403; a write-capable one gets 422 with nothing created (section 5.10).
 
 ## 9. Security
 
