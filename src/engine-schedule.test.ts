@@ -86,3 +86,48 @@ test('runEngines in serial mode follows the given engine order', async t => {
   t.deepEqual(out.passes.get('https://github.com/o/r/pull/1')!.map(p => p.detail), ['blocked: no reason given', 'skipped (Claude not clean)'])
   t.end()
 })
+
+// Regression caught: Promise.all rejects as soon as any engine rejects, losing the other's result.
+// When one engine rejects in parallel mode, the schedule still resolves, the rejected engine's
+// pass is invalid, and the clean engine's result survives.
+test('runEngines in parallel with one engine rejecting preserves the other result', async t => {
+  const codex = fakeEngine('codex', { 1: 'clean', 2: 'clean' })
+  const claude = fakeEngine('claude', {})
+  claude.run = async () => { throw new Error('Claude timed out') }
+  const out = await runEngines([codex, claude], 'parallel', input)
+  t.deepEqual(out.passes.get('https://github.com/o/r/pull/1')!.map(p => `${p.engine}:${p.state}`), ['codex:clean', 'claude:invalid'])
+  t.ok(out.outcomes.find(o => o.engine === 'codex'), 'codex outcome recorded')
+  t.ok(out.outcomes.find(o => o.engine === 'claude' && o.error), 'claude outcome recorded with error')
+  t.end()
+})
+
+// Regression caught: same as rejection but with synchronous throw.
+// When one engine throws synchronously in parallel mode, the schedule still resolves.
+test('runEngines in parallel with one engine throwing preserves the other result', async t => {
+  const codex = fakeEngine('codex', { 1: 'clean', 2: 'clean' })
+  const claude = fakeEngine('claude', {})
+  claude.run = () => { throw new Error('Claude crashed') }
+  const out = await runEngines([codex, claude], 'parallel', input)
+  t.deepEqual(out.passes.get('https://github.com/o/r/pull/1')!.map(p => `${p.engine}:${p.state}`), ['codex:clean', 'claude:invalid'])
+  t.ok(out.outcomes.find(o => o.engine === 'codex' && o.results.length > 0), 'codex outcome recorded with results')
+  t.ok(out.outcomes.find(o => o.engine === 'claude' && o.error), 'claude outcome recorded with error')
+  t.end()
+})
+
+// Regression caught: a thrown/rejected first engine should not prevent the second from running
+// but its PR gets marked skipped for the second engine. When the first engine rejects in serial
+// mode, the schedule resolves, its pass is invalid, and the second engine is not run (because
+// all PRs that dropped out are skipped, not reviewed).
+test('runEngines in serial mode with first engine rejecting skips the second', async t => {
+  const codex = fakeEngine('codex', {})
+  const claude = fakeEngine('claude', { 1: 'clean', 2: 'clean' })
+  codex.run = async () => { throw new Error('Codex out of memory') }
+  const out = await runEngines([codex, claude], 'serial', input)
+  t.equal(claude.calls.length, 0, 'claude never runs when codex fails')
+  const pr1 = out.passes.get('https://github.com/o/r/pull/1')!
+  t.deepEqual(pr1.map(p => p.state), ['invalid', 'skipped'])
+  t.equal(pr1[1].detail, 'skipped (Codex not clean)')
+  t.equal(out.outcomes.length, 1)
+  t.ok(out.outcomes[0].error, 'codex outcome has error field')
+  t.end()
+})

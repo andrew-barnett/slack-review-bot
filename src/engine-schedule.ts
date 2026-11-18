@@ -8,6 +8,7 @@
 import type { EngineSchedule } from './config'
 import { passFor, skippedPass, type EnginePass } from './dual-gate'
 import { engineWorktreeRoot, type Engine, type EnginePr, type EngineRunOutcome } from './engine'
+import { redactSecrets } from './redact'
 
 export interface ScheduleInput {
   prs: EnginePr[]
@@ -29,15 +30,21 @@ export interface ScheduledRun {
 /** `engines` must already be in ENGINE_ORDER; parallel mode uses the same order for reporting. */
 export async function runEngines(engines: Engine[], schedule: EngineSchedule, input: ScheduleInput): Promise<ScheduledRun> {
   const passes = new Map<string, EnginePass[]>(input.prs.map(pr => [pr.ref.url, []]))
-  const runOne = (engine: Engine, prs: EnginePr[]) =>
-    engine.run({
-      prs,
-      instructions: input.instructions,
-      requestedBy: input.requestedBy,
-      worktreeRoot: engineWorktreeRoot(input.worktreeRoot, engine.name),
-      runId: input.runId,
-      onProgress: input.onProgress,
-    })
+  const runOne = async (engine: Engine, prs: EnginePr[]): Promise<EngineRunOutcome> => {
+    try {
+      return await engine.run({
+        prs,
+        instructions: input.instructions,
+        requestedBy: input.requestedBy,
+        worktreeRoot: engineWorktreeRoot(input.worktreeRoot, engine.name),
+        runId: input.runId,
+        onProgress: input.onProgress,
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return { engine: engine.name, results: [], usage: { attempts: 0 }, error: redactSecrets(message) }
+    }
+  }
 
   if (schedule === 'parallel') {
     const outcomes = await Promise.all(engines.map(engine => runOne(engine, input.prs)))
