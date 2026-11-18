@@ -22,8 +22,9 @@ The same image runs under Docker Compose on the operator's laptop now, and on EC
 
 | # | Decision | Why |
 |---|---|---|
-| D1 | **The seam is the three engine run functions, one worker job per attempt.** `runCodexReview` (single mode), `runCodexReportOnly` and `runClaudeReview` (dual mode) get remote implementations with the same signatures. | Both runners already take these as injection seams (`makeReviewRunner`'s `runCodex`; `EngineDeps.runCodex`/`runClaude`). Retries, serial scheduling, the gate, idempotency, Slack rendering and usage all stay in the orchestrator unchanged. A stall retry gets a fresh container and fresh credentials. |
-| D2 | **Workers pull jobs over HTTP from the orchestrator.** The orchestrator never starts containers. | No Docker socket in any container. The same model works on ECS: a worker service whose tasks exit after one job, which ECS replaces with fresh tasks. |
+| D1 | **The seam is the two report-only engine run functions, one worker job per attempt.** `runCodexReportOnly` and `runClaudeReview` get remote implementations with the same signatures. | The dual runner already takes these as injection seams (`EngineDeps.runCodex`/`runClaude`). Retries, serial scheduling, the gate, idempotency, Slack rendering and usage all stay in the orchestrator unchanged. A stall retry gets a fresh container and fresh credentials. |
+| D8 | **In the container runtime, every review is report-only, including single mode.** Single mode becomes the dual runner with one engine (`REVIEW_ENGINES=codex` or `claude`) and approvals disabled. The orchestrator posts one COMMENT review per PR as the role account. | Today's single-mode prompt has the engine post its own review and push regression-test commits with the operator's `gh` login. A worker holds only a read-only token, so it can't, and it must not: write access in the container that runs PR code is exactly what https://github.com/andrew-barnett/slack-review-bot/issues/64 removes. **Behaviour change in the container runtime:** findings arrive as one role-account COMMENT review instead of the operator's own review, and regression tests are no longer pushed to the PR branch; they are reported as suggested tests in the findings. The launchd runtime keeps today's single mode until it is retired. |
+| D2 | **Workers pull jobs over HTTP from the orchestrator.** On the laptop, the orchestrator never starts containers. | There is no Docker socket in any container. On ECS, the orchestrator starts each worker task with a scoped `ecs:RunTask` call (section 4); the pull protocol is the same in both places. |
 | D3 | **On the laptop, a host supervisor (the launcher) starts each worker with `docker compose run --rm`.** Compose's `restart: always` is not used for workers. | `restart` reuses the same container, keeping its writable layer and the environment it was created with, so expired STS credentials would carry over. `run --rm` gives a fresh filesystem and lets the launcher mint fresh credentials for each worker. |
 | D4 | **The container is the sandbox boundary.** Claude Code's sandbox is off in the container profile, and Codex uses `danger-full-access`. The permission deny rules stay. | Spike (2026-11-18, Docker Desktop, `node:22-bookworm-slim`): `bwrap --unshare-all` fails with "No permissions to create new namespace". With `--security-opt seccomp=unconfined` it still fails ("Can't mount proc … Operation not permitted"). Making it work would need a privileged container, which weakens the boundary we rely on, and Fargate does not allow it. This matches the locked decision in https://github.com/andrew-barnett/slack-review-bot/issues/1. |
 | D5 | **Secrets come from Secrets Manager through the launcher.** The launcher assumes `SlackReviewBotSecretsReaderRole` for the orchestrator's secrets and `SlackReviewBotEngineRole` once per worker. Each role is assumed directly from the operator's IAM user, never chained. | Only the launcher holds the operator's AWS credentials, and it runs no PR code. Assuming each role directly avoids role chaining's one-hour session cap. |
@@ -47,7 +48,11 @@ The same image runs under Docker Compose on the operator's laptop now, and on EC
 ### 3.2 Orchestrator
 
 - **Runs:** today's `app.ts` (Socket Mode, the cursor, catch-up, the job queue, the gate, Slack rendering), wired with the remote run functions from 3.3 instead of local spawns.
-- **Holds:** `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `APPROVER_GH_TOKEN` (dual mode), `JOB_SECRET` (3.3), and a `RUN_LOG_DIR` volume.
+- **Holds:** `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `APPROVER_GH_TOKEN` (in both modes, because single mode now posts its COMMENT review as the role account; see D8), `LAUNCH_KEY` (3.3), and a `RUN_LOG_DIR` volume.
+- **Code change for D8:**
+  - `makeDualReviewRunner` gains `approvals: boolean`. When it is false, the gate's outcome is always posted as a COMMENT review and never APPROVE, whatever the engines report.
+  - `selectReviewRunner` uses this path for single mode when `RUNTIME=container`.
+  - The single-engine gate requires exactly one pass, from the configured engine.
 - **Does not hold:** engine credentials of any kind, or AWS credentials.
   - `ENGINE_GH_TOKEN` is not known to the orchestrator. The dual-mode startup check that the engine token differs from the approver token moves to the launcher, which has both.
   - `CODEARTIFACT_REFRESH=false`: the registry token is the worker's.
@@ -56,15 +61,30 @@ The same image runs under Docker Compose on the operator's laptop now, and on EC
 
 ### 3.3 Job protocol (`src/jobs/`)
 
-The protocol is HTTP/1.1 with JSON bodies on the `jobs` network. Every request carries `Authorization: Bearer <JOB_SECRET>`, a random value the launcher generates per boot and gives to both services. It is low value (the network is internal) but stops a stray container from claiming jobs.
+The protocol is HTTP/1.1 with JSON bodies on the `jobs` network.
+
+**Threat this must stop.** Workers run untrusted PR code as the same UID as the worker process, so PR code can read anything that process holds. In dual mode the gate approves only when *both* engines report clean. If PR code running in the Codex worker could claim the Claude job, or post a result for it, it could forge the second clean pass and get the role account to approve. A credential shared by all workers allows exactly that, so there is no shared worker credential.
+
+**Credentials (one-use, bound to one attempt):**
+- **`LAUNCH_KEY`:** a random 32-byte key the launcher generates per boot and gives **only** to the orchestrator.
+- **Claim ticket:** for each worker it starts, the launcher creates `ticket = nonce + "." + base64url(HMAC-SHA256(LAUNCH_KEY, nonce))`, with a fresh random 16-byte nonce. That one ticket is the worker's only credential to the orchestrator.
+- **Ticket rules (enforced by the orchestrator):**
+  - it verifies the HMAC in constant time;
+  - it records each nonce as spent on its first successful claim (a spent nonce gets `403`);
+  - it rejects tickets older than `WORKER_IDLE_EXIT_MS` + 1 minute (the nonce carries a timestamp prefix).
+
+  So a worker can claim **at most one job, ever**.
+- **Job token:** a successful claim returns a fresh random `jobToken` bound to that job. Every later call for the job must carry it. A token for job A is rejected on job B (`403`).
+- **Why this holds:** the worker claims immediately at start-up, before any PR code exists in its container. By the time PR code can read the ticket and token, the ticket is spent and the token only reaches the worker's own job. The worst a compromised worker can do is lie about its **own** engine's result. That is the same power as PR content prompt-injecting that engine, which the two-engine design already assumes one engine may suffer.
+- **Same container:** the two engines of one request always run in different worker containers (each job is one engine attempt, and each worker claims one job).
 
 | Call | Who | Body / reply |
 |---|---|---|
-| `POST /v1/claim` | worker | Long-polls up to 25 s. Replies `204` (retry) or `200 {jobId, kind, options}`. `kind` is `codex-review`, `codex-report-only` or `claude-review`. `options` is the run-options object with its function fields removed (`registry`, `log`, `onProgress`). |
-| `POST /v1/jobs/:id/progress` | worker | `{line, activeMs}`, forwarded to the job's `onProgress`. Replies `200`, or `409 {cancel: true}` once the orchestrator wants the job stopped. |
-| `POST /v1/jobs/:id/heartbeat` | worker | Every 10 s. Same `409` cancel signal. |
-| `POST /v1/jobs/:id/result` | worker | `{ok: true, outcome}` or `{ok: false, error: SerializedRunError}`. |
-| `POST /v1/jobs/:id/log` | worker | Raw run-log chunks (UTF-8, at most 1 MiB per request, 50 MiB per job), appended to `<RUN_LOG_DIR>/<runId>.log` on the orchestrator. |
+| `POST /v1/claim` | worker, `Authorization: Ticket <ticket>` | Long-polls up to 25 s. Replies `204` (no job yet; the ticket is **not** spent), `403` (bad, spent or expired ticket), or `200 {jobId, jobToken, kind, options}`. `kind` is `codex-report-only` or `claude-review`. `options` is the run-options object with its function fields removed (`registry`, `log`, `onProgress`). |
+| `POST /v1/jobs/:id/progress` | worker, `Authorization: Job <jobToken>` | `{line, activeMs}`, forwarded to the job's `onProgress`. Replies `200`, or `409 {cancel: true}` once the orchestrator wants the job stopped. |
+| `POST /v1/jobs/:id/heartbeat` | worker, `Authorization: Job <jobToken>` | Every 10 s. Same `409` cancel signal. |
+| `POST /v1/jobs/:id/result` | worker, `Authorization: Job <jobToken>` | `{ok: true, outcome}` or `{ok: false, error: SerializedRunError}`. Accepted once; after that, the token is dead. |
+| `POST /v1/jobs/:id/log` | worker, `Authorization: Job <jobToken>` | Raw run-log chunks (UTF-8, at most 1 MiB per request, 50 MiB per job), appended to `<RUN_LOG_DIR>/<runId>.log` on the orchestrator. |
 
 **Error round-trip.** `SerializedRunError` is `{class, message, ...fields}` for `CodexStalledError` (snapshot), `CodexTimeoutError` (snapshot), `CodexOutputError` (`activeMs`, `tokensUsed`) and `ClaudeRunError` (`kind`, `activeMs`, `usage`). The remote run function rebuilds the same class, so the existing `instanceof` retry logic needs no change. Any other class comes back as a plain `Error` with a redacted message.
 
@@ -87,7 +107,7 @@ The protocol is HTTP/1.1 with JSON bodies on the `jobs` network. Every request c
   - `ENGINE_GH_TOKEN`;
   - `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` for the engine role;
   - `NPM_TOKEN`, written at startup into a worker-only npmrc (`npm_config_userconfig=/home/bot/.npmrc-worker`) for the `@trade-platform` CodeArtifact scope;
-  - `JOB_SECRET`.
+  - its one-use claim ticket (3.3) as `WORKER_TICKET`. It never receives `LAUNCH_KEY`.
 - **Config:** `ENGINE_AUTH=bedrock` with no `ENGINE_ROLE_ARN`, which is the "static credentials" mode from Phase 2a.
 
 ### 3.5 Profiles in container mode
@@ -105,13 +125,14 @@ Replaces today's daemon LaunchAgent. It runs under the operator's account and is
 1. **Start-up:**
    - assume `SlackReviewBotSecretsReaderRole` (from `LAUNCHER_AWS_PROFILE`, default `staging`) and fetch `/slack-review-bot/*`;
    - check `APPROVER_GH_TOKEN` ≠ `ENGINE_GH_TOKEN`;
-   - generate `JOB_SECRET`;
+   - generate `LAUNCH_KEY`, which goes to the orchestrator only;
    - run `docker compose up -d orchestrator`, passing the orchestrator's secrets as environment-sourced Compose `secrets:`.
 
    The values exist only in the launcher's memory and in the containers' `/run/secrets` tmpfs. Nothing is written to the host disk.
 2. **Worker loop**, with `WORKER_SLOTS` loops in parallel (default `2 × CONCURRENCY`, so a parallel dual run gets one worker per engine). Each iteration:
    - assume `SlackReviewBotEngineRole` (`--duration-seconds` per Phase 2a's `engineSessionSeconds`);
    - mint a CodeArtifact token (domain `trade-platform`, owner `153538148884`, `us-east-2`);
+   - create a one-use claim ticket from `LAUNCH_KEY` (3.3);
    - run `docker compose run --rm worker` with those values;
    - after the worker exits, back off 1 s, then repeat.
 
@@ -143,7 +164,7 @@ Replaces today's daemon LaunchAgent. It runs under the operator's account and is
 | Laptop | ECS |
 |---|---|
 | launcher fetches orchestrator secrets | Orchestrator task-definition `secrets` (valueFrom Secrets Manager) through the task execution role |
-| launcher's worker loop | Worker ECS service, desired count `WORKER_SLOTS`, task exits after one job, and the service replaces it |
+| launcher's worker loop | The orchestrator calls `ecs:RunTask` once per queued job, passing a fresh claim ticket in the container overrides. Its task role may run only the worker task definition, with `iam:PassRole` for the worker task role only. A long-running ECS *service* can't hand each task a unique ticket, so it isn't used. This is a scoped AWS API permission, not a Docker socket. |
 | engine role assumed by the launcher | Worker task role = `SlackReviewBotBedrockInvoke` policy (plus CodeArtifact read); credentials via the task metadata endpoint |
 | `jobs` internal network | Service Connect / Cloud Map name, with a security group allowing worker → orchestrator on the job port only |
 | `orchestrator-state` volume | EFS access point mounted only by the orchestrator |
@@ -182,7 +203,7 @@ The worker-side doctor check "no AWS credentials except the engine role" holds o
    - copy `~/.local/state/slack-review-bot/cursors.json` into the `orchestrator-state` volume;
    - run `scripts/install-service.sh --uninstall`;
    - install the launcher LaunchAgent.
-5. **First reviews:** run in single mode (`REVIEW_ENGINES=codex`, `ENGINE_AUTH=bedrock`) on low-risk PRs.
+5. **First reviews:** run in single mode (`REVIEW_ENGINES=codex`, `ENGINE_AUTH=bedrock`, report-only per D8) on low-risk PRs. Confirm that one role-account COMMENT review is posted per PR and that no APPROVE is posted.
 6. **Rollback:** unload the launcher, `docker compose down`, then `scripts/install-service.sh`. The cursor file on the host is still the old one; copy it back from the volume first if reviews ran in between.
 
 Dual mode is flipped afterwards, under https://github.com/andrew-barnett/slack-review-bot/issues/71.
