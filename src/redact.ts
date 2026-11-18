@@ -41,7 +41,22 @@ const SHAPE_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   [/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, '[redacted:aws-key-id]'],
   // npm automation/publish tokens.
   [/npm_[A-Za-z0-9]{36}/g, '[redacted:npm-token]'],
+  // AWS secret keys and session tokens have no recognisable shape, so match them by the name beside
+  // them: env/ini (`AWS_SECRET_ACCESS_KEY=…`, `aws_session_token = …`) and STS JSON
+  // (`"SecretAccessKey": "…"`). Bedrock mode hands both to the engines (issue #69). The name is kept
+  // and only the value replaced; the placeholder's `[` is outside the value class, so it is idempotent.
+  [
+    /\b(aws_secret_access_key|aws_session_token|SecretAccessKey|SessionToken)(["']?\s*[=:]\s*["']?)[A-Za-z0-9/+=]{16,}/gi,
+    '$1$2[redacted:aws-secret]',
+  ],
 ]
+
+/** How many {@link registerHeldSecret} values are kept; the oldest is evicted past this. */
+export const HELD_SECRET_LIMIT = 64
+
+// Secrets the daemon holds outside its environment (minted engine credentials), matched by literal
+// value like the env layer. Bounded and FIFO: one set is minted per engine attempt for months.
+const heldSecrets: string[] = []
 
 // Environment variable NAMES whose value is a secret worth scrubbing by literal match. Deliberately
 // specific so it never matches non-secret vars whose value is long and appears in output — notably
@@ -51,6 +66,32 @@ const SENSITIVE_ENV_NAME = /(TOKEN|SECRET|PASSWORD|CREDENTIAL|API_?KEY|ACCESS_KE
 // Below this length an env value is too short to be a credential and too likely to be a common
 // substring (a flag, a small number) whose blanket replacement would corrupt legitimate output.
 const MIN_ENV_VALUE_LENGTH = 12
+
+/**
+ * Register a secret the daemon holds outside its environment, so every later redaction masks its
+ * literal value. Minted engine credentials (issue #69) never enter the daemon's environment, so the
+ * env layer cannot see them, yet a PR the engine runs can print them. Values shorter than the env
+ * layer's minimum are ignored, for the same reason.
+ */
+export function registerHeldSecret(value: string | undefined): void {
+  if (!value || value.length < MIN_ENV_VALUE_LENGTH || heldSecrets.includes(value)) return
+  heldSecrets.push(value)
+  if (heldSecrets.length > HELD_SECRET_LIMIT) heldSecrets.shift()
+}
+
+function maskLiteral(text: string, value: string): string {
+  // A multiline secret (e.g. a private key held in an env var) is published one line at a time by
+  // the streaming redactor, so the whole value never appears in a single span. Match the whole
+  // value AND each of its lines, longest first, so a surfaced fragment is masked too.
+  let out = text
+  const needles = [value, ...value.split(/\r?\n/)]
+    .filter(n => n.length >= MIN_ENV_VALUE_LENGTH)
+    .sort((a, b) => b.length - a.length)
+  for (const needle of needles) {
+    if (out.includes(needle)) out = out.split(needle).join('[redacted:env]')
+  }
+  return out
+}
 
 /**
  * Return `text` with credential-shaped substrings and any held environment secrets masked.
@@ -72,16 +113,9 @@ export function redactSecrets(text: string, env: NodeJS.ProcessEnv = process.env
     const value = env[name]
     if (!value || value.length < MIN_ENV_VALUE_LENGTH) continue
     if (!SENSITIVE_ENV_NAME.test(name)) continue
-    // A multiline secret (e.g. a private key held in an env var) is published one line at a time by
-    // the streaming redactor, so the whole value never appears in a single span. Match the whole
-    // value AND each of its lines, longest first, so a surfaced fragment is masked too.
-    const needles = [value, ...value.split(/\r?\n/)]
-      .filter(n => n.length >= MIN_ENV_VALUE_LENGTH)
-      .sort((a, b) => b.length - a.length)
-    for (const needle of needles) {
-      if (out.includes(needle)) out = out.split(needle).join('[redacted:env]')
-    }
+    out = maskLiteral(out, value)
   }
+  for (const value of heldSecrets) out = maskLiteral(out, value)
   return out
 }
 
