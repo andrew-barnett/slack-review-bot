@@ -2,10 +2,8 @@
   "permissions": {
     "defaultMode": "dontAsk",
     "deny": [
-      "Read(/__ENV_DIR__/**)",
-      "Read(/__GH_CONFIG_DIR__/**)",
-      "Edit(/__ENV_DIR__/**)",
-      "Edit(/__GH_CONFIG_DIR__/**)",
+      "__DENY_READ_RULES__",
+      "__DENY_EDIT_RULES__",
       "Edit(/__WORKSPACE_ROOT__/**)"
     ]
   },
@@ -14,14 +12,8 @@
     "autoAllowBashIfSandboxed": true,
     "allowUnsandboxedCommands": false,
     "filesystem": {
-      "denyRead": ["__ENV_DIR__", "__GH_CONFIG_DIR__"],
-      "allowWrite": [
-        "__WORKTREE_ROOT__",
-        "__HOME__/.npm",
-        "__HOME__/.cache",
-        "__HOME__/Library/Caches",
-        "__HOME__/Library/pnpm"
-      ]
+      "denyRead": ["__DENY_DIRS__"],
+      "allowWrite": ["__ENGINE_WORKTREE_ROOT__"]
     },
     "network": {
       "allowedDomains": [

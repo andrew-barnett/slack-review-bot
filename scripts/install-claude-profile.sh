@@ -67,8 +67,47 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-TEMPLATE="${REPO}/claude/review-bot.settings.json.template"
-ENV_DIR="$(dirname "${DAEMON_ENV_FILE}")"
+# Every directory must be absolute, non-empty, free of ".." segments and not "/": these paths become
+# sandbox grants and deny rules, and a relative or root path would silently widen or void them.
+# Prints the path without trailing slashes.
+require_abs_dir() {
+    local name="$1" value="$2"
+    if [ -z "${value}" ]; then
+        echo "ERROR: ${name} is empty" >&2
+        exit 1
+    fi
+    case "${value}" in
+        /*) ;;
+        *)
+            echo "ERROR: ${name} must be an absolute path: ${value}" >&2
+            exit 1
+            ;;
+    esac
+    case "/${value}/" in
+        */../*)
+            echo "ERROR: ${name} must not contain '..': ${value}" >&2
+            exit 1
+            ;;
+    esac
+    while [ "${#value}" -gt 1 ] && [ "${value%/}" != "${value}" ]; do
+        value="${value%/}"
+    done
+    if [ "${value}" = "/" ]; then
+        echo "ERROR: ${name} must not be the filesystem root" >&2
+        exit 1
+    fi
+    printf '%s' "${value}"
+}
+
+HOME="$(require_abs_dir HOME "${HOME:-}")"
+PROFILE_DIR="$(require_abs_dir --dir "${PROFILE_DIR}")"
+WORKSPACE_ROOT_ARG="$(require_abs_dir --workspace-root "${WORKSPACE_ROOT_ARG}")"
+WORKTREE_ROOT_ARG="$(require_abs_dir --worktree-root "${WORKTREE_ROOT_ARG}")"
+SKILL_SRC="$(require_abs_dir --skill-src "${SKILL_SRC}")"
+HOOK_SRC="$(require_abs_dir --hook-src "${HOOK_SRC}")"
+DAEMON_ENV_FILE="$(require_abs_dir --env-file "${DAEMON_ENV_FILE}")"
+GH_DIR="$(require_abs_dir --gh-config-dir "${GH_DIR}")"
+ENV_DIR="$(require_abs_dir "--env-file's directory" "$(dirname "${DAEMON_ENV_FILE}")")"
 
 if [ "${CHECK_ONLY}" -eq 0 ]; then
     if [ ! -f "${SKILL_SRC}/SKILL.md" ]; then
@@ -85,13 +124,10 @@ if [ "${CHECK_ONLY}" -eq 0 ]; then
     ln -sfn "$(cd "${SKILL_SRC}" && pwd -P)" "${PROFILE_DIR}/skills/review-pr"
     ln -sfn "$(node -e 'process.stdout.write(require("fs").realpathSync(process.argv[1]))' "${HOOK_SRC}")" \
         "${PROFILE_DIR}/hooks/block-secret-reads.py"
-    sed -e "s|__HOME__|${HOME}|g" \
-        -e "s|__PROFILE_DIR__|${PROFILE_DIR}|g" \
-        -e "s|__WORKSPACE_ROOT__|${WORKSPACE_ROOT_ARG}|g" \
-        -e "s|__WORKTREE_ROOT__|${WORKTREE_ROOT_ARG}|g" \
-        -e "s|__ENV_DIR__|${ENV_DIR}|g" \
-        -e "s|__GH_CONFIG_DIR__|${GH_DIR}|g" \
-        "${TEMPLATE}" > "${PROFILE_DIR}/settings.json"
+    # Render with node (real JSON, deny dirs resolved with realpath), not sed substitution.
+    SETTINGS_JSON="$(node "${REPO}/scripts/claude-profile-lib.js" render "${PROFILE_DIR}" "${WORKSPACE_ROOT_ARG}" \
+        "${WORKTREE_ROOT_ARG}" "${ENV_DIR}" "${GH_DIR}" "${HOME}")"
+    printf '%s\n' "${SETTINGS_JSON}" > "${PROFILE_DIR}/settings.json"
     echo "installed ${PROFILE_DIR}"
 fi
 
@@ -100,4 +136,5 @@ fi
 ## fails validation, so a broken file would run the engine with no sandbox and no read denies.
 ## Everything is checked by value, not by grep, by check-claude-profile.js.
 ##
-node "${REPO}/scripts/check-claude-profile.js" "${PROFILE_DIR}" "${ENV_DIR}" "${GH_DIR}"
+node "${REPO}/scripts/check-claude-profile.js" "${PROFILE_DIR}" "${WORKSPACE_ROOT_ARG}" "${WORKTREE_ROOT_ARG}" \
+    "${ENV_DIR}" "${GH_DIR}" "${HOME}"
