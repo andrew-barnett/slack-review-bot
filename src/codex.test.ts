@@ -16,9 +16,11 @@ import {
   drainChildRegistry,
   describeStall,
   describeTimeout,
+  deniedPassthrough,
   runCodexReview,
   OUTPUT_FLUSH_LIMIT,
   TRANSCRIPT_TAIL_LIMIT,
+  withEngineGhToken,
   withGitSigningDisabled,
   type Spawner,
 } from './codex'
@@ -950,5 +952,43 @@ test('drainChildRegistry resolves immediately when nothing is registered', async
   const reg = createChildRegistry()
   await drainChildRegistry(reg, { now: d.now, setTimer: d.setTimer, graceMs: 1_000, pollMs: 200 })
   t.notOk(d.hasPending(), 'no poll scheduled when there is nothing to drain')
+  t.end()
+})
+
+// The approver token can approve PRs. If an operator names it in CODEX_ENV_PASSTHROUGH it must
+// still be dropped, or untrusted PR code could read it and approve itself.
+test('buildChildEnv drops daemon secrets even when passed through', t => {
+  const env = buildChildEnv(
+    { PATH: '/bin', APPROVER_GH_TOKEN: 'approver', ENGINE_GH_TOKEN: 'engine' },
+    ['APPROVER_GH_TOKEN', 'ENGINE_GH_TOKEN']
+  )
+  t.deepEqual(env, { PATH: '/bin' })
+  t.deepEqual(deniedPassthrough(['APPROVER_GH_TOKEN', 'FOO']), ['APPROVER_GH_TOKEN'], 'the denied name is reported for a warning')
+  t.end()
+})
+
+// In dual mode engines must authenticate as the read-only engine token. An inherited
+// GITHUB_TOKEN or enterprise token would otherwise give them whatever the operator's token can do.
+test('withEngineGhToken sets GH_TOKEN and strips the other GitHub tokens', t => {
+  const env = withEngineGhToken({ PATH: '/bin', GH_TOKEN: 'operator', GITHUB_TOKEN: 'operator2', GH_ENTERPRISE_TOKEN: 'ent' }, 'engine')
+  t.deepEqual(env, { PATH: '/bin', GH_TOKEN: 'engine' })
+  t.end()
+})
+
+// The runner must apply the engine token to the spawned child when one is configured.
+test('runCodexReview hands the engine token to the child as GH_TOKEN', async t => {
+  const child = new FakeChild()
+  let seen: NodeJS.ProcessEnv | undefined
+  const spawner = ((_bin: string, _args: string[], spawnOpts: { env: NodeJS.ProcessEnv }) => {
+    seen = spawnOpts['env']
+    return child
+  }) as unknown as Spawner
+  const clock = fakeClock()
+  const run = runCodexReview({ ...runOptions(), engineGhToken: 'engine-placeholder' }, spawner, clock.deps).catch(() => undefined)
+  await settle()
+  child.emit('close', 1)
+  await run
+  t.equal(seen?.GH_TOKEN, 'engine-placeholder')
+  t.notOk('GITHUB_TOKEN' in (seen ?? {}), 'no other GitHub token survives')
   t.end()
 })

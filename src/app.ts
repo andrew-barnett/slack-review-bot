@@ -15,12 +15,13 @@ import {
 } from './catchup'
 import {
   createChildRegistry,
+  deniedPassthrough,
   drainChildRegistry,
   runCodexReview,
   SHUTDOWN_GRACE_MS,
   SHUTDOWN_POLL_MS,
 } from './codex'
-import { loadConfig, looksLikeUserId } from './config'
+import { DUAL_MODE_AVAILABLE, isDualMode, loadConfig, looksLikeUserId, scrubDaemonSecrets } from './config'
 import { ensureRegistryAuth } from './registry-auth'
 import { createShutdownController } from './shutdown'
 import { openCursorStore, openNullCursorStore } from './cursor'
@@ -80,6 +81,15 @@ function installCrashHandlers(): void {
 async function main(): Promise<void> {
   installCrashHandlers()
   const config = loadConfig()
+  // The tokens now live only in `config`; drop them from the environment every later spawn inherits.
+  scrubDaemonSecrets(process.env)
+  if (isDualMode(config) && !DUAL_MODE_AVAILABLE) {
+    throw new Error('REVIEW_ENGINES=codex,claude is not available in this build yet (https://github.com/andrew-barnett/slack-review-bot/issues/61)')
+  }
+  const denied = deniedPassthrough(config.codexEnvPassthrough)
+  if (denied.length) {
+    log('config.passthrough_denied', { names: denied, hint: 'daemon-held tokens never reach the review child' })
+  }
   // The receiver is built here rather than left to `socketMode: true`, because App keeps its
   // receiver private: constructing it is the only way to reach the SocketModeClient and hear
   // its connection events, which is where the catch-up hooks in.

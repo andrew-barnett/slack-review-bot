@@ -4,7 +4,7 @@ import { spawn, type ChildProcess } from 'child_process'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { CODEX_ENV_ALLOWLIST, CODEX_ENV_ALLOWLIST_PREFIXES } from './config'
+import { CODEX_ENV_ALLOWLIST, CODEX_ENV_ALLOWLIST_PREFIXES, DAEMON_SECRET_VARS } from './config'
 import { startActiveDeadline, type DeadlineDeps, type DeadlineSnapshot } from './deadline'
 import { REVIEW_OUTPUT_SCHEMA, parseReviewResult, type ReviewRunResult } from './schema'
 import { parseTokensUsed } from './usage'
@@ -34,6 +34,8 @@ export interface CodexRunOptions {
   disableGitSigning: boolean
   /** Extra env var names to pass to the Codex child on top of the built-in allowlist. */
   envPassthrough?: string[]
+  /** Dual mode: the read-only engine token, set as the child's GH_TOKEN. Undefined in single mode. */
+  engineGhToken?: string
   /**
    * Registry the spawned child registers into for its lifetime, so a daemon shutdown can signal
    * every in-flight `codex exec` process group instead of orphaning it. Optional: the CLI has none.
@@ -177,14 +179,36 @@ export function buildChildEnv(
   extraNames: readonly string[] = []
 ): NodeJS.ProcessEnv {
   const allowed = new Set<string>([...CODEX_ENV_ALLOWLIST, ...extraNames])
+  // Daemon-held tokens are denied outright, even when an operator names them as passthrough:
+  // the approver token can approve PRs, and engines run untrusted PR code.
+  for (const name of DAEMON_SECRET_VARS) allowed.delete(name)
   const out: NodeJS.ProcessEnv = {}
   for (const [key, value] of Object.entries(env)) {
     if (value === undefined) continue
+    if (DAEMON_SECRET_VARS.includes(key)) continue
     if (allowed.has(key) || CODEX_ENV_ALLOWLIST_PREFIXES.some(prefix => key.startsWith(prefix))) {
       out[key] = value
     }
   }
   return out
+}
+
+/** The passthrough names that will be ignored because they are daemon secrets; for a startup warning. */
+export function deniedPassthrough(extraNames: readonly string[]): string[] {
+  return extraNames.filter(name => DAEMON_SECRET_VARS.includes(name))
+}
+
+/**
+ * Point the child's `gh` at the read-only engine token. GH_TOKEN wins over GITHUB_TOKEN in gh,
+ * but both other token variables are removed anyway, so nothing else the child runs (a PR's test
+ * script, for example) finds a broader credential.
+ */
+export function withEngineGhToken(env: NodeJS.ProcessEnv, token: string): NodeJS.ProcessEnv {
+  const copy: NodeJS.ProcessEnv = { ...env }
+  delete copy.GITHUB_TOKEN
+  delete copy.GH_ENTERPRISE_TOKEN
+  copy.GH_TOKEN = token
+  return copy
 }
 
 /**
@@ -275,6 +299,7 @@ export async function runCodexReview(
 
   let env = buildChildEnv(process.env, options.envPassthrough)
   if (options.disableGitSigning) env = withGitSigningDisabled(env)
+  if (options.engineGhToken) env = withEngineGhToken(env, options.engineGhToken)
 
   const args = buildCodexArgs({
     profile: options.profile,
