@@ -84,10 +84,45 @@ if (/__[A-Z_]+__/.test(JSON.stringify(s))) problems.push('settings.json still co
 // Catch-all: anything else that diverges from the rendering (network, extra keys, extra rules).
 if (!problems.length && !isDeepStrictEqual(s, expected)) problems.push('settings.json differs from the expected rendering')
 
-// Exact profile contents: only settings.json, skills/review-pr and hooks/block-secret-reads.py.
-for (const forbidden of ['settings.local.json', '.claude.json', '.mcp.json', 'plugins', 'agents', 'commands', 'CLAUDE.md']) {
-  const p = path.join(dir, forbidden)
-  if (fs.existsSync(p) || isLink(p)) problems.push(`${forbidden} is present in the profile dir; the engine must not load it`)
+// Profile contents: settings.json, skills/review-pr and hooks/block-secret-reads.py, plus the runtime
+// state Claude Code writes into CLAUDE_CONFIG_DIR on every run (probed on 2.1.284). None of the state
+// names is required to exist. Anything else (settings.local.json, .mcp.json, plugins, agents,
+// commands, CLAUDE.md, unknown files) is rejected.
+const RUNTIME_STATE = [
+  '.claude.json', 'backups', 'projects', 'sessions', 'todos', 'shell-snapshots',
+  'statsig', 'session-env', 'file-history', 'debug', 'plans', 'cache',
+]
+const ALLOWED = new Set(['settings.json', 'skills', 'hooks', ...RUNTIME_STATE])
+for (const name of fs.readdirSync(dir)) {
+  if (!ALLOWED.has(name)) problems.push(`${name} is present in the profile dir; the engine must not load it`)
+}
+// Runtime state must not smuggle in MCP servers: .claude.json is parsed and checked, failing closed.
+const stateFile = path.join(dir, '.claude.json')
+if (fs.existsSync(stateFile)) {
+  let state
+  try {
+    state = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
+  } catch (error) {
+    problems.push('.claude.json is unreadable or not valid JSON')
+  }
+  if (state !== undefined) {
+    const nonEmpty = v => v !== undefined && v !== null && (typeof v !== 'object' || Object.keys(v).length > 0)
+    if (!state || typeof state !== 'object' || Array.isArray(state)) {
+      problems.push('.claude.json is not a JSON object')
+    } else {
+      if (nonEmpty(state.mcpServers)) problems.push('.claude.json configures top-level mcpServers')
+      const projects = state.projects
+      if (projects !== undefined && (!projects || typeof projects !== 'object' || Array.isArray(projects))) {
+        problems.push('.claude.json projects is not an object')
+      } else {
+        for (const [name, entry] of Object.entries(projects || {})) {
+          if (!entry || typeof entry !== 'object') continue
+          if (nonEmpty(entry.mcpServers)) problems.push(`.claude.json projects entry ${name} configures mcpServers`)
+          if (nonEmpty(entry.enabledMcpjsonServers)) problems.push(`.claude.json projects entry ${name} has enabledMcpjsonServers`)
+        }
+      }
+    }
+  }
 }
 if (!isDeepStrictEqual(entries('skills'), ['review-pr'])) problems.push('skills/ must contain exactly review-pr')
 if (!isDeepStrictEqual(entries('hooks'), ['block-secret-reads.py'])) problems.push('hooks/ must contain exactly block-secret-reads.py')

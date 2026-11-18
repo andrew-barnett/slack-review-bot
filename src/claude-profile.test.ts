@@ -155,10 +155,10 @@ test('check-claude-profile rejects a wrong hook command or matcher', t => {
 
 // Files Claude Code would load on top of settings.json (local overrides, MCP, plugins) break isolation.
 test('check-claude-profile rejects forbidden profile files and dirs', t => {
-  for (const name of ['settings.local.json', '.claude.json', '.mcp.json', 'plugins', 'agents', 'commands']) {
+  for (const name of ['settings.local.json', 'unknown-file', '.mcp.json', 'plugins', 'agents', 'commands']) {
     const out = checkMutated((_s, dir) => {
       const p = path.join(dir, name)
-      if (name.includes('.')) fs.writeFileSync(p, '{}')
+      if (!['plugins', 'agents', 'commands'].includes(name)) fs.writeFileSync(p, '{}')
       else fs.mkdirSync(p)
     })
     t.equal(out.status, 1, name)
@@ -206,5 +206,65 @@ test('install-claude-profile refuses a profile dir inside a read-denied dir', t 
   const out = run(['--dir', path.join(home, '.claude', 'review-bot')])
   t.equal(out.status, 1)
   t.match(out.stderr, /inside the read-denied dir/)
+  t.end()
+})
+
+/** Install a good profile, then let `setup` add files to the profile dir before --check runs. */
+function checkWithState(setup: (dir: string) => void) {
+  const { dir, run } = sandboxHome()
+  const installed = run()
+  if (installed.status !== 0) throw new Error(`baseline install failed: ${installed.stderr}`)
+  setup(dir)
+  return run(['--check'])
+}
+
+// Claude Code writes these into CLAUDE_CONFIG_DIR on every run (probed on 2.1.284, even unauthenticated).
+// Regression caught: a checker that rejects them would fail doctor after the first engine run.
+test('check-claude-profile accepts Claude runtime state', t => {
+  const out = checkWithState(dir => {
+    fs.writeFileSync(path.join(dir, '.claude.json'), '{}')
+    for (const d of ['backups', 'projects', 'sessions']) fs.mkdirSync(path.join(dir, d))
+    fs.writeFileSync(path.join(dir, 'backups', '.claude.json.backup.1'), '{}')
+  })
+  t.equal(out.status, 0, out.stderr)
+  t.end()
+})
+
+// Runtime state must not smuggle in MCP servers: top-level, per-project, or enabled project servers.
+test('check-claude-profile rejects MCP servers in .claude.json', t => {
+  const cases: Array<[unknown, RegExp]> = [
+    [{ mcpServers: { evil: { command: 'x' } } }, /top-level mcpServers/],
+    [{ projects: { '/some/repo': { mcpServers: { evil: { command: 'x' } } } } }, /configures mcpServers/],
+    [{ projects: { '/some/repo': { enabledMcpjsonServers: ['evil'] } } }, /enabledMcpjsonServers/],
+    [{ mcpServers: {}, projects: { '/some/repo': { mcpServers: {}, enabledMcpjsonServers: [] } } }, /^$/],
+  ]
+  for (const [state, re] of cases) {
+    const out = checkWithState(dir => fs.writeFileSync(path.join(dir, '.claude.json'), JSON.stringify(state)))
+    if (String(re) === String(/^$/)) {
+      t.equal(out.status, 0, 'empty MCP containers are benign')
+    } else {
+      t.equal(out.status, 1)
+      t.match(out.stderr, re)
+    }
+  }
+  t.end()
+})
+
+// An unparseable .claude.json cannot be verified MCP-free, so the check fails closed.
+test('check-claude-profile fails closed on an unparseable .claude.json', t => {
+  const out = checkWithState(dir => fs.writeFileSync(path.join(dir, '.claude.json'), '{nope'))
+  t.equal(out.status, 1)
+  t.match(out.stderr, /\.claude\.json is unreadable or not valid JSON/)
+  t.end()
+})
+
+// The runtime-state allowance is by name only: an unknown file is still rejected.
+test('check-claude-profile still rejects an unknown extra file next to runtime state', t => {
+  const out = checkWithState(dir => {
+    fs.writeFileSync(path.join(dir, '.claude.json'), '{}')
+    fs.writeFileSync(path.join(dir, 'extra.txt'), 'x')
+  })
+  t.equal(out.status, 1)
+  t.match(out.stderr, /extra\.txt is present/)
   t.end()
 })
