@@ -9,8 +9,13 @@ import {
   runCodexReview,
   type ChildRegistry,
 } from './codex'
-import { isDualMode, type ReviewConfig } from './config'
+import { makeApproverGitHub, type ApproverGitHub } from './approver-github'
+import { assertModeAvailable, DUAL_MODE_AVAILABLE, isDualMode, type ReviewConfig } from './config'
+import { makeDualReviewRunner } from './dual'
+import { makeClaudeEngine, makeCodexEngine, type EngineDeps } from './engine'
+import { makeGitHubEffects } from './github'
 import type { ReviewRequest } from './job'
+import type { PullRequestRef } from './parse-message'
 import type { ActiveReviews } from './progress'
 import { buildPrompt } from './prompt'
 import { reconcileResults } from './schema'
@@ -164,4 +169,66 @@ export function makeReviewRunner(
     // type checker that the function cannot fall through without one.
     throw new Error('review runner exhausted its attempts without producing a result')
   }
+}
+
+/**
+ * Wrap an async step so concurrent callers run it one at a time. In parallel dual mode both
+ * engines refresh the CodeArtifact token before each attempt; two refreshes at once would race on
+ * the same user config file.
+ */
+export function serialized(fn: () => Promise<void>): () => Promise<void> {
+  let chain: Promise<void> = Promise.resolve()
+  return () => {
+    const next = chain.then(fn, fn)
+    chain = next.catch(() => {})
+    return next
+  }
+}
+
+export interface RunnerDeps {
+  log?: (event: string, fields: Record<string, unknown>) => void
+  reviews?: ActiveReviews
+  /** Shared by every engine child, so a shutdown drains both of a parallel run's children. */
+  registry?: ChildRegistry
+  refreshAuth?: () => Promise<void>
+  /** Dual mode: the role-account client. Built from APPROVER_GH_TOKEN when absent. */
+  gh?: ApproverGitHub
+  /** Dual mode: changed file names for the pre-flight. Defaults to the existing gh effect. */
+  listChangedFiles?: (pr: PullRequestRef) => Promise<string[]>
+  /** Injection seams for the engines' child runs (tests). */
+  engineDeps?: Pick<EngineDeps, 'runCodex' | 'runClaude'>
+}
+
+/**
+ * The review runner for the configured mode: today's single-engine Codex runner, or the dual-engine
+ * gate. `available` defaults to DUAL_MODE_AVAILABLE; tests pass true to reach the dual path. The
+ * daemon and CLI already refused an unavailable dual mode at startup, so this is a second guard.
+ */
+export function selectReviewRunner(
+  config: ReviewConfig,
+  deps: RunnerDeps = {},
+  available: boolean = DUAL_MODE_AVAILABLE
+): (request: ReviewRequest) => Promise<ReviewOutcome> {
+  if (!isDualMode(config)) {
+    return makeReviewRunner(config, deps.log, runCodexReview, deps.reviews, deps.registry, deps.refreshAuth)
+  }
+  assertModeAvailable(config, available)
+  const log = deps.log ?? (() => {})
+  const engineDeps: EngineDeps = {
+    ...deps.engineDeps,
+    log,
+    registry: deps.registry,
+    refreshAuth: deps.refreshAuth ? serialized(deps.refreshAuth) : undefined,
+  }
+  const makers = { codex: makeCodexEngine, claude: makeClaudeEngine }
+  return makeDualReviewRunner({
+    gh: deps.gh ?? makeApproverGitHub(config.approverGhToken),
+    engines: config.engineOrder.map(name => makers[name](config, engineDeps)),
+    schedule: config.engineSchedule,
+    worktreeRoot: config.worktreeRoot,
+    listChangedFiles: deps.listChangedFiles ?? makeGitHubEffects().listChangedFiles!,
+    runIdFor,
+    log,
+    reviews: deps.reviews,
+  })
 }

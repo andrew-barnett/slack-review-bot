@@ -1,6 +1,6 @@
 import test from 'tape'
 import { SHUTDOWN_GRACE_MS } from './codex'
-import { APPROVER_TOKEN_VAR, DAEMON_SECRET_VARS, ENGINE_TOKEN_VAR, isDualMode, loadConfig, loadReviewConfig, looksLikeUserId, parseMsList, parseEngineOrder, parseEngines, parseSchedule, parseUserIds, scrubDaemonSecrets } from './config'
+import { APPROVER_TOKEN_VAR, assertModeAvailable, DAEMON_SECRET_VARS, DUAL_MODE_AVAILABLE, ENGINE_TOKEN_VAR, isDualMode, loadConfig, loadReviewConfig, looksLikeUserId, parseMsList, parseEngineOrder, parseEngines, parseSchedule, parseUserIds, scrubDaemonSecrets } from './config'
 
 /** The two required keys, so a test can vary only the knob it cares about. */
 const credentials = { SLACK_BOT_TOKEN: 'placeholder', SLACK_APP_TOKEN: 'placeholder' }
@@ -351,5 +351,15 @@ test('loadConfig defaults the dual-mode emoji and lets each be overridden', t =>
   t.equal(c.headMovedEmoji, 'arrows_counterclockwise')
   t.notOk([c.approvalPartialEmoji, c.approvalNotCountedEmoji, c.headMovedEmoji].includes(c.passEmoji))
   t.equal(loadConfig({ ...credentials, HEAD_MOVED_EMOJI: 'repeat' }).headMovedEmoji, 'repeat')
+  t.end()
+})
+
+// The availability seam: dual mode is refused while DUAL_MODE_AVAILABLE is false (issue 64), and
+// tests reach dual paths by passing `available` rather than flipping the constant.
+test('assertModeAvailable refuses dual mode unless it is available', t => {
+  t.equal(DUAL_MODE_AVAILABLE, false, 'dual mode stays off until the issue 64 flip checklist is done')
+  t.throws(() => assertModeAvailable({ reviewEngines: ['codex', 'claude'] }), /issues\/64/)
+  t.doesNotThrow(() => assertModeAvailable({ reviewEngines: ['codex', 'claude'] }, true))
+  t.doesNotThrow(() => assertModeAvailable({ reviewEngines: ['codex'] }))
   t.end()
 })

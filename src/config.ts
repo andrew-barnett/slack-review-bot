@@ -26,10 +26,22 @@ export const ENGINE_TOKEN_VAR = 'ENGINE_GH_TOKEN'
 export const DAEMON_SECRET_VARS: readonly string[] = [APPROVER_TOKEN_VAR, ENGINE_TOKEN_VAR]
 
 /**
- * Whether dual mode can run in this build. False until the orchestrator lands
- * (https://github.com/andrew-barnett/slack-review-bot/issues/61); startup refuses dual mode while it is.
+ * Whether dual mode may run. The orchestrator exists, but this stays false until the filesystem
+ * boundary for the approver token lands (https://github.com/andrew-barnett/slack-review-bot/issues/64)
+ * and the V1/V3 checks that need the role account's token are done; see the README's flip checklist.
+ * Startup refuses dual mode while it is false. Tests reach dual paths through the `available`
+ * parameter of assertModeAvailable and selectReviewRunner, never by changing this constant.
  */
 export const DUAL_MODE_AVAILABLE = false
+
+/** Throw when dual mode is configured but not available in this build. */
+export function assertModeAvailable(config: Pick<ReviewConfig, 'reviewEngines'>, available: boolean = DUAL_MODE_AVAILABLE): void {
+  if (isDualMode(config) && !available) {
+    throw new Error(
+      'REVIEW_ENGINES=codex,claude is not available yet: it is gated on https://github.com/andrew-barnett/slack-review-bot/issues/64'
+    )
+  }
+}
 
 /**
  * Everything needed to run a review. Deliberately free of Slack credentials so the

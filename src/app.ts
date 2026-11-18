@@ -13,25 +13,25 @@ import {
   type CatchUpReason,
   type ConnectionState,
 } from './catchup'
+import { makeApproverGitHub } from './approver-github'
 import {
   createChildRegistry,
   deniedPassthrough,
   drainChildRegistry,
-  runCodexReview,
   SHUTDOWN_GRACE_MS,
   SHUTDOWN_POLL_MS,
 } from './codex'
-import { DUAL_MODE_AVAILABLE, isDualMode, loadConfig, looksLikeUserId, scrubDaemonSecrets } from './config'
+import { assertModeAvailable, isDualMode, loadConfig, looksLikeUserId, scrubDaemonSecrets } from './config'
 import { ensureRegistryAuth } from './registry-auth'
 import { createShutdownController } from './shutdown'
 import { openCursorStore, openNullCursorStore } from './cursor'
-import { makeGitHubEffects } from './github'
+import { makeJobGitHubEffects } from './github'
 import { renderHelp } from './help'
 import { runJob, type JobDeps } from './job'
 import { createActiveReviews } from './progress'
 import { TaskQueue } from './queue'
 import { fetchHistorySince, replayMissed, type ReplaySummary } from './replay'
-import { makeReviewRunner } from './review'
+import { selectReviewRunner } from './review'
 import {
   decideTrigger,
   isHelpRequest,
@@ -83,9 +83,7 @@ async function main(): Promise<void> {
   const config = loadConfig()
   // The tokens now live only in `config`; drop them from the environment every later spawn inherits.
   scrubDaemonSecrets(process.env)
-  if (isDualMode(config) && !DUAL_MODE_AVAILABLE) {
-    throw new Error('REVIEW_ENGINES=codex,claude is not available in this build yet (https://github.com/andrew-barnett/slack-review-bot/issues/61)')
-  }
+  assertModeAvailable(config)
   const denied = deniedPassthrough(config.codexEnvPassthrough)
   if (denied.length) {
     log('config.passthrough_denied', { names: denied, hint: 'daemon-held tokens never reach the review child' })
@@ -139,13 +137,23 @@ async function main(): Promise<void> {
   // to idle, and — if that times out — force-kill them so they replay cleanly instead of settling
   // as a spurious error. Its `forced` flag gates the cursor settle and the error thread below.
   const shutdown = createShutdownController()
-  const runReview = makeReviewRunner(config, log, runCodexReview, reviews, childRegistry, () =>
-    ensureRegistryAuth({
-      scriptPath: config.codeartifactLoginScript,
-      enabled: config.codeartifactRefreshEnabled,
-      log,
-    })
-  )
+  // Dual mode only: the role-account client. It keeps the approver token in a closure and hands it
+  // to gh per call, never through the daemon's own environment (spec 5.7).
+  const approverGh = isDualMode(config) ? makeApproverGitHub(config.approverGhToken) : undefined
+  // One runner for either mode. The child registry is shared, so a shutdown drains both of a
+  // parallel dual run's children.
+  const runReview = selectReviewRunner(config, {
+    log,
+    reviews,
+    registry: childRegistry,
+    gh: approverGh,
+    refreshAuth: () =>
+      ensureRegistryAuth({
+        scriptPath: config.codeartifactLoginScript,
+        enabled: config.codeartifactRefreshEnabled,
+        log,
+      }),
+  })
   // How far each channel has been processed, on disk. This is what makes a restart able to
   // pick up messages posted while the socket was down — Slack never redelivers them.
   const cursors = config.cursorFile
@@ -308,7 +316,7 @@ async function main(): Promise<void> {
     let usage: RunUsage | undefined
     const deps: JobDeps = {
       ...makeSlackEffects(client),
-      ...makeGitHubEffects(),
+      ...makeJobGitHubEffects(config, approverGh),
       runReview,
       recordUsage: u => {
         usage = u
@@ -378,11 +386,11 @@ async function main(): Promise<void> {
           { queued: queuedReaction, postUsage: config.usageReplyEnabled }
         )
       })
-      .then(outcome => stats.record(outcome, request.prs.length, Date.now(), usage?.tokensUsed))
+      .then(outcome => stats.record(outcome, request.prs.length, Date.now(), usage?.tokensUsed, usage?.engines))
       .catch(error => {
         // A crash never reaches runJob's own reporting, so count it as an error outcome
         // rather than letting the status reply claim nothing went wrong.
-        stats.record('error', request.prs.length, Date.now(), usage?.tokensUsed)
+        stats.record('error', request.prs.length, Date.now(), usage?.tokensUsed, usage?.engines)
         log('job.crashed', { key, error: String(error) })
       })
       .finally(() => {

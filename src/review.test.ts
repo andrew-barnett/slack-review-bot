@@ -1,4 +1,5 @@
 import test from 'tape'
+import type { ApproverGitHub } from './approver-github'
 import {
   CodexOutputError,
   CodexStalledError,
@@ -8,7 +9,7 @@ import {
 } from './codex'
 import { loadReviewConfig, type ReviewConfig } from './config'
 import type { ReviewRequest } from './job'
-import { makeReviewRunner } from './review'
+import { makeReviewRunner, selectReviewRunner, serialized } from './review'
 import { ReviewFailedError } from './usage'
 
 const request: ReviewRequest = {
@@ -320,5 +321,99 @@ test('makeReviewRunner runs without a refresh hook', async t => {
   const runner = makeReviewRunner(config([]), () => {}, fakeRun)
   const { result } = await runner(request)
   t.equal(result.results[0].status, 'passed', 'review completes with no refresh wired')
+  t.end()
+})
+
+// --- Mode selection and dual wiring ---
+
+const dualConfig = loadReviewConfig({
+  HOME: '/home/u',
+  REVIEW_ENGINES: 'codex,claude',
+  ENGINE_ORDER: 'claude,codex',
+  ENGINE_SCHEDULE: 'serial',
+  APPROVER_GH_TOKEN: 'approver-placeholder',
+  ENGINE_GH_TOKEN: 'engine-placeholder',
+  RUN_LOG_DIR: '',
+})
+
+// Dual mode stays refused until the flip checklist is done (issue 64). The runner selection is a
+// second guard behind startup. Regression caught: a code path that runs dual mode while the
+// approver token is still readable by engine children.
+test('selectReviewRunner refuses dual mode while it is unavailable', t => {
+  t.throws(() => selectReviewRunner(dualConfig), /issues\/64/)
+  t.doesNotThrow(() => selectReviewRunner(loadReviewConfig({ HOME: '/home/u' })), 'single mode is unaffected')
+  t.end()
+})
+
+// The whole dual wiring through the availability seam: engines in ENGINE_ORDER, serial schedule,
+// the role-account client for posting, and both engines given the engine token. A clean result
+// from both approves with commit_id. Regression caught: the selector building the engines in the
+// wrong order or handing them the approver token.
+test('selectReviewRunner wires the dual gate when dual mode is available', async t => {
+  const sha = '4'.repeat(40)
+  const order: string[] = []
+  const tokens: (string | undefined)[] = []
+  const clean = (prs: { url: string }[]) => ({
+    results: prs.map(p => ({ url: p.url, reviewedSha: sha, verdict: 'clean', findings: [], summary: '', environmentProblems: [] })),
+  })
+  const posted: string[] = []
+  const gh = {
+    login: async () => 'role-bot',
+    getPullRequest: async () => ({ author: 'dev', base: 'main', baseRepo: 'o/r', headRef: 'x', headSha: sha, headRepo: 'o/r', state: 'open', draft: false }),
+    permission: async () => 'write',
+    branchRules: async () => [],
+    classicProtection: async () => null,
+    reviews: async () => [],
+    behindBy: async () => 0,
+    botReviews: async () => [],
+    commentableLines: async () => new Map(),
+    postReview: async (_pr: unknown, r: { event: string; commitId: string }) => {
+      posted.push(`${r.event}@${r.commitId}`)
+      return { id: 1, url: 'u' }
+    },
+    decision: async () => ({ reviewDecision: null, mergeStateStatus: 'CLEAN' }),
+  } as unknown as ApproverGitHub
+  const runner = selectReviewRunner(
+    dualConfig,
+    {
+      gh,
+      listChangedFiles: async () => ['a.ts'],
+      engineDeps: {
+        runCodex: (async (o: { engineGhToken?: string }) => {
+          order.push('codex')
+          tokens.push(o.engineGhToken)
+          return { result: clean(request.prs), rawFinalMessage: '', activeMs: 1 }
+        }) as never,
+        runClaude: (async (o: { engineGhToken: string }) => {
+          order.push('claude')
+          tokens.push(o.engineGhToken)
+          const usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0, numTurns: 0, durationMs: 0 }
+          return { result: clean(request.prs), usage, tokensUsed: 0, activeMs: 1, permissionDenials: 0 }
+        }) as never,
+      },
+    },
+    true
+  )
+  const out = await runner(request)
+  t.deepEqual(order, ['claude', 'codex'], 'ENGINE_ORDER, serially')
+  t.deepEqual(tokens, ['engine-placeholder', 'engine-placeholder'], 'engines get the read-only token, never the approver token')
+  t.deepEqual(posted, [`APPROVE@${sha}`])
+  t.equal(out.dual?.prs[0].outcome, 'approved')
+  t.end()
+})
+
+// Two parallel engines refreshing the CodeArtifact token at once would race on one shared
+// config file; serialized() runs them one after the other.
+test('serialized runs concurrent calls one at a time', async t => {
+  let running = 0
+  let maxRunning = 0
+  const step = serialized(async () => {
+    running += 1
+    maxRunning = Math.max(maxRunning, running)
+    await new Promise(resolve => setImmediate(resolve))
+    running -= 1
+  })
+  await Promise.all([step(), step(), step()])
+  t.equal(maxRunning, 1)
   t.end()
 })
