@@ -6152,7 +6152,7 @@ volumes:
   runs: {}
 ```
 
-- [ ] **Step 5: Run the static test, validate and build**
+- [ ] **Step 5: Run the static test and validate the Compose file**
 
 Run: `chmod +x docker/entrypoint.sh scripts/build-image.sh && npx ts-node --compiler-options '{"module":"commonjs"}' --transpile-only src/container-files.test.ts`
 Expected: PASS (all four tests).
@@ -6160,16 +6160,9 @@ Expected: PASS (all four tests).
 Run: `docker compose -f compose.yaml config --quiet && echo compose-ok`
 Expected: `compose-ok`.
 
-Run: `scripts/build-image.sh`
-Expected: ends with `built slack-review-bot:local from <sha> with aqua-skills <12 hex>`. The two installer `RUN` steps print `looks correct (container: ...)` lines.
-
-Run: `docker run --rm --entrypoint id slack-review-bot:local`
-Expected: `uid=10001(bot) gid=10001(bot) groups=10001(bot)`.
-
-Run: `docker run --rm slack-review-bot:local nonsense; echo "exit $?"`
-Expected: `usage: srb-entrypoint orchestrator|worker|doctor [args]` and `exit 2`.
-
 - [ ] **Step 6: Commit**
+
+Commit now, before building. `scripts/build-image.sh` builds from `git archive HEAD`, so an uncommitted Dockerfile, `.dockerignore` or entrypoint would be missing from the build context, and the build would fail or use stale files.
 
 Write `/tmp/srb-commit-msg.txt`:
 
@@ -6184,6 +6177,22 @@ the Compose file carries no secret, socket, port or restart policy.
 ```
 
 Run: `git add Dockerfile .dockerignore docker/entrypoint.sh docker/aqua-skills.ref scripts/build-image.sh compose.yaml src/container-files.test.ts && git commit -F /tmp/srb-commit-msg.txt`
+
+Run: `git status --short -- Dockerfile .dockerignore docker scripts/build-image.sh compose.yaml`
+Expected: no output (everything the build needs is committed).
+
+- [ ] **Step 7: Build the image from the commit and check it**
+
+If this step shows a defect, fix it, commit the fix as a new commit (never amend), and re-run this step. The build always reads the committed tree.
+
+Run: `scripts/build-image.sh`
+Expected: ends with `built slack-review-bot:local from <sha> with aqua-skills <12 hex>`. The two installer `RUN` steps print `looks correct (container: ...)` lines.
+
+Run: `docker run --rm --entrypoint id slack-review-bot:local`
+Expected: `uid=10001(bot) gid=10001(bot) groups=10001(bot)`.
+
+Run: `docker run --rm slack-review-bot:local nonsense; echo "exit $?"`
+Expected: `usage: srb-entrypoint orchestrator|worker|doctor [args]` and `exit 2`.
 
 ---
 
@@ -6921,11 +6930,27 @@ Create `scripts/launcher`:
 ```bash
 #!/usr/bin/env bash
 # Thin wrapper around the TypeScript launcher (ruling 9). Usage: scripts/launcher [doctor orchestrator|worker]
+#
+# Loads the non-secret settings file here, not in the LaunchAgent, so every entry path (launchd,
+# and a terminal `scripts/launcher doctor worker`) sees the same settings, including the required
+# ROLE_GH_LOGIN and OPERATOR_GH_LOGIN. A file naming a secret variable is refused, as in
+# scripts/install-launcher.sh: secrets come from Secrets Manager only.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." > /dev/null 2>&1 && pwd)"
+CONF="${SLACK_REVIEW_BOT_LAUNCHER_CONF:-${HOME}/.config/slack-review-bot/launcher.conf}"
 if [ ! -f "${REPO}/dist/launcher.js" ]; then
     echo "ERROR: ${REPO}/dist/launcher.js not found. Run 'npm ci && npm run build' first." >&2
     exit 1
+fi
+if [ -f "${CONF}" ]; then
+    if grep -qE '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_]*(TOKEN|SECRET|LAUNCH_KEY|WORKER_TICKET|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY)[A-Za-z_]*=' "${CONF}"; then
+        echo "ERROR: ${CONF} sets a secret variable; secrets come from Secrets Manager only." >&2
+        exit 1
+    fi
+    set -a
+    # shellcheck source=/dev/null
+    . "${CONF}"
+    set +a
 fi
 exec node "${REPO}/dist/launcher.js" "$@"
 ```
@@ -6963,7 +6988,7 @@ Create `launchd/com.abarnett.slack-review-bot-launcher.plist.template`:
     <array>
         <string>/bin/bash</string>
         <string>-c</string>
-        <string>export PATH="__PATH_PREFIX__:$PATH"; if [ -f "__CONF__" ]; then set -a; . "__CONF__"; set +a; fi; exec "__LAUNCHER__"</string>
+        <string>export PATH="__PATH_PREFIX__:$PATH"; export SLACK_REVIEW_BOT_LAUNCHER_CONF="__CONF__"; exec "__LAUNCHER__"</string>
     </array>
 
     <key>WorkingDirectory</key>
@@ -7096,6 +7121,14 @@ Expected: every suite passes; typecheck exit 0; `dist/launcher.js` listed.
 
 Run: `scripts/launcher bogus; echo "exit $?"`
 Expected: `usage: launcher [doctor orchestrator|worker]` and `exit 2`.
+
+The next two checks pin that the wrapper itself loads the settings file, so a terminal `scripts/launcher doctor worker` sees the same settings as launchd, and that it refuses a secret. A stand-in `node` first on `PATH` prints what the wrapper exported, without running the real launcher:
+
+Run: `mkdir -p /tmp/srb-fake-node && printf '#!/bin/sh\necho "ROLE_GH_LOGIN=${ROLE_GH_LOGIN:-unset}"\n' > /tmp/srb-fake-node/node && chmod +x /tmp/srb-fake-node/node && printf 'ROLE_GH_LOGIN=probe-login\n' > /tmp/srb-conf-ok && SLACK_REVIEW_BOT_LAUNCHER_CONF=/tmp/srb-conf-ok PATH="/tmp/srb-fake-node:$PATH" scripts/launcher doctor worker`
+Expected: `ROLE_GH_LOGIN=probe-login`.
+
+Run: `printf 'GH_TOKEN=placeholder\n' > /tmp/srb-conf-secret && SLACK_REVIEW_BOT_LAUNCHER_CONF=/tmp/srb-conf-secret PATH="/tmp/srb-fake-node:$PATH" scripts/launcher doctor worker; echo "exit $?"`
+Expected: `ERROR: /tmp/srb-conf-secret sets a secret variable; secrets come from Secrets Manager only.` and `exit 1`. The stand-in `node` never runs.
 
 Run: `scripts/install-launcher.sh --check`
 Expected on a laptop that still runs the launchd daemon: `ERROR: the launchd daemon is still installed ...` and exit 1 (the cutover in Task 15 uninstalls it first). Otherwise `launcher prerequisites look correct ...`.
