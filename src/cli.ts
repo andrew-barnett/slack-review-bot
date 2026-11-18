@@ -6,6 +6,7 @@
 // This is the same prompt, profile, and output contract the daemon uses, so a review
 // that misbehaves in Slack can be reproduced and iterated on here.
 
+import { makeEngineAuth } from './bedrock-auth'
 import { assertModeAvailable, isDualMode, loadReviewConfig, scrubDaemonSecrets } from './config'
 import { engineWorktreeRoot } from './engine'
 import { parseMessage } from './parse-message'
@@ -29,7 +30,7 @@ async function main(): Promise<void> {
   }
 
   const config = loadReviewConfig()
-  scrubDaemonSecrets(process.env)
+  scrubDaemonSecrets(process.env, config)
   try {
     assertModeAvailable(config)
   } catch (error) {
@@ -75,7 +76,7 @@ async function main(): Promise<void> {
       scriptPath: config.codeartifactLoginScript,
       enabled: config.codeartifactRefreshEnabled,
     })
-  const { result, usage, dual } = await selectReviewRunner(config, { refreshAuth })(request)
+  const { result, usage, dual } = await selectReviewRunner(config, { refreshAuth, engineAuth: makeEngineAuth(config) })(request)
 
   process.stdout.write(`\n${JSON.stringify(dual ?? result, null, 2)}\n`)
   process.stdout.write(`\n${renderUsageLine(usage)}\n`)

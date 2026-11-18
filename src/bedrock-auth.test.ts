@@ -4,6 +4,7 @@ import {
   bedrockCodexArgs,
   engineSessionName,
   engineSessionSeconds,
+  makeEngineAuth,
   resolveBedrockAuth,
   withBedrockClaudeEnv,
   withBedrockCodexEnv,
@@ -274,6 +275,18 @@ test('resolveBedrockAuth uses static credentials without calling sts', async t =
   const auth = await resolveBedrockAuth(config, 'codex', 'run', exec)
   t.equal(calls.length, 0, 'no subprocess')
   t.deepEqual(auth.credentials, { accessKeyId: KEY_ID, secretAccessKey: SECRET })
+  t.end()
+})
+
+// The wiring the daemon and CLI share: subscription mode must never mint (or shell out), and
+// bedrock mode must resolve through the role.
+test('makeEngineAuth resolves nothing in subscription mode and mints in bedrock mode', async t => {
+  const { exec, calls } = stsExec()
+  t.equal(await makeEngineAuth(loadReviewConfig({ HOME: '/home/test' }), exec)('codex', 'run'), undefined)
+  t.equal(calls.length, 0, 'subscription mode never calls sts')
+  const auth = await makeEngineAuth(bedrockConfig(), exec)('codex', 'run')
+  t.equal(auth?.model, 'us.openai.gpt-5.5')
+  t.equal(calls.length, 1)
   t.end()
 })
 

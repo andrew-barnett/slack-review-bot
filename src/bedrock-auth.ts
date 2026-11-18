@@ -185,6 +185,19 @@ export function bedrockCodexArgs(auth: BedrockAuth): string[] {
 }
 
 /**
+ * The per-attempt engine-auth resolver the daemon and CLI wire into the review runner: Bedrock auth
+ * in bedrock mode, and always undefined in subscription mode, which leaves every run as it was.
+ */
+export function makeEngineAuth(
+  config: ReviewConfig,
+  exec?: Exec
+): (engine: EngineName, runId: string) => Promise<BedrockAuth | undefined> {
+  return config.engineAuth === 'bedrock'
+    ? (engine, runId) => resolveBedrockAuth(config, engine, runId, exec)
+    : () => Promise.resolve(undefined)
+}
+
+/**
  * The Bedrock auth for one engine attempt: freshly minted role credentials when ENGINE_ROLE_ARN is
  * set, otherwise the captured static credentials. Minted values are registered with the redactor.
  */
