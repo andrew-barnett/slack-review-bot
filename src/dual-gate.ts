@@ -36,6 +36,22 @@ const oneLine = (text: string, max = 200) => {
   return line.length > max ? `${line.slice(0, max - 1)}…` : line
 }
 
+/** Sanitise text provided by an engine to prevent mentions and hidden sections. */
+function sanitiseEngineText(text: string): string {
+  // Neutralise mentions by inserting U+200D (zero-width joiner) after @ followed by word char
+  let result = text.replace(/@(\w)/g, '@‍$1')
+  // Replace `<!--` with `&lt;!--` to prevent hiding sections
+  result = result.replace(/<!--/g, '&lt;!--')
+  return result
+}
+
+/** Indent continuation lines of multi-line text to keep them inside list items. */
+function indentContinuation(text: string): string {
+  const lines = text.split('\n')
+  if (lines.length === 1) return text
+  return lines.map((line, i) => (i === 0 ? line : '  ' + line)).join('\n')
+}
+
 function counts(findings: Finding[]): { blocking: number; nonBlocking: number } {
   const blocking = findings.filter(f => f.severity === 'blocking').length
   return { blocking, nonBlocking: findings.length - blocking }
@@ -44,11 +60,22 @@ function counts(findings: Finding[]): { blocking: number; nonBlocking: number } 
 /**
  * One engine's pass state for one PR (spec 5.8, first table). A blocked verdict is read before
  * the SHA check because the skill reports a blocked PR's found head, not the pinned one.
+ * Rejects invalid pinnedSha format, duplicate URL matches, and validates that any blocking
+ * finding yields 'findings' state regardless of reported verdict.
  */
 export function passFor(outcome: EngineRunOutcome, url: string, pinnedSha: string): EnginePass {
   const engine = outcome.engine
+  // Validate pinnedSha format
+  if (!/^[0-9a-f]{40}$/i.test(pinnedSha)) {
+    return { engine, state: 'invalid', detail: `invalid: pinned SHA does not match required format` }
+  }
   if (outcome.error) return { engine, state: 'invalid', detail: `error: ${oneLine(outcome.error)}` }
-  const result = outcome.results.find(r => r.url.toLowerCase() === url.toLowerCase())
+  // Check for duplicate URL matches
+  const matches = outcome.results.filter(r => r.url.toLowerCase() === url.toLowerCase())
+  if (matches.length > 1) {
+    return { engine, state: 'invalid', detail: `invalid: multiple results for this pull request` }
+  }
+  const result = matches[0]
   if (!result) return { engine, state: 'invalid', detail: 'invalid: no result for this pull request' }
   if (result.environmentProblems.length > 0) {
     return { engine, state: 'invalid', detail: `invalid: ${oneLine(result.environmentProblems.join('; '))}`, result }
@@ -65,6 +92,11 @@ export function passFor(outcome: EngineRunOutcome, url: string, pinnedSha: strin
     }
   }
   const { blocking, nonBlocking } = counts(result.findings)
+  // Any blocking finding forces 'findings' state, regardless of reported verdict
+  if (blocking > 0) {
+    const extra = nonBlocking ? `, ${nonBlocking} non-blocking` : ''
+    return { engine, state: 'findings', detail: `${blocking} blocking${extra}`, result }
+  }
   const extra = nonBlocking ? `, ${nonBlocking} non-blocking` : ''
   if (result.verdict === 'findings') return { engine, state: 'findings', detail: `${blocking} blocking${extra}`, result }
   return { engine, state: 'clean', detail: nonBlocking ? `clean (${nonBlocking} non-blocking)` : 'clean', result }
@@ -77,10 +109,26 @@ export function skippedPass(engine: EngineName, earlier: EngineName): EnginePass
 
 /**
  * The per-PR decision (spec 5.8, second table), for a head already confirmed unchanged. Every
- * APPROVE needs every configured engine clean; a skipped engine is never clean.
+ * APPROVE needs every configured engine clean; a skipped engine is never clean. Requires exactly
+ * one pass per configured engine, with no duplicates or unknown engines.
  */
-export function decide(passes: EnginePass[], eligibility: Eligibility): GateDecision {
-  if (passes.length === 0) return { event: null, outcome: 'error' }
+export function decide(passes: EnginePass[], eligibility: Eligibility, engines: readonly EngineName[] = Object.keys(ENGINE_LABEL) as EngineName[]): GateDecision {
+  // Validate that we have exactly one pass per configured engine
+  const engineSet = new Set(engines)
+  const passEngines = new Set<EngineName>()
+  for (const pass of passes) {
+    if (!engineSet.has(pass.engine)) {
+      return { event: null, outcome: 'error' } // Unknown engine
+    }
+    if (passEngines.has(pass.engine)) {
+      return { event: null, outcome: 'error' } // Duplicate engine
+    }
+    passEngines.add(pass.engine)
+  }
+  if (passEngines.size !== engines.length) {
+    return { event: null, outcome: 'error' } // Missing engine(s)
+  }
+
   const has = (state: PassState) => passes.some(p => p.state === state)
   if (has('findings')) return { event: 'COMMENT', outcome: 'findings' }
   if (has('blocked')) return { event: null, outcome: 'blocked' }
@@ -95,7 +143,13 @@ export function decide(passes: EnginePass[], eligibility: Eligibility): GateDeci
 export const MAX_GITHUB_TEXT = 60_000
 
 function cap(text: string): string {
-  return text.length > MAX_GITHUB_TEXT ? `${text.slice(0, MAX_GITHUB_TEXT)}\n\n_(truncated)_` : text
+  if (text.length <= MAX_GITHUB_TEXT) return text
+  const kept = text.slice(0, MAX_GITHUB_TEXT)
+  // Count fence markers in kept text; if odd, append a closing fence
+  const fenceCount = (kept.match(/```/g) || []).length
+  const needsClosingFence = fenceCount % 2 === 1
+  const suffix = needsClosingFence ? '\n```\n\n_(truncated)_' : '\n\n_(truncated)_'
+  return kept + suffix
 }
 
 function tag(engine: EngineName, finding: Finding): string {
@@ -127,12 +181,13 @@ export interface ComposeInput {
  * The one combined review (spec 5.8): the pinned SHA, a line per engine, the pre-flight with its
  * reasons and missing items, findings that cannot be anchored, the name of any engine that failed,
  * and the hidden no-mention note. Every finding from a valid engine (clean or findings) is posted;
- * nothing is deduplicated by meaning.
+ * nothing is deduplicated by meaning. Engine-provided text is sanitised to prevent mentions and
+ * hidden sections.
  */
 export function composeReview(input: ComposeInput): { body: string; comments: ReviewComment[] } {
   const { pinnedSha, passes, eligibility, outcome, commentable } = input
   const lines: string[] = [`**Dual-engine review at \`${pinnedSha}\`.** ${HEADLINE[outcome]}`, '']
-  lines.push(passes.map(p => `${ENGINE_LABEL[p.engine]}: ${p.detail}`).join(' · '), '')
+  lines.push(passes.map(p => `${ENGINE_LABEL[p.engine]}: ${sanitiseEngineText(p.detail)}`).join(' · '), '')
   lines.push(`Pre-flight: ${VERDICT_TEXT[eligibility.verdict]}.`)
   for (const reason of eligibility.reasons) lines.push(`- ${reason}`)
   if (eligibility.missing.length) {
@@ -140,7 +195,7 @@ export function composeReview(input: ComposeInput): { body: string; comments: Re
     for (const item of eligibility.missing) lines.push(`- ${item}`)
   }
   for (const failed of passes.filter(p => p.state === 'invalid')) {
-    lines.push('', `${ENGINE_LABEL[failed.engine]} did not complete a valid review (${failed.detail}), so this review cannot approve.`)
+    lines.push('', `${ENGINE_LABEL[failed.engine]} did not complete a valid review (${sanitiseEngineText(failed.detail)}), so this review cannot approve.`)
   }
 
   const comments: ReviewComment[] = []
@@ -149,11 +204,12 @@ export function composeReview(input: ComposeInput): { body: string; comments: Re
     const unanchored: string[] = []
     for (const finding of pass.result.findings) {
       const anchored = finding.file !== '' && finding.line > 0 && commentable.get(finding.file)?.has(finding.line)
+      const sanitisedBody = sanitiseEngineText(indentContinuation(finding.body))
       if (anchored) {
-        comments.push({ path: finding.file, line: finding.line, side: 'RIGHT', body: withAgentNote(cap(`${tag(pass.engine, finding)} ${finding.body}`)) })
+        comments.push({ path: finding.file, line: finding.line, side: 'RIGHT', body: withAgentNote(cap(`${tag(pass.engine, finding)} ${sanitisedBody}`)) })
       } else {
         const where = finding.file ? `\`${finding.file}${finding.line > 0 ? `:${finding.line}` : ''}\` ` : ''
-        unanchored.push(`- ${tag(pass.engine, finding)} ${where}${finding.body}`)
+        unanchored.push(`- ${tag(pass.engine, finding)} ${where}${sanitisedBody}`)
       }
     }
     if (unanchored.length) lines.push('', `### ${ENGINE_LABEL[pass.engine]}`, ...unanchored)

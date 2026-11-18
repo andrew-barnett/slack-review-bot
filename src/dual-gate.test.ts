@@ -41,6 +41,32 @@ test('passFor implements every row of the pass-state table', t => {
   t.end()
 })
 
+// Hardened pass validation: invalid SHA format, duplicate URLs, and blocking findings enforcement.
+// Regression: accepting malformed SHA, duplicate results for one URL, or blocking findings in a
+// clean verdict, any of which could reach approval.
+test('passFor rejects invalid pinnedSha format and duplicate URL matches', t => {
+  t.equal(passFor(outcome({}, result()), URL1, 'not-a-sha').state, 'invalid', 'invalid SHA format')
+  t.match(passFor(outcome({}, result()), URL1, 'xyz').detail, /format/, 'SHA format error message')
+
+  // Duplicate URL matches
+  const dup = outcome({}, result())
+  dup.results = [result(), result()]
+  t.equal(passFor(dup, URL1, SHA).state, 'invalid', 'duplicate URL matches')
+  t.match(passFor(dup, URL1, SHA).detail, /multiple results/, 'duplicate URL error message')
+
+  t.end()
+})
+
+// Blocking findings always yield 'findings' state, overriding reported verdict.
+// Regression: a clean verdict with a blocking finding being reported as clean to the gate.
+test('passFor enforces blocking findings → findings state regardless of verdict', t => {
+  const withBlocking = result({ verdict: 'clean', findings: [{ severity: 'blocking', file: 'a.ts', line: 1, body: 'bug' }] })
+  const p = passFor(outcome({}, withBlocking), URL1, SHA)
+  t.equal(p.state, 'findings', 'blocking finding forces findings state')
+  t.match(p.detail, /1 blocking/, 'detail names the blocking finding')
+  t.end()
+})
+
 // Spec 5.8, second table: every row, plus the rule that a skipped engine is never clean.
 // Regression caught by each row: an APPROVE without both engines clean, a REQUEST_CHANGES, or a
 // "one engine clean" comment that reads as half an approval.
@@ -59,6 +85,26 @@ test('decide implements every row of the decision table', t => {
     ['no passes', [], counts, { event: null, outcome: 'error' }],
   ]
   for (const [name, passes, eligibility, expected] of rows) t.deepEqual(decide(passes, eligibility), expected, name)
+  t.end()
+})
+
+// Engine list validation: decide must receive exactly one pass per configured engine, with no
+// duplicates or unknown engines. The engines parameter defaults to both codex and claude.
+// Regression: single-engine results reported as full approval, duplicate engine entries,
+// or unknown engines slipping through the gate.
+test('decide requires exactly one pass per configured engine', t => {
+  const single = [pass('codex', 'clean')]
+  t.deepEqual(decide(single, counts), { event: null, outcome: 'error' }, 'single engine when both required')
+
+  const duplicated = [pass('codex', 'clean'), pass('codex', 'clean'), pass('claude', 'clean')]
+  t.deepEqual(decide(duplicated, counts), { event: null, outcome: 'error' }, 'duplicated engine')
+
+  const unknown = [pass('codex', 'clean'), { engine: 'unknown' as any, state: 'clean' as const, detail: 'x' }]
+  t.deepEqual(decide(unknown, counts), { event: null, outcome: 'error' }, 'unknown engine')
+
+  // With explicit engine list
+  t.deepEqual(decide(single, counts, ['codex']), { event: 'APPROVE', outcome: 'approved' }, 'single engine when only codex required')
+
   t.end()
 })
 
@@ -118,12 +164,61 @@ test('composeReview explains a clean result whose approval would not count', t =
   t.end()
 })
 
+// Engine text sanitisation: neutralise mentions, hide HTML comments, and indent continuations.
+// Regression: @mention and @org/team forming real mentions posted as the role account; `<!--` hiding
+// subsequent content; multi-line findings breaking list formatting.
+test('composeReview sanitises engine-provided text', t => {
+  const withMentions: EnginePass = {
+    engine: 'codex', state: 'findings', detail: '@octocat broke @org/team syntax',
+    result: result({ verdict: 'findings', findings: [{ severity: 'blocking', file: '', line: 0, body: 'see @user and @org/team notes' }] }),
+  }
+  const { body } = composeReview({ pinnedSha: SHA, passes: [withMentions, pass('claude', 'clean')], eligibility: counts, outcome: 'findings', commentable: new Map() })
+  t.notOk(body.includes('@octocat'), '@octocat is sanitised in detail')
+  t.notOk(body.includes('@user'), '@user is sanitised in finding')
+  t.ok(body.includes('@‍octocat'), '@‍octocat with ZWJ inserted')
+  t.ok(body.includes('@‍user'), '@‍user with ZWJ inserted')
+  t.ok(body.includes('@‍org/team'), '@‍org/team with ZWJ inserted')
+
+  const withComment: EnginePass = {
+    engine: 'codex', state: 'findings', detail: '1 blocking',
+    result: result({ verdict: 'findings', findings: [{ severity: 'blocking', file: '', line: 0, body: 'issue: <!-- secret --> visible' }] }),
+  }
+  const claude: EnginePass = {
+    engine: 'claude', state: 'findings', detail: '1 blocking',
+    result: result({ verdict: 'findings', findings: [{ severity: 'blocking', file: '', line: 0, body: 'claude finding' }] }),
+  }
+  const { body: body2 } = composeReview({ pinnedSha: SHA, passes: [withComment, claude], eligibility: counts, outcome: 'findings', commentable: new Map() })
+  t.ok(body2.includes('&lt;!--'), '<!-- is escaped')
+  t.ok(body2.includes('### Claude'), '### Claude section is not hidden')
+
+  const multiline: EnginePass = {
+    engine: 'codex', state: 'findings', detail: '1 blocking',
+    result: result({ verdict: 'findings', findings: [{ severity: 'blocking', file: '', line: 0, body: 'line1\nline2\nline3' }] }),
+  }
+  const { body: body3 } = composeReview({ pinnedSha: SHA, passes: [multiline, pass('claude', 'clean')], eligibility: counts, outcome: 'findings', commentable: new Map() })
+  t.ok(body3.includes('line1\n  line2\n  line3'), 'continuation lines are indented')
+
+  t.end()
+})
+
 // GitHub rejects a review body over 65,536 characters with 422, which would turn a valid review
 // into an error. A huge finding (an engine pasting a whole test file) is truncated instead.
+// When an odd number of ``` fences is kept, a closing fence is appended before the truncation marker.
+// An invalid engine message must survive truncation.
 test('composeReview caps an oversized body', t => {
   const huge: EnginePass = { engine: 'codex', state: 'findings', detail: '1 blocking', result: result({ verdict: 'findings', findings: [{ severity: 'blocking', file: '', line: 0, body: 'x'.repeat(100_000) }] }) }
-  const { body } = composeReview({ pinnedSha: SHA, passes: [huge, pass('claude', 'clean')], eligibility: counts, outcome: 'findings', commentable: new Map() })
-  t.ok(body.length < 65_536)
-  t.ok(body.includes('_(truncated)_'))
+  const invalid: EnginePass = { engine: 'claude', state: 'invalid', detail: 'invalid: environment problem', result: result({ findings: [] }) }
+  const { body } = composeReview({ pinnedSha: SHA, passes: [huge, invalid], eligibility: counts, outcome: 'findings', commentable: new Map() })
+  t.ok(body.length < 65_536, 'body is under GitHub limit')
+  t.ok(body.includes('_(truncated)_'), 'truncation marker is present')
+  t.ok(body.includes('did not complete a valid review'), 'invalid engine message survives truncation')
+
+  // Odd fence markers: append closing fence
+  const withFence: EnginePass = { engine: 'codex', state: 'findings', detail: '1 blocking', result: result({ verdict: 'findings', findings: [{ severity: 'blocking', file: '', line: 0, body: '```code\n' + 'x'.repeat(100_000) }] }) }
+  const { body: body2 } = composeReview({ pinnedSha: SHA, passes: [withFence, pass('claude', 'clean')], eligibility: counts, outcome: 'findings', commentable: new Map() })
+  const beforeTrunc = body2.split('\n\n_(truncated)_')[0]
+  const fenceCount = (beforeTrunc.match(/```/g) || []).length
+  t.equal(fenceCount % 2, 0, 'even number of fence markers before truncation')
+
   t.end()
 })
