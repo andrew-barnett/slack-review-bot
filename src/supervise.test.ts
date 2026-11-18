@@ -44,16 +44,51 @@ test('drainChildRegistry stops two concurrent children', async t => {
 })
 
 // Each engine's events must stay distinguishable in the daemon log, so the event names carry the
-// caller's prefix. Codex keeps "codex.*" (the names operators already grep for).
-test('superviseChild returns the redacted transcript and uses the log prefix', async t => {
+// caller's prefix. Codex keeps "codex.*" (the names operators already grep for). Regression: a
+// hardcoded or dropped prefix would pass a check that only inspects events that never fire, so this
+// drives a real stall and asserts the exact event name.
+test('superviseChild names its stall event with the caller log prefix', async t => {
   const child = new FakeChild()
   const spawner = (() => child) as unknown as Spawner
+  let now = 1_000_000
+  let heartbeat: (() => void) | undefined
   const events: string[] = []
   const run = superviseChild(
     {
-      bin: 'x', args: [], cwd: '/', env: {}, timeoutMs: 60_000, stallTimeoutMs: 0,
+      bin: 'x', args: [], cwd: '/', env: {}, timeoutMs: 600_000, stallTimeoutMs: 40_000,
       logName: 'n', runId: 'r', logPrefix: 'claude', log: event => events.push(event),
     },
+    spawner,
+    {
+      now: () => now,
+      setInterval: (cb: () => void) => {
+        heartbeat = cb
+        return 1 as unknown as ReturnType<typeof setInterval>
+      },
+      clearInterval: () => {},
+      checkMs: 10_000,
+      toleranceMs: 5_000,
+    }
+  )
+  await new Promise(resolve => setImmediate(resolve))
+  // Four silent heartbeats reach the 40s grace; the stall kills the child (FakeChild closes on signal).
+  for (let i = 0; i < 4; i += 1) {
+    now += 10_000
+    heartbeat?.()
+  }
+  const exit = await run
+  t.ok(exit.stalled, 'the run is reported stalled')
+  t.deepEqual(child.signals, ['SIGTERM'], 'the stalled child is signalled')
+  t.deepEqual(events, ['claude.stalled'], 'the event carries the caller prefix')
+  t.end()
+})
+
+// The supervised exit must hand the caller the child's output, since engines parse results from it.
+test('superviseChild returns the child output as the transcript', async t => {
+  const child = new FakeChild()
+  const spawner = (() => child) as unknown as Spawner
+  const run = superviseChild(
+    { bin: 'x', args: [], cwd: '/', env: {}, timeoutMs: 60_000, logName: 'n', runId: 'r', logPrefix: 'claude' },
     spawner,
     { setInterval: () => 1 as unknown as ReturnType<typeof setInterval>, clearInterval: () => {} }
   )
@@ -63,6 +98,5 @@ test('superviseChild returns the redacted transcript and uses the log prefix', a
   const exit = await run
   t.equal(exit.code, 0)
   t.ok(exit.transcript.includes('hello'), 'output reaches the transcript')
-  t.ok(events.every(event => event.startsWith('claude.')), 'any event uses the given prefix')
   t.end()
 })
