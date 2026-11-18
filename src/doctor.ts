@@ -13,8 +13,17 @@ import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
 import { WebClient } from '@slack/web-api'
-import { loadConfig, looksLikeUserId, type Config } from './config'
+import { isDualMode, loadConfig, looksLikeUserId, scrubDaemonSecrets, type Config, type ReviewConfig } from './config'
 import { readCursorFile } from './cursor'
+import {
+  DOCTOR_PROBE_PR_VAR,
+  checkChildEnvIsolation,
+  checkRoleIdentity,
+  ghEnvAs,
+  lookupLogin,
+  probeEngineReadOnly,
+} from './doctor-dual'
+import { defaultRunner } from './gh-api'
 
 export type CheckStatus = 'ok' | 'warn' | 'fail'
 
@@ -141,6 +150,25 @@ async function checkChannels(client: WebClient, ids: string[]): Promise<CheckRes
 }
 
 /**
+ * Every emoji the bot reacts with in the configured mode. Dual mode adds the three gate
+ * outcomes, so a missing one is caught here rather than as a failed reaction mid-review.
+ */
+export function wantedEmoji(config: ReviewConfig): string[] {
+  const names = [
+    config.ackEmoji,
+    config.queuedEmoji,
+    config.passEmoji,
+    config.findingsEmoji,
+    config.errorEmoji,
+    config.humanReviewEmoji,
+  ]
+  if (isDualMode(config)) {
+    names.push(config.approvalPartialEmoji, config.approvalNotCountedEmoji, config.headMovedEmoji)
+  }
+  return [...new Set(names)]
+}
+
+/**
  * A missing emoji does not stop a review, but it does lose the channel-level verdict,
  * which is the part anyone actually looks at. Only custom emoji are listable, so a name
  * that is absent may still be a valid built-in — hence a warning, never a failure.
@@ -150,16 +178,7 @@ export async function checkEmoji(client: WebClient, config: Config): Promise<Che
   // Every emoji the bot actually reacts with, so the preflight can't pass while a configured
   // queued/human-review emoji is missing and its reaction fails at runtime (#20). Deduped in
   // case an operator points two of them at the same name.
-  const wanted = [
-    ...new Set([
-      config.ackEmoji,
-      config.queuedEmoji,
-      config.passEmoji,
-      config.findingsEmoji,
-      config.errorEmoji,
-      config.humanReviewEmoji,
-    ]),
-  ]
+  const wanted = wantedEmoji(config)
   try {
     const res = await client.emoji.list()
     const custom = new Set(Object.keys(res.emoji ?? {}))
@@ -261,13 +280,18 @@ async function resolveAgentPath(): Promise<string | undefined> {
   return `${prefix}:${code === 0 ? output.trim() : LAUNCHD_BASE_PATH}`
 }
 
+/** The tools the agent must resolve: Claude joins the list only in dual mode. */
+export function agentTools(config: ReviewConfig): string[] {
+  return isDualMode(config) ? ['codex', 'claude', 'gh', 'git', 'npm'] : ['codex', 'gh', 'git', 'npm']
+}
+
 /**
  * Every tool the review shells out to has to be reachable from the agent, not just from a
  * terminal. A miss here is what produces `spawn codex ENOENT` on the first real review —
  * hours or days after a startup that looked completely healthy, because the plist invokes
  * node by absolute path and only PATH-resolved children fail.
  */
-function checkAgentToolchain(agentPath: string | undefined): CheckResult {
+function checkAgentToolchain(agentPath: string | undefined, wanted: string[]): CheckResult {
   const name = 'agent PATH'
   if (agentPath === undefined) {
     return {
@@ -276,7 +300,6 @@ function checkAgentToolchain(agentPath: string | undefined): CheckResult {
       detail: `no agent installed at ${AGENT_PLIST} — checks below use this shell's PATH`,
     }
   }
-  const wanted = ['codex', 'gh', 'git', 'npm']
   const missing = wanted.filter(tool => !findOnPath(tool, agentPath))
   if (missing.length) {
     return {
@@ -289,8 +312,7 @@ function checkAgentToolchain(agentPath: string | undefined): CheckResult {
 }
 
 /** Run against the agent's PATH when there is one, so this agrees with what the daemon sees. */
-async function checkCodexBin(bin: string, agentPath: string | undefined): Promise<CheckResult> {
-  const name = 'codex binary'
+async function checkBinary(name: string, bin: string, agentPath: string | undefined): Promise<CheckResult> {
   const env = agentPath === undefined ? process.env : { ...process.env, PATH: agentPath }
   const { code, output } = await run(bin, ['--version'], env)
   if (code !== 0) {
@@ -302,6 +324,56 @@ async function checkCodexBin(bin: string, agentPath: string | undefined): Promis
     }
   }
   return { name, status: 'ok', detail: `${bin} — ${output.trim().split('\n')[0]}` }
+}
+
+/**
+ * Defers to the Claude installer's --check, so there is one definition of a valid profile.
+ * The roots come from config so the check validates the same grants the engine runs with; the
+ * daemon env file and gh config dir are not config fields, so the installer resolves them from
+ * its own defaults and variables, as the daemon's other checks do.
+ */
+async function checkClaudeProfile(config: Config): Promise<CheckResult> {
+  const name = 'claude profile'
+  const script = path.join(__dirname, '..', 'scripts', 'install-claude-profile.sh')
+  if (!fs.existsSync(script)) {
+    return { name, status: 'fail', detail: `installer not found at ${script}` }
+  }
+  const { code, output } = await run(script, [
+    '--check',
+    '--dir',
+    config.claudeConfigDir,
+    '--workspace-root',
+    config.workspaceRoot,
+    '--worktree-root',
+    config.worktreeRoot,
+  ])
+  return code === 0
+    ? { name, status: 'ok', detail: output.trim().split('\n').pop() ?? 'valid' }
+    : { name, status: 'fail', detail: output.trim().split('\n')[0] ?? `exit ${code}` }
+}
+
+/**
+ * The dual-mode checks (spec 5.10). Each guards a property the gate's safety rests on: the
+ * engine binary and its isolated profile, one role account behind both tokens, an engine token
+ * that cannot write, and an approver token no engine can see.
+ */
+async function checkDualMode(config: Config, agentPath: string | undefined): Promise<CheckResult[]> {
+  const gh = defaultRunner('gh')
+  // main() has scrubbed both daemon tokens from the process environment; ghEnvAs also strips
+  // every other GitHub token, so each lookup runs as exactly one identity.
+  const base = process.env
+  const [approver, engine, operator] = await Promise.all([
+    lookupLogin(gh, ghEnvAs(base, config.approverGhToken)),
+    lookupLogin(gh, ghEnvAs(base, config.engineGhToken)),
+    lookupLogin(gh, ghEnvAs(base)),
+  ])
+  return [
+    await checkBinary('claude binary', config.claudeBin, agentPath),
+    await checkClaudeProfile(config),
+    checkRoleIdentity(approver, engine, operator),
+    await probeEngineReadOnly(gh, base, config.engineGhToken, base[DOCTOR_PROBE_PR_VAR]),
+    checkChildEnvIsolation(config, base),
+  ]
 }
 
 /** Defers to the installer's own --check, so there is one definition of a valid profile. */
@@ -533,6 +605,8 @@ async function main(): Promise<void> {
     return
   }
 
+  // The tokens now live only on `config`; no check below may find them in the process environment.
+  scrubDaemonSecrets(process.env)
   const client = new WebClient(config.botToken)
   const agentPath = await resolveAgentPath()
   const results: CheckResult[] = [
@@ -542,9 +616,10 @@ async function main(): Promise<void> {
     ...(await checkChannels(client, config.channelIds)),
     checkIgnoreList(config.ignoreUserIds),
     await checkEmoji(client, config),
-    checkAgentToolchain(agentPath),
-    await checkCodexBin(config.codexBin, agentPath),
+    checkAgentToolchain(agentPath, agentTools(config)),
+    await checkBinary('codex binary', config.codexBin, agentPath),
     await checkCodexProfile(config),
+    ...(isDualMode(config) ? await checkDualMode(config, agentPath) : []),
     ...checkRoots(config),
     ...checkCursor(config),
     ...(await checkHistoryAccess(client, config)),
