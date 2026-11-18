@@ -184,3 +184,15 @@ test('an engine turns a crash into a redacted error', async t => {
   t.notOk((out.error ?? '').includes('ghp_'), 'the token is redacted')
   t.end()
 })
+
+// Two engines share one live-status line in parallel, so each line names its engine.
+test('an engine prefixes its progress lines with its name', async t => {
+  const lines: string[] = []
+  const runCodex = (async (options: CodexRunOptions) => {
+    options.onProgress?.('npm ci', 10)
+    return { result: { results: [clean(URL1), clean(URL2)] }, rawFinalMessage: '', activeMs: 10 }
+  }) as unknown as typeof runCodexReportOnly
+  await makeCodexEngine(config, { runCodex }).run({ ...input, onProgress: line => lines.push(line) })
+  t.deepEqual(lines, ['[codex] npm ci'])
+  t.end()
+})

@@ -16,6 +16,7 @@ export interface ScheduleInput {
   runId: string
   /** The configured WORKTREE_ROOT; each engine gets its own subdirectory. */
   worktreeRoot: string
+  onProgress?: (line: string, activeMs: number) => void
 }
 
 export interface ScheduledRun {
@@ -35,6 +36,7 @@ export async function runEngines(engines: Engine[], schedule: EngineSchedule, in
       requestedBy: input.requestedBy,
       worktreeRoot: engineWorktreeRoot(input.worktreeRoot, engine.name),
       runId: input.runId,
+      onProgress: input.onProgress,
     })
 
   if (schedule === 'parallel') {

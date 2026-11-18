@@ -7,6 +7,7 @@
 // the formatting are unit-testable on their own.
 
 import type { EngineName } from './config'
+import type { DualReport } from './dual'
 import type { ReviewRunResult } from './schema'
 
 /**
@@ -49,6 +50,8 @@ export interface RunUsage {
 export interface ReviewOutcome {
   result: ReviewRunResult
   usage: RunUsage
+  /** Dual mode only: the per-PR gate report the job renders. */
+  dual?: DualReport
 }
 
 /**

@@ -31,6 +31,8 @@ export interface EngineRunInput {
   /** This engine's own root: `<WORKTREE_ROOT>/<engine>` (see engineWorktreeRoot). */
   worktreeRoot: string
   runId: string
+  /** Live-status sink for this request; the engine prefixes each line with its name. */
+  onProgress?: (line: string, activeMs: number) => void
 }
 
 export interface EngineRunOutcome {
@@ -162,8 +164,6 @@ export async function runWithStallRetries(
 
 export interface EngineDeps extends RetryDeps {
   registry?: ChildRegistry
-  /** Live-status sink; the line is prefixed with the engine name. */
-  onProgress?: (line: string, activeMs: number) => void
   /** Injection seams for tests. */
   runCodex?: typeof runCodexReportOnly
   runClaude?: typeof runClaudeReview
@@ -179,8 +179,8 @@ function prompt(engine: EngineName, input: EngineRunInput): string {
   })
 }
 
-const progress = (engine: EngineName, deps: EngineDeps) =>
-  deps.onProgress ? (line: string, activeMs: number) => deps.onProgress!(`[${engine}] ${line}`, activeMs) : undefined
+const progress = (engine: EngineName, input: EngineRunInput) =>
+  input.onProgress ? (line: string, activeMs: number) => input.onProgress!(`[${engine}] ${line}`, activeMs) : undefined
 
 export function makeCodexEngine(config: ReviewConfig, deps: EngineDeps = {}): Engine {
   const runCodex = deps.runCodex ?? runCodexReportOnly
@@ -208,7 +208,7 @@ export function makeCodexEngine(config: ReviewConfig, deps: EngineDeps = {}): En
               logDir: config.runLogDir,
               runId,
               log: deps.log,
-              onProgress: progress('codex', deps),
+              onProgress: progress('codex', input),
             })
             return { result: o.result, activeMs: o.activeMs, tokensUsed: o.tokensUsed }
           } catch (error) {
@@ -249,7 +249,7 @@ export function makeClaudeEngine(config: ReviewConfig, deps: EngineDeps = {}): E
               logDir: config.runLogDir,
               runId,
               log: deps.log,
-              onProgress: progress('claude', deps),
+              onProgress: progress('claude', input),
             })
             return { result: o.result, activeMs: o.activeMs, tokensUsed: o.tokensUsed, claude: o.usage }
           } catch (error) {
