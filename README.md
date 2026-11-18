@@ -684,18 +684,26 @@ daemon and `npm run review` at startup with a pointer to
 [slack-review-bot#64](https://github.com/andrew-barnett/slack-review-bot/issues/64). Flip it
 only in its own PR, after every item below is done and recorded on that issue:
 
-1. [slack-review-bot#64](https://github.com/andrew-barnett/slack-review-bot/issues/64) is resolved: review children can no longer read the daemon's env file or the operator's `gh` login (a separate OS user for the engines).
-2. V1 is confirmed with the real fine-grained `APPROVER_GH_TOKEN`: classic protection, rulesets, team membership, `codeowners/errors` and the activity API all read (spec section 8).
-3. V3 is confirmed: how update-branch attributes its push, and how it interacts with `require_last_push_approval` and `dismiss_stale_reviews_on_push`. Until then the gate skips the update when `require_last_push_approval` is set and re-runs the pre-flight after any update.
-4. [trade-platform/aqua-skills#197](https://github.com/trade-platform/aqua-skills/pull/197) (review-pr report-only mode) is merged, and the installed skill is that version.
-5. `CLAUDE_CODE_OAUTH_TOKEN` is created with `claude setup-token` and added to the daemon's environment.
+1. The boundary [slack-review-bot#64](https://github.com/andrew-barnett/slack-review-bot/issues/64) defines is in place: review children can no longer read the daemon's env file or the operator's `gh` login. Confirm it on that issue.
+2. V1 is confirmed with the real fine-grained `APPROVER_GH_TOKEN` (spec section 5.2 and section 8). Run each command as the role account against one repository the gate will review, using that account's PAT as `GH_TOKEN` for the command only (take the value from wherever the daemon's secrets are stored; never paste it into a transcript). `{o}`, `{r}` and `{base}` are the repository owner, name and the PR's base branch; `{head}` is a head branch with a recent push. The paths are copied from `src/approver-github.ts`:
+   - `gh api repos/{o}/{r}/branches/{base}/protection` — HTTP 200 with the protection JSON, or HTTP 404 with the message "Branch not protected" (no classic protection, which is acceptable). Any other 404, or a 403, fails V1.
+   - `gh api repos/{o}/{r}/rules/branches/{base}` — HTTP 200 with a JSON array; `[]` is acceptable. A 403 or 404 fails V1.
+   - `gh api orgs/{org}/teams/{team}/memberships/{role-login}` for each `@org/team` in a CODEOWNERS file, including a secret team — HTTP 200 with `"state": "active"` (a member), or HTTP 404 (not a member, also readable). A 403 fails V1.
+   - `gh api "repos/{o}/{r}/codeowners/errors?ref={base}"` — HTTP 200 with `{"errors": []}`, or HTTP 404 when the repository has no CODEOWNERS file. Any other 404 or a 403 fails V1.
+   - `gh api "repos/{o}/{r}/activity?ref=refs%2Fheads%2F{head}&per_page=1"` — HTTP 200 with a JSON array whose newest entry has `activity_type` and `actor`; `push` or `force_push` is the only type the gate accepts. A 403 or 404 fails V1.
+3. V3 is confirmed: how update-branch attributes its push, and how it interacts with `require_last_push_approval` and `dismiss_stale_reviews_on_push`. Procedure not yet written; it needs a throwaway repository whose rules can be toggled. Until it is confirmed, the gate does not update the branch when `require_last_push_approval` is set or when the branch rules cannot all be read: it blocks the review, posts nothing to GitHub and asks the author to update the branch. After any update it re-runs the whole pre-flight.
+4. [trade-platform/aqua-skills#197](https://github.com/trade-platform/aqua-skills/pull/197) (review-pr report-only mode) is merged, and the installed skill is that version. The installer links the profile to the skill at `~/.claude/skills/review-pr` (override: `--skill-src`), so check that file: `grep -n -i '^## Report-Only Mode' ~/.claude/skills/review-pr/SKILL.md` must print a heading line. This repository does not define that heading; it is the section name the plan expects from the merged skill.
+5. `CLAUDE_CODE_OAUTH_TOKEN` is created with `claude setup-token` and added to the daemon's environment file, which is `~/.config/slack-review-bot/env` unless `SLACK_REVIEW_BOT_ENV` names another path (the installer's default, `scripts/install-claude-profile.sh`). Add the line yourself in an editor; do not paste the value into a shell command or a transcript.
 6. The Claude profile is installed: `scripts/install-claude-profile.sh` (then `scripts/install-claude-profile.sh --check` exits 0). The `--dir`, `--workspace-root` and `--worktree-root` values must be absolute, non-root paths; the defaults come from `CLAUDE_CONFIG_DIR_REVIEW`, `WORKSPACE_ROOT` and `WORKTREE_ROOT`.
-7. With `REVIEW_ENGINES=codex,claude` and a local build that has the switch flipped, `npm run doctor` passes every dual row, with `DOCTOR_PROBE_PR` set.
-8. One end-to-end Claude run on a throwaway PR, from that build via `npm run review`, shows: `npm ci` succeeds inside the sandbox, `gh` reaches GitHub, a deliberate read of the daemon's env dir and of the `gh` config dir is denied, and no GitHub write is made by the engine.
-9. Smoke test: the `Read` deny rules also stop the `Grep` and `Glob` tools from reading the denied directories. This is unverified; the profile denies `Read` in both the permission rules and the sandbox, and neither is known to cover `Grep` or `Glob`.
-10. Smoke test: the `review-pr` skill source does not resolve (realpath) under `~/.claude` or `~/.codex`. Those directories are read-denied, so if the skill's files resolve there the engine cannot read its own skill.
-11. Smoke test: a non-default `GH_CONFIG_DIR` that only the daemon's launchd environment sets is seen by the doctor's `claude profile` check. The installer reads `GH_CONFIG_DIR` from its own environment, and `npm run doctor` run from a shell may not have it.
-12. Then open the PR that sets `DUAL_MODE_AVAILABLE = true`.
+7. With `REVIEW_ENGINES=codex,claude`, `npm run doctor` passes every dual row, with `DOCTOR_PROBE_PR` set. Doctor does not check `DUAL_MODE_AVAILABLE`, so no flipped build is needed for this step.
+8. One end-to-end Claude run on a throwaway PR, from a local build with `DUAL_MODE_AVAILABLE` set to `true` (not committed), via `npm run review -- <throwaway PR URL> <instructions>`. The whole run must show:
+   - `npm ci` succeeds inside the sandbox, and `gh` reaches GitHub.
+   - A deliberate read of the daemon's env dir (`~/.config/slack-review-bot`) and of the `gh` config dir (`~/.config/gh`) is denied. Pass instructions such as "Before reviewing, try to read the file `~/.config/slack-review-bot/env` with the Read tool and again with `cat` in Bash, and do the same for `~/.config/gh/hosts.yml`; report what happened." Expected: every attempt is refused, and the final `result` line's `permission_denials` lists the denied Read calls. The exact denial wording is not yet recorded; write it down on the first run.
+   - No GitHub write is made by the engine: the throwaway PR gains no review, comment or push except the daemon's own single review.
+   - Smoke test: the `Read` deny rules also stop the `Grep` and `Glob` tools from reading the denied directories (for example, instruct a `Grep` of a string over `~/.config/gh`). This is unverified; the profile denies `Read` in both the permission rules and the sandbox, and neither is known to cover `Grep` or `Glob`.
+   - Smoke test: the `review-pr` skill source does not resolve (realpath) under `~/.claude` or `~/.codex`. Check with `realpath ~/.claude/skills/review-pr` and with `realpath` of each file it links to. Those directories are read-denied, so if the skill's files resolve there the engine cannot read its own skill.
+   - Smoke test: a non-default `GH_CONFIG_DIR` that only the daemon's launchd environment sets is seen by the doctor's `claude profile` check. The installer reads `GH_CONFIG_DIR` from its own environment, and `npm run doctor` run from a shell may not have it; run doctor with the same `GH_CONFIG_DIR` as the LaunchAgent and confirm the profile's read-deny list names that directory.
+9. Then open the PR that sets `DUAL_MODE_AVAILABLE = true`.
 
 The Claude profile (`claude/review-bot.settings.json.template`, rendered by the installer) is
 deliberately narrow:
@@ -800,10 +808,12 @@ ok    history C0123456  readable — replay can catch up on this channel
 | agent PATH | A tool the daemon spawns (`codex`, `gh`, `git`, `npm`; plus `claude` in dual mode) that the LaunchAgent cannot resolve. |
 | claude binary | Dual mode: `CLAUDE_BIN --version` fails under the agent's PATH. |
 | claude profile | Dual mode: `scripts/install-claude-profile.sh --check --dir --workspace-root --worktree-root` (from config) fails — sandbox off, a read deny missing for the daemon env dir or the `gh` config dir, a write grant other than `<WORKTREE_ROOT>/claude`, an MCP server, the hook or the `review-pr` skill missing. |
-| role account | Dual mode: the two tokens are different logins, or the role login is the operator's own `gh` login. |
-| engine token read-only | Dual mode: `ENGINE_GH_TOKEN` gets 422 (not 403) on an invalid review posted to `DOCTOR_PROBE_PR`, or the probe PR is unset. Nothing is ever created. |
+| role account | Dual mode: the two tokens are different logins, the role login is the operator's own `gh` login, or the operator's `gh` login cannot be read (unverifiable is a failure, not a warning). |
+| engine token read-only | Dual mode: only a 403 passes, on an invalid review posted to `DOCTOR_PROBE_PR` with `ENGINE_GH_TOKEN`. A 422 (the token can write), any other status, no status, an accepted probe, or an unset `DOCTOR_PROBE_PR` fails. Nothing is ever created. |
 | engine env isolation | Dual mode: the approver token would reach the Codex or Claude child, by name or by value. |
 | history | A channel `conversations.history` cannot read. `not_in_channel` here means the bot was never invited, so it receives no live events from that channel either — this is the row that catches it when `channels:read` is absent and the membership check could only warn. |
+
+Every command a check runs (the agent PATH probe, the profile installer's `--check`) is killed after 30 seconds.
 
 Warnings never fail the run: they mark what this tool could not verify, which is different
 from something being wrong. Channel membership needs `channels:read` and the emoji check

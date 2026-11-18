@@ -18,7 +18,7 @@ Before it reviews, the bot knows whether its approval would satisfy the PR's rul
 |---|---|
 | Q1 approver identity | An existing org role (machine-user) account's PAT. Only the daemon holds it. |
 | Q2 scheduling | Configurable: `ENGINE_SCHEDULE=parallel` (default) or `serial`. |
-| Q3 stale base | The daemon calls GitHub's update-branch API before pinning, except when `require_last_push_approval` is in effect. |
+| Q3 stale base | The daemon calls GitHub's update-branch API before pinning, except when `require_last_push_approval` is in effect or the branch rules cannot all be read; then the review is blocked, nothing is posted, and the author is asked to update the branch. |
 | Q4 approval won't count | Review anyway. Dual-CLEAN posts `APPROVE` for **counts** and **partial**, and a `COMMENT` review for **won't count**. A pre-flight that cannot finish is treated as **won't count**. |
 | Q5 comment surface | The daemon posts one combined review per run, tagged by engine, without deduplicating by meaning, as `COMMENT` (never `REQUEST_CHANGES`). |
 | Q6 report-only | A supported report-only mode in `review-pr` (`trade-platform/aqua-skills`), enforced a second time by a read-only engine credential. |
@@ -157,6 +157,7 @@ It is tested against the examples in GitHub's CODEOWNERS documentation.
 
 Run after pre-flight, before pinning, only when the base has moved. "Moved" means `GET /repos/{o}/{r}/compare/{base}...{head}` reports `behind_by > 0`.
 
+- If the branch rules could not all be read (the last-push rule may sit in an unreadable source): do not update. Record the PR as `blocked` ("base moved, and the branch rules could not all be read, so the bot will not update the branch; the author must update it"). Post nothing to GitHub.
 - If `eligibility.lastPushApproval` is true: do not update. Record the PR as `blocked` ("base moved; this repo requires approval of the latest push, so the author must update the branch"). Post nothing to GitHub.
 - Otherwise: `PUT /repos/{o}/{r}/pulls/{n}/update-branch` with `expected_head_sha` set to the current head.
   - `202`: poll `GET /pulls/{n}` until `head.sha` changes, using the same timeout as `gh` calls, then **re-run the whole pre-flight against the new head** before pinning. The update can dismiss existing approvals (when `dismiss_stale_reviews_on_push` is set) and makes the bot the latest pusher, so the earlier prediction is stale. The re-evaluated eligibility is the one used for posting and rendering.
