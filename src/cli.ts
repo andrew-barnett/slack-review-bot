@@ -6,7 +6,7 @@
 // This is the same prompt, profile, and output contract the daemon uses, so a review
 // that misbehaves in Slack can be reproduced and iterated on here.
 
-import { loadReviewConfig } from './config'
+import { DUAL_MODE_AVAILABLE, isDualMode, loadReviewConfig, scrubDaemonSecrets } from './config'
 import { parseMessage } from './parse-message'
 import { buildPrompt } from './prompt'
 import { renderThread, verdictFor } from './render'
@@ -28,6 +28,12 @@ async function main(): Promise<void> {
   }
 
   const config = loadReviewConfig()
+  scrubDaemonSecrets(process.env)
+  if (isDualMode(config) && !DUAL_MODE_AVAILABLE) {
+    process.stderr.write('REVIEW_ENGINES=codex,claude is not available in this build yet.\n')
+    process.exitCode = 2
+    return
+  }
   // The CLI has no Slack message to key the run log on, so it synthesises a ref with a
   // 'cli' channel and a wall-clock ts. Nothing reacts or posts to it.
   const request: ReviewRequest = {

@@ -1,6 +1,6 @@
 import test from 'tape'
 import { SHUTDOWN_GRACE_MS } from './codex'
-import { loadConfig, looksLikeUserId, parseMsList, parseUserIds } from './config'
+import { APPROVER_TOKEN_VAR, DAEMON_SECRET_VARS, ENGINE_TOKEN_VAR, isDualMode, loadConfig, loadReviewConfig, looksLikeUserId, parseMsList, parseEngineOrder, parseEngines, parseSchedule, parseUserIds, scrubDaemonSecrets } from './config'
 
 /** The two required keys, so a test can vary only the knob it cares about. */
 const credentials = { SLACK_BOT_TOKEN: 'placeholder', SLACK_APP_TOKEN: 'placeholder' }
@@ -232,5 +232,112 @@ test('STALL_BACKOFF_MS empty disables the schedule, unset keeps the default', t 
     [1000, 2000],
     'an explicit schedule is honoured'
   )
+  t.end()
+})
+
+// Single-engine Codex must stay the default, so an install that sets nothing keeps today's
+// behaviour exactly. Regression: a default that silently enabled dual mode would refuse to start.
+test('parseEngines defaults to codex alone', t => {
+  t.deepEqual(parseEngines(undefined), ['codex'])
+  t.deepEqual(parseEngines(''), ['codex'])
+  t.end()
+})
+
+// Only the two supported shapes are accepted; anything else is a startup error rather than a
+// half-configured run. Catches a typo like "codx" or a claude-only mode that is out of scope.
+test('parseEngines accepts codex or codex,claude and rejects everything else', t => {
+  t.deepEqual(parseEngines('codex,claude'), ['codex', 'claude'])
+  t.deepEqual(parseEngines('claude codex'), ['claude', 'codex'])
+  t.throws(() => parseEngines('claude'), /REVIEW_ENGINES/)
+  t.throws(() => parseEngines('codex,codex'), /REVIEW_ENGINES/)
+  t.throws(() => parseEngines('codx'), /unknown engine "codx"/)
+  t.end()
+})
+
+// The schedule is a two-value switch so serial can be turned on without code changes.
+test('parseSchedule defaults to parallel and rejects unknown values', t => {
+  t.equal(parseSchedule(undefined), 'parallel')
+  t.equal(parseSchedule('serial'), 'serial')
+  t.throws(() => parseSchedule('sequential'), /ENGINE_SCHEDULE/)
+  t.end()
+})
+
+// The serial order must name each configured engine exactly once; a missing engine would never
+// run and a duplicate would run twice.
+test('parseEngineOrder requires a permutation of the configured engines', t => {
+  t.deepEqual(parseEngineOrder(undefined, ['codex', 'claude']), ['codex', 'claude'])
+  t.deepEqual(parseEngineOrder('claude,codex', ['codex', 'claude']), ['claude', 'codex'])
+  t.throws(() => parseEngineOrder('codex', ['codex', 'claude']), /ENGINE_ORDER/)
+  t.throws(() => parseEngineOrder('codex,codex', ['codex', 'claude']), /ENGINE_ORDER/)
+  t.deepEqual(parseEngineOrder('claude,codex', ['codex']), ['codex'], 'ignored in single mode')
+  t.end()
+})
+
+// ENGINE_SCHEDULE is a dual-mode setting. Regression caught: a stale invalid value in a
+// single-engine env file would stop startup even though the setting is unused; in dual mode a bad
+// value must still be refused.
+test('loadReviewConfig validates ENGINE_SCHEDULE only in dual mode', t => {
+  const single = loadReviewConfig({ ENGINE_SCHEDULE: 'bogus' })
+  t.equal(single.engineSchedule, 'parallel', 'single mode ignores an invalid value and uses the default')
+  t.throws(
+    () => loadReviewConfig({ REVIEW_ENGINES: 'codex,claude', ENGINE_SCHEDULE: 'bogus', [APPROVER_TOKEN_VAR]: 'a', [ENGINE_TOKEN_VAR]: 'e' }),
+    /ENGINE_SCHEDULE/,
+    'dual mode rejects an invalid value'
+  )
+  t.end()
+})
+
+// Dual mode without both tokens would either approve with the wrong identity or hand engines a
+// write-capable token; refuse to start instead.
+test('loadReviewConfig refuses dual mode without both tokens', t => {
+  t.throws(() => loadReviewConfig({ REVIEW_ENGINES: 'codex,claude' }), /APPROVER_GH_TOKEN/)
+  t.throws(
+    () => loadReviewConfig({ REVIEW_ENGINES: 'codex,claude', [APPROVER_TOKEN_VAR]: 'a' }),
+    /ENGINE_GH_TOKEN/
+  )
+  t.end()
+})
+
+// The engine token must be read-only. The same value as the approver token means the engines
+// would hold an approving credential, which is the attack the split exists to prevent.
+test('loadReviewConfig refuses identical approver and engine tokens', t => {
+  t.throws(
+    () => loadReviewConfig({ REVIEW_ENGINES: 'codex,claude', [APPROVER_TOKEN_VAR]: 'same', [ENGINE_TOKEN_VAR]: 'same' }),
+    /must be different tokens/
+  )
+  t.end()
+})
+
+// A valid dual configuration loads, and isDualMode reports it.
+test('loadReviewConfig loads a valid dual configuration', t => {
+  const c = loadReviewConfig({
+    REVIEW_ENGINES: 'codex,claude',
+    ENGINE_SCHEDULE: 'serial',
+    [APPROVER_TOKEN_VAR]: 'approver-placeholder',
+    [ENGINE_TOKEN_VAR]: 'engine-placeholder',
+  })
+  t.ok(isDualMode(c))
+  t.equal(c.engineSchedule, 'serial')
+  t.deepEqual(c.engineOrder, ['codex', 'claude'])
+  t.equal(c.claudeBin, 'claude')
+  t.ok(c.claudeConfigDir.endsWith('.claude-review-bot'))
+  t.end()
+})
+
+// Single mode ignores the tokens entirely, so today's installs need no new variables.
+test('loadReviewConfig in single mode needs no tokens', t => {
+  const c = loadReviewConfig({})
+  t.notOk(isDualMode(c))
+  t.equal(c.approverGhToken, '')
+  t.end()
+})
+
+// The approver token must not linger in process.env, where any later spawn that inherits the
+// environment (the CodeArtifact login script, gh) would carry it.
+test('scrubDaemonSecrets removes both token variables and nothing else', t => {
+  const env: NodeJS.ProcessEnv = { [APPROVER_TOKEN_VAR]: 'a', [ENGINE_TOKEN_VAR]: 'e', PATH: '/bin' }
+  scrubDaemonSecrets(env)
+  t.deepEqual(env, { PATH: '/bin' })
+  t.deepEqual([...DAEMON_SECRET_VARS].sort(), [APPROVER_TOKEN_VAR, ENGINE_TOKEN_VAR].sort())
   t.end()
 })

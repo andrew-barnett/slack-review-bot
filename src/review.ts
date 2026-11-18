@@ -9,7 +9,7 @@ import {
   runCodexReview,
   type ChildRegistry,
 } from './codex'
-import type { ReviewConfig } from './config'
+import { isDualMode, type ReviewConfig } from './config'
 import type { ReviewRequest } from './job'
 import type { ActiveReviews } from './progress'
 import { buildPrompt } from './prompt'
@@ -92,6 +92,7 @@ export function makeReviewRunner(
           stallTimeoutMs,
           disableGitSigning: config.disableGitSigning,
           envPassthrough: config.codexEnvPassthrough,
+          engineGhToken: isDualMode(config) ? config.engineGhToken : undefined,
           registry,
           logDir: config.runLogDir,
           runId,

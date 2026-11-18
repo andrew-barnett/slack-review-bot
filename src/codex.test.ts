@@ -16,9 +16,11 @@ import {
   drainChildRegistry,
   describeStall,
   describeTimeout,
+  deniedPassthrough,
   runCodexReview,
   OUTPUT_FLUSH_LIMIT,
   TRANSCRIPT_TAIL_LIMIT,
+  withEngineGhToken,
   withGitSigningDisabled,
   type Spawner,
 } from './codex'
@@ -950,5 +952,95 @@ test('drainChildRegistry resolves immediately when nothing is registered', async
   const reg = createChildRegistry()
   await drainChildRegistry(reg, { now: d.now, setTimer: d.setTimer, graceMs: 1_000, pollMs: 200 })
   t.notOk(d.hasPending(), 'no poll scheduled when there is nothing to drain')
+  t.end()
+})
+
+// The approver token can approve PRs. If an operator names it in CODEX_ENV_PASSTHROUGH it must
+// still be dropped, or untrusted PR code could read it and approve itself.
+test('buildChildEnv drops daemon secrets even when passed through', t => {
+  const env = buildChildEnv(
+    { PATH: '/bin', APPROVER_GH_TOKEN: 'approver', ENGINE_GH_TOKEN: 'engine' },
+    ['APPROVER_GH_TOKEN', 'ENGINE_GH_TOKEN']
+  )
+  t.deepEqual(env, { PATH: '/bin' })
+  t.deepEqual(deniedPassthrough(['APPROVER_GH_TOKEN', 'FOO']), ['APPROVER_GH_TOKEN'], 'the denied name is reported for a warning')
+  t.end()
+})
+
+// In dual mode engines must authenticate as the read-only engine token. An inherited
+// GITHUB_TOKEN or enterprise token would otherwise give them whatever the operator's token can do.
+test('withEngineGhToken sets GH_TOKEN and strips the other GitHub tokens', t => {
+  const env = withEngineGhToken({ PATH: '/bin', GH_TOKEN: 'operator', GITHUB_TOKEN: 'operator2', GH_ENTERPRISE_TOKEN: 'ent' }, 'engine')
+  t.deepEqual(env, { PATH: '/bin', GH_TOKEN: 'engine' })
+  t.end()
+})
+
+// The runner must apply the engine token to the spawned child when one is configured.
+test('runCodexReview hands the engine token to the child as GH_TOKEN', async t => {
+  const child = new FakeChild()
+  let seen: NodeJS.ProcessEnv | undefined
+  const spawner = ((_bin: string, _args: string[], spawnOpts: { env: NodeJS.ProcessEnv }) => {
+    seen = spawnOpts['env']
+    return child
+  }) as unknown as Spawner
+  const clock = fakeClock()
+  const run = runCodexReview({ ...runOptions(), engineGhToken: 'engine-placeholder' }, spawner, clock.deps).catch(() => undefined)
+  await settle()
+  child.emit('close', 1)
+  await run
+  t.equal(seen?.GH_TOKEN, 'engine-placeholder')
+  t.notOk('GITHUB_TOKEN' in (seen ?? {}), 'no other GitHub token survives')
+  t.end()
+})
+
+/** Run runCodexReview with the given variables set on the real process env (restored afterwards) and return the env the child was spawned with. */
+async function spawnedEnvWith(vars: Record<string, string>, options: Record<string, unknown>): Promise<NodeJS.ProcessEnv | undefined> {
+  const saved: Record<string, string | undefined> = {}
+  for (const [k, v] of Object.entries(vars)) {
+    saved[k] = process.env[k]
+    process.env[k] = v
+  }
+  try {
+    const child = new FakeChild()
+    let seen: NodeJS.ProcessEnv | undefined
+    const spawner = ((_bin: string, _args: string[], spawnOpts: { env: NodeJS.ProcessEnv }) => {
+      seen = spawnOpts['env']
+      return child
+    }) as unknown as Spawner
+    const clock = fakeClock()
+    const run = runCodexReview({ ...runOptions(), ...options }, spawner, clock.deps).catch(() => undefined)
+    await settle()
+    child.emit('close', 1)
+    await run
+    return seen
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+}
+
+// End to end through the runner, not just buildChildEnv: the approver token in the daemon's
+// environment must not reach the spawned child even when an operator names it as passthrough.
+// Regression caught: a passthrough or env-merge change letting an approving credential into
+// untrusted PR code.
+test('runCodexReview never gives the child the approver or engine token', async t => {
+  const seen = await spawnedEnvWith(
+    { APPROVER_GH_TOKEN: 'approver-placeholder', ENGINE_GH_TOKEN: 'engine-placeholder' },
+    { envPassthrough: ['APPROVER_GH_TOKEN', 'ENGINE_GH_TOKEN'] }
+  )
+  t.ok(seen, 'the child was spawned')
+  t.notOk('APPROVER_GH_TOKEN' in (seen ?? {}), 'the approver token is absent')
+  t.notOk('ENGINE_GH_TOKEN' in (seen ?? {}), 'the engine token variable is absent')
+  t.end()
+})
+
+// Single mode has no engine token, so the operator's own GH_TOKEN keeps reaching the child as it
+// does today. Regression caught: dual-mode token handling stripping or replacing GH_TOKEN for
+// existing single-engine installs.
+test('runCodexReview leaves GH_TOKEN untouched in single mode', async t => {
+  const seen = await spawnedEnvWith({ GH_TOKEN: 'operator-placeholder' }, {})
+  t.equal(seen?.GH_TOKEN, 'operator-placeholder')
   t.end()
 })

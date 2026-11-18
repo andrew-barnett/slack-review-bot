@@ -97,12 +97,12 @@ The code is split into a pure evaluator and a fetch layer.
 | changed file paths | existing `listChangedFiles` (names only) |
 | bot permission | `GET /repos/{o}/{r}/collaborators/{bot}/permission` |
 | ruleset rules on base | `GET /repos/{o}/{r}/rules/branches/{base}` |
-| classic protection on base | `GET /repos/{o}/{r}/branches/{base}/protection`, **readability to be verified** (V1) |
+| classic protection on base | `GET /repos/{o}/{r}/branches/{base}/protection`, readable with Administration: read (V1) |
 | CODEOWNERS | first of `.github/CODEOWNERS`, `CODEOWNERS`, `docs/CODEOWNERS` at `ref={base}` via the contents API |
 | CODEOWNERS validity | `GET /repos/{o}/{r}/codeowners/errors?ref={base}` |
 | team membership | `GET /orgs/{org}/teams/{slug}/memberships/{bot}` (state `active`) for each `@org/team` owner the evaluator needs |
 | current approvals | GraphQL `pullRequest.latestOpinionatedReviews` (author, state, commit oid, submittedAt) |
-| other approvers' eligibility | `GET /repos/{o}/{r}/collaborators/{login}/permission` for each other approver, plus team membership as for the bot when evaluating owner coverage |
+| other approvers' eligibility | `GET /repos/{o}/{r}/collaborators/{login}/permission` for each other approver or change requester, plus team membership as for the bot when evaluating owner coverage |
 | latest pusher of the head branch | `GET /repos/{o}/{r}/activity?ref=refs/heads/{head}&activity_type=push&per_page=1` (actor, after-SHA, timestamp). Needed only when `require_last_push_approval` is set. A head branch in a fork is not readable this way, so the result is "cannot verify". Readability is checked in V1. |
 
 **Evaluator.** `evaluateEligibility(facts) -> Eligibility`, a pure function:
@@ -136,11 +136,12 @@ The evaluator first decides whether the bot's approval would be **valid** at all
    - the approval shortfall, `required - (eligible + 1)`, when positive;
    - every owner path still unsatisfied (its owners go in `missing`);
    - when `require_last_push_approval` is set, whether the latest push would then be approved. That needs at least one approval from someone other than the latest pusher, submitted after that push: an eligible existing approval, or the bot's own (valid unless rule 3 failed). This is checked **separately** from rule 2. Approvals from before the latest push still count toward the approval number and owner coverage unless `dismiss_stale_reviews_on_push` removed them; they just cannot satisfy the latest-push requirement.
+   - when approvals or code-owner review are required, each outstanding `CHANGES_REQUESTED` review from a reviewer with write or higher permission (other than the bot) remains (`changes requested by @login` in `missing`), since only that reviewer or a dismissal clears it. The reviewer's permission is fetched like an approver's.
 6. **Verdict.**
    - No remaining requirements → `counts`.
    - Some remain, and the bot's approval reduced them (it filled an approval slot, or satisfied at least one owner path that was otherwise unsatisfied) → `partial`, with what remains in `missing`.
    - Some remain, and the bot's approval reduced nothing → `wontCount`. Its approval would not move the PR toward mergeable.
-7. **Cannot verify.** If any source that rules 1-5 need could not be read, or `codeowners/errors` is non-empty → `wontCount`, naming the unreadable source (the Q4 decision). The latest pusher is needed only when `require_last_push_approval` is set; a fork head branch counts as unreadable. A source that is legitimately absent is not unreadable: no ruleset, no classic protection (404), or no CODEOWNERS file all read as "no requirement".
+7. **Cannot verify.** If any source that rules 1-5 need could not be read, or `codeowners/errors` is non-empty → `wontCount`, naming the unreadable source (the Q4 decision). The latest pusher is needed only when `require_last_push_approval` is set; a fork head branch counts as unreadable. A source that is legitimately absent is not unreadable: no ruleset, no classic protection (404), or no CODEOWNERS file all read as "no requirement". When code-owner review is required, a CODEOWNERS line using unsupported syntax makes ownership unverifiable.
 
 **CODEOWNERS matcher** (`codeowners.ts`, pure). It implements GitHub's documented syntax:
 
@@ -325,7 +326,7 @@ Until the skill ships report-only mode, dual mode stays behind `REVIEW_ENGINES`,
 
 ## 8. Verification items (spike before the dependent sub-issues)
 
-- **V1.** With the role PAT, what is readable: `branches/{b}/protection` (classic protection normally needs admin), `rules/branches/{b}`, team memberships (`read:org`, and secret teams), `codeowners/errors`, the repository activity API for the latest pusher? If classic protection is unreadable to a write-level account, rule 7 would make every classically protected repo `wontCount`. The fallback is decided with the user before 5.2 is built. Candidates: GraphQL `baseRef.branchProtectionRule` readability, or classifying "classic protection unreadable" as `partial` with a reason instead of `wontCount`.
+- **V1.** Settled in part (https://github.com/andrew-barnett/slack-review-bot/issues/54): the role account has admin, so classic branch protection is readable. Still to confirm with the real fine-grained token: Administration: read suffices for classic protection, secret-team membership reads, `codeowners/errors`, and the repository activity API for the latest pusher.
 - **V2.** Claude Code headless: structured-output flag, stream-JSON progress events, the permission mode that never prompts, sandbox config for the worktree root, and auth (a subscription token from `claude setup-token` passed as `CLAUDE_CODE_OAUTH_TOKEN`, or an API key). Bedrock and Vertex are excluded, because their cloud keys would sit in the engine env. `--json-schema` is confirmed present in Claude Code 2.1.284.
 - **V3.** Whether update-branch attributes the push to the token user, and how it interacts with `require_last_push_approval` and `dismiss_stale_reviews_on_push`.
 - **V4.** How `doctor` can confirm the engine token is read-only without writing anything: fine-grained token permissions, or classic `X-OAuth-Scopes`.
@@ -333,6 +334,7 @@ Until the skill ships report-only mode, dual mode stays behind `REVIEW_ENGINES`,
 ## 9. Security
 
 - **The approver token never reaches untrusted code.** The engines run PR code for 10-30 minutes. The approver token is denylisted in `buildChildEnv`, kept out of `process.env`, and passed only per `gh` call. If it leaked, a malicious PR could approve itself.
+- **Env-var isolation alone is insufficient.** The engines run as the daemon's OS user, so the env file holding `APPROVER_GH_TOKEN` and the operator's `gh` config/keychain are readable by the engine's OS identity regardless of what `buildChildEnv` passes. Enabling dual mode is gated on https://github.com/andrew-barnett/slack-review-bot/issues/64: a filesystem boundary for the approver token, `GH_CONFIG_DIR` pointed at an empty bot-owned directory, and doctor verification of both.
 - **The engine token is read-only.** It is a fine-grained PAT on the role account (contents, pull requests and metadata: read), the preferred option, or the GitHub App installation token proposed in andrew-barnett/slack-review-bot#33, scoped to read. A leaked engine token cannot comment, push, or approve.
 - **Claude engine isolation** matches the Codex child: allowlisted env, sandbox, a dedicated config dir with the secret-blocking hook, and no personal hooks, memory, or MCP servers.
 - **Accepted residual risk:** each engine's own model credential (Codex auth, Claude credential) is visible to PR code, as Codex's is today. This is unchanged, and andrew-barnett/slack-review-bot#33 and andrew-barnett/slack-review-bot#34 track the hardening.
