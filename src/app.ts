@@ -147,6 +147,7 @@ async function main(): Promise<void> {
     reviews,
     registry: childRegistry,
     gh: approverGh,
+    isShuttingDown: () => shutdown.forced,
     refreshAuth: () =>
       ensureRegistryAuth({
         scriptPath: config.codeartifactLoginScript,

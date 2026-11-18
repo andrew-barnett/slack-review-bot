@@ -190,7 +190,16 @@ export async function runJob(
     return 'error'
   }
 
-  if (outcome.dual) return finishDual(request, emoji, deps, options, outcome.dual, outcome.usage, gatedAny)
+  if (outcome.dual) {
+    // Engines never throw, so a shutdown force-kill reaches here as an engine error rather than
+    // through the catch above. Post nothing and leave the cursor unsettled so the review replays
+    // on the next start (issue #32); reporting it here would post a second set on the replay.
+    if (deps.isShuttingDown?.()) {
+      deps.log('review.aborted.shutdown', { prs: reviewUrls })
+      return 'skipped'
+    }
+    return finishDual(request, emoji, deps, options, outcome.dual, outcome.usage, gatedAny)
+  }
 
   const { result, usage } = outcome
   const verdict = verdictFor(result)

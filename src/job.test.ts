@@ -567,6 +567,21 @@ test('runJob reacts to each dual outcome with its own emoji', async t => {
   t.end()
 })
 
+// Issue 32 on the dual path: engines never throw, so a shutdown force-kill reaches the job as a
+// dual outcome (an engine error), not through the catch. Regression caught: the job posting an
+// error reaction and thread for our own deploy, and the replay then posting a second set.
+test('runJob stays silent when a dual outcome arrives during a shutdown', async t => {
+  const usages: RunUsage[] = []
+  const rec = dualRecorder(dualReport('error'), { isShuttingDown: () => true, recordUsage: u => { usages.push(u) } })
+  const outcome = await runJob(request, emoji, rec.deps)
+  t.equal(outcome, 'skipped', 'a shutdown kill is not reported as an error outcome')
+  t.deepEqual(rec.added, ['eyes'], 'no outcome reaction is added')
+  t.deepEqual(rec.removed, [], 'the ack is left in place for the replay')
+  t.deepEqual(rec.threads, [], 'no thread is posted')
+  t.deepEqual(usages, [], 'no usage is reported')
+  t.end()
+})
+
 // A mixed request takes the worst outcome. Regression caught: the approval stamp on a request in
 // which another PR had findings.
 test('runJob takes the worst outcome of a mixed dual request', async t => {

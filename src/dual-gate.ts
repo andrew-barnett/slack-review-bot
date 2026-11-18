@@ -36,8 +36,11 @@ const oneLine = (text: string, max = 200) => {
   return line.length > max ? `${line.slice(0, max - 1)}…` : line
 }
 
-/** Sanitise text provided by an engine to prevent mentions and hidden sections. */
-function sanitiseEngineText(text: string): string {
+/**
+ * Sanitise untrusted text (engine output, or GitHub-derived pre-flight lines such as CODEOWNERS
+ * teams, requester logins and PR-controlled file paths) to prevent mentions and hidden sections.
+ */
+function sanitiseUntrustedText(text: string): string {
   // Neutralise mentions by inserting U+200D (zero-width joiner) after @ followed by word char
   let result = text.replace(/@(\w)/g, '@‍$1')
   // Replace `<!--` with `&lt;!--` to prevent hiding sections
@@ -181,21 +184,21 @@ export interface ComposeInput {
  * The one combined review (spec 5.8): the pinned SHA, a line per engine, the pre-flight with its
  * reasons and missing items, findings that cannot be anchored, the name of any engine that failed,
  * and the hidden no-mention note. Every finding from a valid engine (clean or findings) is posted;
- * nothing is deduplicated by meaning. Engine-provided text is sanitised to prevent mentions and
- * hidden sections.
+ * nothing is deduplicated by meaning. Engine-provided text and the GitHub-derived pre-flight lines
+ * are sanitised to prevent mentions and hidden sections.
  */
 export function composeReview(input: ComposeInput): { body: string; comments: ReviewComment[] } {
   const { pinnedSha, passes, eligibility, outcome, commentable } = input
   const lines: string[] = [`**Dual-engine review at \`${pinnedSha}\`.** ${HEADLINE[outcome]}`, '']
-  lines.push(passes.map(p => `${ENGINE_LABEL[p.engine]}: ${sanitiseEngineText(p.detail)}`).join(' · '), '')
+  lines.push(passes.map(p => `${ENGINE_LABEL[p.engine]}: ${sanitiseUntrustedText(p.detail)}`).join(' · '), '')
   lines.push(`Pre-flight: ${VERDICT_TEXT[eligibility.verdict]}.`)
-  for (const reason of eligibility.reasons) lines.push(`- ${reason}`)
+  for (const reason of eligibility.reasons) lines.push(`- ${sanitiseUntrustedText(reason)}`)
   if (eligibility.missing.length) {
     lines.push('', 'Still needed:')
-    for (const item of eligibility.missing) lines.push(`- ${item}`)
+    for (const item of eligibility.missing) lines.push(`- ${sanitiseUntrustedText(item)}`)
   }
   for (const failed of passes.filter(p => p.state === 'invalid')) {
-    lines.push('', `${ENGINE_LABEL[failed.engine]} did not complete a valid review (${sanitiseEngineText(failed.detail)}), so this review cannot approve.`)
+    lines.push('', `${ENGINE_LABEL[failed.engine]} did not complete a valid review (${sanitiseUntrustedText(failed.detail)}), so this review cannot approve.`)
   }
 
   const comments: ReviewComment[] = []
@@ -204,12 +207,16 @@ export function composeReview(input: ComposeInput): { body: string; comments: Re
     const unanchored: string[] = []
     for (const finding of pass.result.findings) {
       const anchored = finding.file !== '' && finding.line > 0 && commentable.get(finding.file)?.has(finding.line)
-      const sanitisedBody = sanitiseEngineText(indentContinuation(finding.body))
       if (anchored) {
-        comments.push({ path: finding.file, line: finding.line, side: 'RIGHT', body: withAgentNote(cap(`${tag(pass.engine, finding)} ${sanitisedBody}`)) })
+        // An inline comment is not a list item, so its body keeps its own line structure.
+        const body = sanitiseUntrustedText(finding.body)
+        comments.push({ path: finding.file, line: finding.line, side: 'RIGHT', body: withAgentNote(cap(`${tag(pass.engine, finding)} ${body}`)) })
       } else {
-        const where = finding.file ? `\`${finding.file}${finding.line > 0 ? `:${finding.line}` : ''}\` ` : ''
-        unanchored.push(`- ${tag(pass.engine, finding)} ${where}${sanitisedBody}`)
+        const body = sanitiseUntrustedText(indentContinuation(finding.body))
+        // A backtick or newline in the path would close the code span or break out of the list item.
+        const file = sanitiseUntrustedText(finding.file.replace(/[`\r\n]/g, ''))
+        const where = file ? `\`${file}${finding.line > 0 ? `:${finding.line}` : ''}\` ` : ''
+        unanchored.push(`- ${tag(pass.engine, finding)} ${where}${body}`)
       }
     }
     if (unanchored.length) lines.push('', `### ${ENGINE_LABEL[pass.engine]}`, ...unanchored)

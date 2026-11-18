@@ -53,6 +53,11 @@ export interface DualDeps {
   pollMs?: number
   sleep?(ms: number): Promise<void>
   now?(): number
+  /**
+   * True once a shutdown has force-killed the run (issue #32). The killed engines report errors,
+   * so nothing is posted as the role account; the review replays on the next start.
+   */
+  isShuttingDown?(): boolean
 }
 
 type Prepared =
@@ -60,6 +65,7 @@ type Prepared =
   | { kind: 'blocked'; pr: PullRequestRef; reason: string; eligibility?: Eligibility }
 
 const errText = (error: unknown) => (error instanceof Error ? error.message : String(error))
+const SHUTDOWN_REASON = 'the daemon is shutting down; nothing was posted and the review will replay'
 const short = (sha: string) => sha.slice(0, 7)
 
 /**
@@ -229,6 +235,7 @@ export async function finishPr(
 
   const decision = decide(passes, eligibility)
   if (!decision.event) return { ...report, outcome: decision.outcome }
+  if (deps.isShuttingDown?.()) return { ...report, outcome: 'error', reason: SHUTDOWN_REASON }
 
   try {
     const earlier = await deps.gh.botReviews(pr, botLogin)
@@ -261,6 +268,8 @@ export async function finishPr(
     deps.log('dual.head.reread_failed', { pr: pr.url, error: errText(error) })
     return { ...report, outcome: 'error', reason: 'could not re-read the head just before posting; nothing was posted' }
   }
+  // A shutdown can start during the reads above; the last check sits right before the write.
+  if (deps.isShuttingDown?.()) return { ...report, outcome: 'error', reason: SHUTDOWN_REASON }
   try {
     const posted = await deps.gh.postReview(pr, { commitId: pinnedSha, event: decision.event, body, comments })
     report.reviewUrl = posted.url
@@ -340,7 +349,15 @@ export function makeDualReviewRunner(deps: DualDeps): (request: ReviewRequest) =
       }
     } else {
       const prepared: Prepared[] = []
-      for (const pr of prList) prepared.push(await preparePr(deps, pr, botLogin))
+      for (const pr of prList) {
+        try {
+          prepared.push(await preparePr(deps, pr, botLogin))
+        } catch (error) {
+          // One PR's failure must not lose the other PRs' reports or the usage.
+          deps.log('dual.prepare.failed', { runId, pr: pr.url, error: errText(error) })
+          reports.set(pr.url, { url: pr.url, outcome: 'error', passes: [], warnings: [], reason: 'preparing the review failed unexpectedly; nothing was posted' })
+        }
+      }
       const ready = prepared.filter((p): p is Extract<Prepared, { kind: 'ready' }> => p.kind === 'ready')
       for (const p of prepared) {
         if (p.kind === 'blocked') reports.set(p.pr.url, { url: p.pr.url, outcome: 'blocked', eligibility: p.eligibility, passes: [], warnings: [], reason: p.reason })
@@ -356,6 +373,11 @@ export function makeDualReviewRunner(deps: DualDeps): (request: ReviewRequest) =
         })
         outcomes = run.outcomes
         for (const r of ready) {
+          if (deps.isShuttingDown?.()) {
+            deps.log('dual.finish.shutdown', { runId, pr: r.pr.url })
+            reports.set(r.pr.url, { url: r.pr.url, outcome: 'error', pinnedSha: r.pinnedSha, eligibility: r.eligibility, passes: run.passes.get(r.pr.url) ?? [], warnings: [...r.warnings], reason: SHUTDOWN_REASON })
+            continue
+          }
           try {
             reports.set(r.pr.url, await finishPr(deps, r, run.passes.get(r.pr.url) ?? [], botLogin))
           } catch (error) {

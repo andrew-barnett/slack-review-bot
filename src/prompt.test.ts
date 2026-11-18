@@ -218,3 +218,17 @@ test('buildReportOnlyPrompt pins the engine-specific worktree root and the outpu
   t.throws(() => buildReportOnlyPrompt({ engine: 'codex', prs: [], instructions: '', worktreeRoot }), /at least one/)
   t.end()
 })
+
+// The unattended section and the output contract must agree: a test not run because of the
+// environment (services or network the sandbox denies) is an environment problem, which makes the
+// pass invalid. Regression caught: the summary telling the engine such tests are "skipped and
+// noted", so an engine skips them and returns clean, and the gate approves an untested PR.
+test('buildReportOnlyPrompt treats tests not run because of the environment as an environment problem', t => {
+  const prompt = reportOnly('codex')
+  const flat = prompt.replace(/\s+/g, ' ')
+  t.notOk(flat.includes('skipped and noted'), 'no "skipped and noted" escape hatch')
+  t.ok(flat.includes('Tests not run because of the environment (suites needing a database, NATS or network the sandbox denies) are an environment problem: list each one in `environmentProblems`, and never return `clean` after skipping them'), 'the unattended section routes them to environmentProblems')
+  t.ok(flat.includes('tests NOT RUN because of the environment (an install, toolchain or network failure, or a database, NATS or network the sandbox denies)'), 'the output contract covers sandbox-denied services')
+  t.ok(flat.includes('an engine that skipped tests because of the environment must not return `clean`'), 'the output contract forbids clean after skipping')
+  t.end()
+})

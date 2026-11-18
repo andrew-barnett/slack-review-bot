@@ -201,6 +201,60 @@ test('composeReview sanitises engine-provided text', t => {
   t.end()
 })
 
+// The pre-flight reasons and missing items are built from GitHub data (CODEOWNERS teams, the
+// logins that requested changes, PR-controlled file paths) and posted as the role account.
+// Regression: every partial or won't-count review @-mentioned the CODEOWNERS team and the change
+// requester, and a path containing `<!--` hid the rest of the body.
+test('composeReview sanitises the GitHub-derived pre-flight lines', t => {
+  const eligibility: Eligibility = {
+    ...counts,
+    verdict: 'partial',
+    reasons: ['changes requested by @octocat must be resolved or dismissed; an approval from the bot cannot clear it'],
+    missing: ['@org/team for docs/<!--hidden.md', 'changes requested by @octocat'],
+  }
+  const { body } = composeReview({ pinnedSha: SHA, passes: [pass('codex', 'clean'), pass('claude', 'clean')], eligibility, outcome: 'approvedPartial', commentable: new Map() })
+  t.notOk(/@org\/team/.test(body), 'the CODEOWNERS team is not mentioned')
+  t.ok(body.includes('- @‍org/team for docs/&lt;!--hidden.md'), 'team neutralised and <!-- escaped in a missing item')
+  t.notOk(body.includes('<!--hidden'), 'the path cannot open a hidden section')
+  t.notOk(/@octocat/.test(body), 'the change requester is not mentioned in a reason or missing item')
+  t.ok(body.includes('changes requested by @‍octocat must be resolved'), 'reason neutralised')
+  t.end()
+})
+
+// An unanchored finding shows its file inside a code span. Regression: a PR-controlled path with
+// a backtick closed the span (letting `@team` or `<!--` render live), and a newline broke out of
+// the list item.
+test('composeReview strips backticks and newlines from an unanchored finding path and sanitises it', t => {
+  const codex: EnginePass = {
+    engine: 'codex', state: 'findings', detail: '1 blocking',
+    result: result({ verdict: 'findings', findings: [{ severity: 'blocking', file: 'a`@org/team\n<!--b.ts', line: 4, body: 'bug' }] }),
+  }
+  const { body } = composeReview({ pinnedSha: SHA, passes: [codex, pass('claude', 'clean')], eligibility: counts, outcome: 'findings', commentable: new Map() })
+  t.ok(body.includes('- **[Codex · BLOCKING]** `a@‍org/team&lt;!--b.ts:4` bug'), 'path is one sanitised code span')
+  t.end()
+})
+
+// Continuation indentation keeps a multi-line finding inside its list item; an inline comment is
+// not a list item. Regression: anchored comment bodies gained a stray two-space indent, which
+// GitHub can render as an indented code block or broken fences.
+test('composeReview indents continuation lines only for unanchored list items', t => {
+  const codex: EnginePass = {
+    engine: 'codex', state: 'findings', detail: '2 blocking',
+    result: result({
+      verdict: 'findings',
+      findings: [
+        { severity: 'blocking', file: 'src/a.ts', line: 3, body: 'anchored1\nanchored2' },
+        { severity: 'blocking', file: '', line: 0, body: 'loose1\nloose2' },
+      ],
+    }),
+  }
+  const { body, comments } = composeReview({ pinnedSha: SHA, passes: [codex, pass('claude', 'clean')], eligibility: counts, outcome: 'findings', commentable: new Map([['src/a.ts', new Set([3])]]) })
+  t.equal(comments.length, 1)
+  t.ok(comments[0].body.startsWith('**[Codex · BLOCKING]** anchored1\nanchored2'), 'anchored body keeps its lines unindented')
+  t.ok(body.includes('loose1\n  loose2'), 'unanchored list item is indented')
+  t.end()
+})
+
 // GitHub rejects a review body over 65,536 characters with 422, which would turn a valid review
 // into an error. A huge finding (an engine pasting a whole test file) is truncated instead.
 // When an odd number of ``` fences is kept, a closing fence is appended before the truncation marker.

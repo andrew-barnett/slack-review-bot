@@ -392,6 +392,63 @@ test('dual runner isolates a throw while finishing one PR', async t => {
   t.end()
 })
 
+// The same isolation for the pre-flight step. Regression caught: an unexpected throw in preparePr
+// for PR 2 rejecting the whole run, so PR 1's approval was never reported and the usage was lost.
+test('dual runner isolates a throw while preparing one PR', async t => {
+  const URL2 = 'https://github.com/o/r/pull/2'
+  const two: ReviewRequest = { ...request, prs: [request.prs[0], { owner: 'o', repo: 'r', number: 2, url: URL2 }] }
+  const w = world([OLD], {
+    behindBy: async (pr: { number: number }) => {
+      if (pr.number === 2) throw new Error('HTTP 502')
+      return 0
+    },
+  } as Partial<ApproverGitHub>)
+  const d = deps(w, undefined, {
+    log: event => {
+      if (event === 'dual.compare.failed') throw new Error('log sink broke')
+    },
+  })
+  const out = await makeDualReviewRunner(d)(two)
+  t.deepEqual(out.dual!.prs.map(p => p.outcome), ['approved', 'error'], 'PR 1 keeps its report')
+  t.match(out.dual!.prs[1].reason ?? '', /preparing the review failed unexpectedly; nothing was posted/)
+  t.deepEqual(w.posted.map(p => p.commitId), [OLD], 'only PR 1 was posted')
+  t.equal(out.usage.tokensUsed, 200, 'usage survives')
+  t.end()
+})
+
+// Shutdown contract (issue 32) on the dual path: engines never throw, so a force-kill arrives as an
+// engine error and the runner resolves normally. Regression caught: the runner posting a COMMENT
+// (or anything) as the role account while the daemon was shutting down, then posting again on replay.
+test('dual runner posts nothing once a shutdown is signalled', async t => {
+  // Signalled while the engines run (the force-kill), so before finishPr.
+  let shuttingDown = false
+  const killed: Engine = {
+    name: 'codex',
+    async run() {
+      shuttingDown = true
+      return { engine: 'codex', results: [], usage: { attempts: 1 }, error: 'killed by shutdown' }
+    },
+  }
+  const w = world()
+  const out = await run(deps(w, [killed, engine('claude', 'findings')], { isShuttingDown: () => shuttingDown }))
+  t.deepEqual(w.posted, [], 'no postReview call')
+  t.equal(out.dual!.prs[0].outcome, 'error')
+  t.match(out.dual!.prs[0].reason ?? '', /shutting down; nothing was posted/)
+
+  // Signalled during finishPr's reads, after the decision: the last check before the write holds.
+  let late = false
+  const w2 = world([OLD], {
+    commentableLines: async () => {
+      late = true
+      return new Map()
+    },
+  })
+  const out2 = await run(deps(w2, [engine('codex', 'findings'), engine('claude')], { isShuttingDown: () => late }))
+  t.deepEqual(w2.posted, [], 'no postReview call when shutdown starts mid-finish')
+  t.equal(out2.dual!.prs[0].outcome, 'error')
+  t.end()
+})
+
 // A failed behindBy compare skips the update; the user must see that base freshness was unchecked.
 test('dual runner warns when the base freshness could not be checked', async t => {
   const w = world([OLD], { behindBy: async () => { throw new Error('HTTP 502') } })

@@ -195,6 +195,8 @@ export interface RunnerDeps {
   gh?: ApproverGitHub
   /** Dual mode: changed file names for the pre-flight. Defaults to the existing gh effect. */
   listChangedFiles?: (pr: PullRequestRef) => Promise<string[]>
+  /** Dual mode: true once a shutdown force-killed the run, so nothing is posted (issue #32). */
+  isShuttingDown?: () => boolean
   /** Injection seams for the engines' child runs (tests). */
   engineDeps?: Pick<EngineDeps, 'runCodex' | 'runClaude'>
 }
@@ -213,6 +215,13 @@ export function selectReviewRunner(
     return makeReviewRunner(config, deps.log, runCodexReview, deps.reviews, deps.registry, deps.refreshAuth)
   }
   assertModeAvailable(config, available)
+  // A second guard behind config loading: the engines must get a read-only token distinct from the
+  // role account's, or an engine child could write to GitHub as the approver.
+  if (!config.engineGhToken) throw new Error('dual mode requires ENGINE_GH_TOKEN')
+  if (!config.approverGhToken) throw new Error('dual mode requires APPROVER_GH_TOKEN')
+  if (config.engineGhToken === config.approverGhToken) {
+    throw new Error('dual mode requires ENGINE_GH_TOKEN and APPROVER_GH_TOKEN to differ')
+  }
   const log = deps.log ?? (() => {})
   const engineDeps: EngineDeps = {
     ...deps.engineDeps,
@@ -230,5 +239,6 @@ export function selectReviewRunner(
     runIdFor,
     log,
     reviews: deps.reviews,
+    isShuttingDown: deps.isShuttingDown,
   })
 }
