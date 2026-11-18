@@ -3,7 +3,7 @@
 // rules. The fetch layer that gathers the facts is at the bottom of this file.
 
 import type { LatestPush, Permission, ReviewFact } from './approver-github'
-import { ownersFor, parseCodeowners } from './codeowners'
+import { ownersFor, parseCodeowners, unsupportedLines } from './codeowners'
 
 export type EligibilityVerdict = 'counts' | 'partial' | 'wontCount'
 export interface Eligibility { verdict: EligibilityVerdict; reasons: string[]; missing: string[]; lastPushApproval: boolean; dismissStale: boolean }
@@ -95,6 +95,7 @@ const MAX_LISTED_PATHS = 5
 
 export function evaluateEligibility(f: EligibilityFacts): Eligibility {
   const unreadable: string[] = []
+  if (f.ruleSources.length === 0) unreadable.push('rule sources (none were read)')
   for (const source of f.ruleSources) if (!source.rules) unreadable.push(source.name)
   const rules = mergeRules(f.ruleSources.flatMap(s => (s.rules ? [s.rules] : [])))
   const base = { lastPushApproval: rules.requireLastPushApproval, dismissStale: rules.dismissStaleReviews }
@@ -119,18 +120,40 @@ export function evaluateEligibility(f: EligibilityFacts): Eligibility {
     if (f.codeowners === null) unreadable.push('CODEOWNERS')
     if (f.codeownersErrors === null) unreadable.push('CODEOWNERS errors')
     else if (f.codeownersErrors > 0) unreadable.push(`CODEOWNERS (${f.codeownersErrors} error(s) reported by GitHub)`)
+    if (f.codeowners) {
+      const lines = unsupportedLines(parseCodeowners(f.codeowners))
+      if (lines.length) unreadable.push(`CODEOWNERS syntax this tool does not support on line(s) ${lines.join(', ')}`)
+    }
   }
 
   // Rule 2: eligible existing approvals.
   const approvals: ReviewFact[] = []
+  const seenApprovers = new Set<string>()
+  const changeRequesters: string[] = []
+  const seenRequesters = new Set<string>()
+  const needsReviews = rules.requiredApprovals > 0 || rules.requireCodeOwnerReview
   for (const r of f.reviews ?? []) {
+    if (r.state === 'CHANGES_REQUESTED' && needsReviews && !same(r.login, f.botLogin) && !seenRequesters.has(r.login.toLowerCase())) {
+      // An outstanding change request blocks merge; only a write-or-higher reviewer's counts.
+      const perm = f.reviewerPermissions[r.login.toLowerCase()]
+      if (perm === null || perm === undefined) unreadable.push(`permission of ${r.login}`)
+      else if (WRITE_OR_ABOVE.has(perm)) {
+        seenRequesters.add(r.login.toLowerCase())
+        changeRequesters.push(r.login)
+      }
+      continue
+    }
     if (r.state !== 'APPROVED' || same(r.login, f.botLogin) || same(r.login, f.prAuthor)) continue
+    if (seenApprovers.has(r.login.toLowerCase())) continue
     const permission = f.reviewerPermissions[r.login.toLowerCase()]
     if (permission === null || permission === undefined) {
       unreadable.push(`permission of ${r.login}`)
       continue
     }
-    if (WRITE_OR_ABOVE.has(permission)) approvals.push(r)
+    if (WRITE_OR_ABOVE.has(permission)) {
+      seenApprovers.add(r.login.toLowerCase())
+      approvals.push(r)
+    }
   }
 
   // Rule 4: owner coverage.
@@ -157,7 +180,7 @@ export function evaluateEligibility(f: EligibilityFacts): Eligibility {
   const unsatisfiedWith = unsatisfiedWithout.filter(p => !p.byBot)
   const lastPushSatisfiedWithout =
     !rules.requireLastPushApproval ||
-    approvals.some(a => f.latestPush && !same(a.login, f.latestPush.actor) && a.submittedAt > f.latestPush.at)
+    approvals.some(a => f.latestPush && !same(a.login, f.latestPush.actor) && Date.parse(a.submittedAt) > Date.parse(f.latestPush.at))
 
   const missing: string[] = []
   if (shortfallWith > 0) missing.push(`${shortfallWith} more approval${shortfallWith === 1 ? '' : 's'}`)
@@ -169,10 +192,13 @@ export function evaluateEligibility(f: EligibilityFacts): Eligibility {
     missing.push(`${owners} for ${shown}${more}`)
   }
 
+  for (const login of changeRequesters) missing.push(`changes requested by @${login}`)
+
   // Rule 6: verdict.
   if (missing.length === 0) return { verdict: 'counts', reasons: [], missing: [], ...base }
+  const changeReasons = changeRequesters.map(l => `changes requested by @${l} must be resolved or dismissed; an approval from the bot cannot clear it`)
   const reduced =
     shortfallWith < shortfallWithout || unsatisfiedWith.length < unsatisfiedWithout.length || !lastPushSatisfiedWithout
-  if (reduced) return { verdict: 'partial', reasons: ['the bot approval satisfies some but not all requirements'], missing, ...base }
-  return { verdict: 'wontCount', reasons: ['the bot approval would not satisfy any remaining requirement'], missing, ...base }
+  if (reduced) return { verdict: 'partial', reasons: ['the bot approval satisfies some but not all requirements', ...changeReasons], missing, ...base }
+  return { verdict: 'wontCount', reasons: ['the bot approval would not satisfy any remaining requirement', ...changeReasons], missing, ...base }
 }

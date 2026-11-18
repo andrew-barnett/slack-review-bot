@@ -1,4 +1,5 @@
 import test from 'tape'
+import type { ReviewFact } from './approver-github'
 import { evaluateEligibility, mergeRules, NO_RULES, rulesFromClassic, rulesFromRulesets, type EligibilityFacts, type PullRequestRules } from './preflight'
 
 const rules = (r: Partial<PullRequestRules>): PullRequestRules => ({ ...NO_RULES, ...r })
@@ -91,7 +92,7 @@ test('a read-only reviewer approval does not count toward the number', t => {
 
 // Rule 2: GitHub's DISMISSED state is authoritative. An APPROVED review on an older SHA still
 // counts (an empty-commit push does not dismiss it).
-test('dismissed approvals are excluded, older-SHA approvals still count', t => {
+test('an APPROVED review counts toward the number and a DISMISSED one does not', t => {
   const base = { ruleSources: [{ name: 'rulesets', rules: rules({ requiredApprovals: 2, dismissStaleReviews: true }) }], reviewerPermissions: { alice: 'write' as const } }
   t.equal(evaluateEligibility(facts({ ...base, reviews: [{ login: 'alice', state: 'APPROVED', submittedAt: '2026-11-17T09:00:00Z' }] })).verdict, 'counts')
   t.equal(evaluateEligibility(facts({ ...base, reviews: [{ login: 'alice', state: 'DISMISSED', submittedAt: '2026-11-17T09:00:00Z' }] })).verdict, 'partial')
@@ -179,5 +180,118 @@ test('wontCount naming each unreadable source', t => {
 test('CODEOWNERS errors make the result unverifiable only when owners are required', t => {
   t.equal(evaluateEligibility(facts({ codeownersErrors: 2 })).verdict, 'counts')
   t.equal(evaluateEligibility(facts({ codeownersErrors: 2, ruleSources: [{ name: 'rulesets', rules: rules({ requireCodeOwnerReview: true }) }] })).verdict, 'wontCount')
+  t.end()
+})
+
+const REV = (login: string, state: ReviewFact['state'], submittedAt = '2026-11-17T09:00:00Z'): ReviewFact => ({ login, state, submittedAt })
+const needApproval = (extra: Partial<PullRequestRules> = {}) => [{ name: 'rulesets', rules: rules({ requiredApprovals: 1, ...extra }) }]
+
+// A write-level CHANGES_REQUESTED blocks merge and the bot's approval cannot clear it. Predicting
+// "counts" here would tell the user the PR is mergeable when GitHub still blocks it.
+test('an outstanding change request from a writer prevents counts', t => {
+  const e = evaluateEligibility(facts({
+    ruleSources: needApproval(),
+    reviews: [REV('carol', 'CHANGES_REQUESTED')],
+    reviewerPermissions: { carol: 'write' },
+  }))
+  t.notEqual(e.verdict, 'counts')
+  t.ok(e.missing.includes('changes requested by @carol'))
+  t.match(e.reasons.join(' '), /changes requested by @carol/)
+  t.end()
+})
+
+// A read-only reviewer's change request does not block merge, so it must not block counts.
+test('a change request from a read-only reviewer does not block', t => {
+  t.equal(evaluateEligibility(facts({
+    ruleSources: needApproval(),
+    reviews: [REV('carol', 'CHANGES_REQUESTED')],
+    reviewerPermissions: { carol: 'read' },
+  })).verdict, 'counts')
+  t.end()
+})
+
+// An unknown requester permission is unverifiable: never a quiet counts.
+test('wontCount when a change requester permission is unknown', t => {
+  const e = evaluateEligibility(facts({ ruleSources: needApproval(), reviews: [REV('carol', 'CHANGES_REQUESTED')] }))
+  t.equal(e.verdict, 'wontCount')
+  t.match(e.reasons.join(' '), /permission of carol/)
+  t.end()
+})
+
+// With no approvals or owner review required, change requests are not merge-blocking.
+test('change requests are ignored when no approvals or owner review are required', t => {
+  t.equal(evaluateEligibility(facts({ reviews: [REV('carol', 'CHANGES_REQUESTED')], reviewerPermissions: { carol: 'write' } })).verdict, 'counts')
+  t.end()
+})
+
+// A change request plus a slot the bot fills is partial: the bot reduced something, but the
+// change request (which it cannot clear) remains.
+test('partial when the bot fills a slot but a change request remains', t => {
+  const e = evaluateEligibility(facts({
+    ruleSources: needApproval({ requiredApprovals: 2 }),
+    reviews: [REV('carol', 'CHANGES_REQUESTED')],
+    reviewerPermissions: { carol: 'write' },
+  }))
+  t.equal(e.verdict, 'partial')
+  t.ok(e.missing.includes('changes requested by @carol'))
+  t.end()
+})
+
+// CODEOWNERS syntax the matcher does not support means ownership cannot be trusted (regression:
+// a negation line silently ignored would predict counts wrongly).
+test('unsupported CODEOWNERS syntax is unverifiable only when owner review is required', t => {
+  const codeowners = '!src/a.ts @alice'
+  const e = evaluateEligibility(facts({ codeowners, ruleSources: needApproval({ requireCodeOwnerReview: true }) }))
+  t.equal(e.verdict, 'wontCount')
+  t.match(e.reasons.join(' '), /line\(s\) 1/)
+  t.equal(evaluateEligibility(facts({ codeowners })).verdict, 'counts')
+  t.end()
+})
+
+// Each unreadable input must yield wontCount and name itself, never a quiet counts.
+test('each unreadable input yields wontCount naming it', t => {
+  const owner = [{ name: 'rulesets', rules: rules({ requireCodeOwnerReview: true }) }]
+  const push = [{ name: 'rulesets', rules: rules({ requireLastPushApproval: true }) }]
+  const cases: [string, Partial<EligibilityFacts>, RegExp][] = [
+    ['reviews null', { reviews: null }, /PR reviews/],
+    ['botPermission null', { botPermission: null }, /bot permission/],
+    ['codeowners null', { ruleSources: owner, codeowners: null }, /CODEOWNERS/],
+    ['codeownersErrors null', { ruleSources: owner, codeownersErrors: null }, /CODEOWNERS errors/],
+    ['latestPush null', { ruleSources: push, latestPush: null }, /latest pusher/],
+    ['team membership missing', { ruleSources: owner, codeowners: '/src/ @acme/pay' }, /team membership/],
+    ['team membership null', { ruleSources: owner, codeowners: '/src/ @acme/pay', teamMembership: { '@acme/pay|role-bot': null } }, /team membership/],
+    ['empty ruleSources', { ruleSources: [] }, /rule sources/],
+  ]
+  for (const [name, over, re] of cases) {
+    const e = evaluateEligibility(facts(over))
+    t.equal(e.verdict, 'wontCount', name)
+    t.match(e.reasons.join(' '), re, `${name} reason`)
+  }
+  t.end()
+})
+
+// The same person may appear as 'alice' and 'Alice'; counting twice would over-state approvals.
+test('approvals are deduplicated by lower-cased login', t => {
+  const e = evaluateEligibility(facts({
+    ruleSources: needApproval({ requiredApprovals: 3 }),
+    reviews: [REV('alice', 'APPROVED'), REV('Alice', 'APPROVED')],
+    reviewerPermissions: { alice: 'write' },
+  }))
+  t.deepEqual(e.missing, ['1 more approval'], 'one approval + bot leaves 1 of 3 missing')
+  t.end()
+})
+
+// Fractional-second timestamps must order correctly. As strings '...09:00:00.500Z' sorts before
+// '...09:00:00Z', so alice's post-push approval would be missed, the latest push would look
+// unapproved, and the bot would wrongly read as "reducing" a requirement (partial, not wontCount).
+test('last-push ordering uses parsed timestamps', t => {
+  const e = evaluateEligibility(facts({
+    ruleSources: needApproval({ requireLastPushApproval: true, requireCodeOwnerReview: true }),
+    codeowners: '/src/ @zed',
+    reviews: [REV('alice', 'APPROVED', '2026-11-17T09:00:00.500Z')],
+    reviewerPermissions: { alice: 'write' },
+    latestPush: { actor: 'dev', at: '2026-11-17T09:00:00Z', afterSha: 'h' },
+  }))
+  t.equal(e.verdict, 'wontCount')
   t.end()
 })
