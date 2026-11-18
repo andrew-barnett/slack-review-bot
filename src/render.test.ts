@@ -175,7 +175,7 @@ test('renderDualThread escapes untrusted text but keeps the bot link', t => {
       {
         url: 'https://github.com/o/r/pull/1',
         outcome: 'blocked',
-        passes: [{ engine: 'codex', state: 'error', detail: evil }],
+        passes: [{ engine: 'codex', state: 'invalid', detail: evil }],
         warnings: [evil],
         reason: evil,
         eligibility: { verdict: 'partial', reasons: [evil], missing: [evil], lastPushApproval: false, dismissStale: false },
