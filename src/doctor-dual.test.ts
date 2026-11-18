@@ -1,3 +1,6 @@
+import * as fs from 'fs'
+import * as os from 'os'
+import * as path from 'path'
 import test from 'tape'
 import { loadConfig, loadReviewConfig } from './config'
 import { CHECK_COMMAND_TIMEOUT_MS, agentTools, checkClaudeProfile, checkDualMode, run, wantedEmoji } from './doctor'
@@ -176,6 +179,34 @@ test('run kills a command that never exits', async t => {
   const result = await run(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { PATH: '/usr/bin' }, 300)
   t.equal(result.code, -1)
   t.ok(/timed out/.test(result.output))
+  t.end()
+})
+
+// The installer check runs as bash → node; killing only bash left the grandchild holding the pipes,
+// so 'close' never fired and the doctor hung despite the timeout. Regression caught: run() waiting
+// on 'close' after the timer, and a SIGKILL that reached only the direct child.
+test('run resolves on time and kills the group when a grandchild holds the pipes', async t => {
+  const pidFile = path.join(os.tmpdir(), `srb-run-grandchild-${process.pid}-${Date.now()}`)
+  const started = Date.now()
+  const result = await run('/bin/bash', ['-c', `sleep 30 & echo $! > '${pidFile}'; wait`], { PATH: '/usr/bin:/bin' }, 500)
+  const elapsed = Date.now() - started
+  t.equal(result.code, -1)
+  t.equal(result.output, 'timed out after 500ms')
+  t.ok(elapsed < 3_000, `resolved within the bound (${elapsed}ms)`)
+  const pid = Number(fs.readFileSync(pidFile, 'utf8').trim())
+  fs.rmSync(pidFile, { force: true })
+  // The grandchild was in the killed group; allow a moment for it to be reaped.
+  let alive = true
+  for (let i = 0; i < 20 && alive; i += 1) {
+    try {
+      process.kill(pid, 0)
+      await new Promise(resolve => setTimeout(resolve, 50))
+    } catch {
+      alive = false
+    }
+  }
+  t.notOk(alive, 'the sleeping grandchild was killed with the group')
+  if (alive) process.kill(pid, 'SIGKILL')
   t.end()
 })
 

@@ -203,7 +203,12 @@ export const CHECK_COMMAND_TIMEOUT_MS = 30_000
 export type CommandResult = { code: number; output: string }
 export type CommandRunner = (command: string, args: string[], env?: NodeJS.ProcessEnv) => Promise<CommandResult>
 
-/** Run a command to completion, SIGKILLing it after `timeoutMs` (the same bound the gh runner uses). */
+/**
+ * Run a command to completion, SIGKILLing its whole process group after `timeoutMs` (the same bound
+ * the gh runner uses). The timeout resolves from the timer itself: a grandchild (bash running
+ * `node check-claude-profile.js`) can hold the pipes open after the direct child dies, so 'close'
+ * may never fire.
+ */
 export function run(
   command: string,
   args: string[],
@@ -211,23 +216,32 @@ export function run(
   timeoutMs: number = CHECK_COMMAND_TIMEOUT_MS
 ): Promise<CommandResult> {
   return new Promise(resolve => {
-    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], env })
+    let settled = false
+    const finish = (result: CommandResult) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(result)
+    }
+    // Detached puts the child in its own process group, so the timeout can kill its descendants too.
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], env, detached: true })
     let output = ''
-    let timedOut = false
     const timer = setTimeout(() => {
-      timedOut = true
-      child.kill('SIGKILL')
+      try {
+        if (child.pid !== undefined) process.kill(-child.pid, 'SIGKILL')
+      } catch {
+        // The group is already gone; fall back to the direct child.
+        child.kill('SIGKILL')
+      }
+      // Stop reading so a surviving holder of the pipes cannot keep the doctor's event loop busy.
+      child.stdout.destroy()
+      child.stderr.destroy()
+      finish({ code: -1, output: `timed out after ${timeoutMs}ms` })
     }, timeoutMs)
     child.stdout.on('data', chunk => (output += chunk))
     child.stderr.on('data', chunk => (output += chunk))
-    child.on('error', error => {
-      clearTimeout(timer)
-      resolve({ code: -1, output: String(error) })
-    })
-    child.on('close', code => {
-      clearTimeout(timer)
-      resolve(timedOut ? { code: -1, output: `timed out after ${timeoutMs}ms` } : { code: code ?? -1, output })
-    })
+    child.on('error', error => finish({ code: -1, output: String(error) }))
+    child.on('close', code => finish({ code: code ?? -1, output }))
   })
 }
 
