@@ -273,6 +273,20 @@ test('parseEngineOrder requires a permutation of the configured engines', t => {
   t.end()
 })
 
+// ENGINE_SCHEDULE is a dual-mode setting. Regression caught: a stale invalid value in a
+// single-engine env file would stop startup even though the setting is unused; in dual mode a bad
+// value must still be refused.
+test('loadReviewConfig validates ENGINE_SCHEDULE only in dual mode', t => {
+  const single = loadReviewConfig({ ENGINE_SCHEDULE: 'bogus' })
+  t.equal(single.engineSchedule, 'parallel', 'single mode ignores an invalid value and uses the default')
+  t.throws(
+    () => loadReviewConfig({ REVIEW_ENGINES: 'codex,claude', ENGINE_SCHEDULE: 'bogus', [APPROVER_TOKEN_VAR]: 'a', [ENGINE_TOKEN_VAR]: 'e' }),
+    /ENGINE_SCHEDULE/,
+    'dual mode rejects an invalid value'
+  )
+  t.end()
+})
+
 // Dual mode without both tokens would either approve with the wrong identity or hand engines a
 // write-capable token; refuse to start instead.
 test('loadReviewConfig refuses dual mode without both tokens', t => {

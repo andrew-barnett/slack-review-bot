@@ -323,6 +323,15 @@ export function parseSchedule(raw: string | undefined): EngineSchedule {
   throw new Error(`ENGINE_SCHEDULE must be "parallel" or "serial" (got "${raw}")`)
 }
 
+/** ENGINE_SCHEDULE for single mode, where it is unused: an invalid value falls back to the default. */
+function lenientSchedule(raw: string | undefined): EngineSchedule {
+  try {
+    return parseSchedule(raw)
+  } catch {
+    return 'parallel'
+  }
+}
+
 /** Parse ENGINE_ORDER as a permutation of the configured engines; ignored in single mode. */
 export function parseEngineOrder(raw: string | undefined, engines: EngineName[]): EngineName[] {
   if (engines.length < 2) return [...engines]
@@ -392,7 +401,9 @@ export function loadReviewConfig(env: NodeJS.ProcessEnv = process.env): ReviewCo
     codeartifactRefreshEnabled: parseBool(env.CODEARTIFACT_REFRESH, true),
     codeartifactLoginScript: env.CODEARTIFACT_LOGIN_SCRIPT || defaultLoginScriptPath(),
     reviewEngines,
-    engineSchedule: parseSchedule(env.ENGINE_SCHEDULE),
+    // Like ENGINE_ORDER, validated only in dual mode: a stale invalid value must not stop a
+    // single-engine install from starting.
+    engineSchedule: dual ? parseSchedule(env.ENGINE_SCHEDULE) : lenientSchedule(env.ENGINE_SCHEDULE),
     engineOrder: parseEngineOrder(env.ENGINE_ORDER, reviewEngines),
     approverGhToken: dual ? env[APPROVER_TOKEN_VAR] ?? '' : '',
     engineGhToken: dual ? env[ENGINE_TOKEN_VAR] ?? '' : '',
