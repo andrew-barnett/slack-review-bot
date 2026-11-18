@@ -48,6 +48,12 @@ export interface ReviewConfig {
   errorEmoji: string
   /** Emoji posted when a PR is handed to a human instead of reviewed (the deployments gate). */
   humanReviewEmoji: string
+  /** Dual mode: both engines clean and approved, but the approval does not satisfy every rule. */
+  approvalPartialEmoji: string
+  /** Dual mode: both engines clean, but an approval from the role account would not count. */
+  approvalNotCountedEmoji: string
+  /** Dual mode: the PR head moved during the review, so nothing was posted. */
+  headMovedEmoji: string
   /** Remove the ack emoji once a terminal reaction is added. */
   removeAckOnComplete: boolean
   /** Path to the codex binary. */
@@ -370,6 +376,9 @@ export function loadReviewConfig(env: NodeJS.ProcessEnv = process.env): ReviewCo
     findingsEmoji: env.FINDINGS_EMOJI || 'comments',
     errorEmoji: env.ERROR_EMOJI || 'warning',
     humanReviewEmoji: env.HUMAN_REVIEW_EMOJI || 'raising_hand',
+    approvalPartialEmoji: env.APPROVAL_PARTIAL_EMOJI || 'large_yellow_circle',
+    approvalNotCountedEmoji: env.APPROVAL_NOT_COUNTED_EMOJI || 'white_circle',
+    headMovedEmoji: env.HEAD_MOVED_EMOJI || 'arrows_counterclockwise',
     removeAckOnComplete: parseBool(env.REMOVE_ACK_ON_COMPLETE, false),
     codexBin: env.CODEX_BIN || 'codex',
     codexProfile: env.CODEX_PROFILE || 'review-bot',

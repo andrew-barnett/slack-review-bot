@@ -13,6 +13,8 @@ export interface HelpEmoji {
   findings: string
   error: string
   humanReview: string
+  /** Dual mode only: the extra reactions the approval gate uses. */
+  dual?: { approvalPartial: string; approvalNotCounted: string; headMoved: string }
 }
 
 export function renderHelp(emoji: HelpEmoji): string {
@@ -45,6 +47,14 @@ export function renderHelp(emoji: HelpEmoji): string {
     `:${emoji.ack}: reviewing · :${emoji.queued}: queued, waiting for a slot · ` +
       `:${emoji.pass}: all passed · :${emoji.findings}: findings posted · ` +
       `:${emoji.error}: the run failed · :${emoji.humanReview}: handed to a human`,
+    ...(emoji.dual
+      ? [
+          'Two engines (Codex and Claude) review the same commit; I approve only when both are clean. ' +
+            `:${emoji.pass}: approved · :${emoji.dual.approvalPartial}: approved, but more reviews are still needed · ` +
+            `:${emoji.dual.approvalNotCounted}: both clean, but my approval would not count here · ` +
+            `:${emoji.dual.headMoved}: the PR changed during the review, so re-request`,
+        ]
+      : []),
     '',
     '*Commands* — @-mention me, then:',
     '• `help` — show this message',

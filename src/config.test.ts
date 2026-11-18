@@ -341,3 +341,15 @@ test('scrubDaemonSecrets removes both token variables and nothing else', t => {
   t.deepEqual([...DAEMON_SECRET_VARS].sort(), [APPROVER_TOKEN_VAR, ENGINE_TOKEN_VAR].sort())
   t.end()
 })
+
+// The three dual-mode reactions need defaults that exist in every workspace (built-in names) and
+// must differ from the pass stamp, or a partial or not-counted result would look like an approval.
+test('loadConfig defaults the dual-mode emoji and lets each be overridden', t => {
+  const c = loadConfig({ ...credentials })
+  t.equal(c.approvalPartialEmoji, 'large_yellow_circle')
+  t.equal(c.approvalNotCountedEmoji, 'white_circle')
+  t.equal(c.headMovedEmoji, 'arrows_counterclockwise')
+  t.notOk([c.approvalPartialEmoji, c.approvalNotCountedEmoji, c.headMovedEmoji].includes(c.passEmoji))
+  t.equal(loadConfig({ ...credentials, HEAD_MOVED_EMOJI: 'repeat' }).headMovedEmoji, 'repeat')
+  t.end()
+})

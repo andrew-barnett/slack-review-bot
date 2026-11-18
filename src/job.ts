@@ -4,7 +4,9 @@
 
 import { protectedDeploymentsFiles, renderHumanReviewComment, renderHumanReviewThread } from './gate'
 import type { PullRequestRef } from './parse-message'
-import { renderError, renderThread, verdictFor } from './render'
+import type { DualReport } from './dual'
+import type { PrOutcome } from './dual-gate'
+import { renderDualThread, renderError, renderThread, verdictFor, worstOutcome } from './render'
 import { ReviewFailedError, renderUsageLine, type ReviewOutcome, type RunUsage } from './usage'
 
 export interface MessageRef {
@@ -65,6 +67,12 @@ export interface JobEmoji {
   error: string
   /** Worn when a PR is handed to a human instead of being reviewed (the deployments gate). */
   humanReview: string
+  /** Dual mode: approved, but the approval does not satisfy every rule. */
+  approvalPartial: string
+  /** Dual mode: both engines clean, but the approval would not count, so only a comment was posted. */
+  approvalNotCounted: string
+  /** Dual mode: the head moved during the review, so nothing was posted. */
+  headMoved: string
   removeAckOnComplete: boolean
 }
 
@@ -86,7 +94,8 @@ export interface JobOptions {
   postUsage?: boolean
 }
 
-export type JobOutcome = 'pass' | 'findings' | 'error' | 'skipped'
+/** `approved`, `approvedPartial`, `cleanNotCounted` and `headMoved` occur in dual mode only. */
+export type JobOutcome = 'pass' | 'findings' | 'error' | 'skipped' | 'approved' | 'approvedPartial' | 'cleanNotCounted' | 'headMoved'
 
 /**
  * Acknowledge, review, and report.
@@ -181,6 +190,8 @@ export async function runJob(
     return 'error'
   }
 
+  if (outcome.dual) return finishDual(request, emoji, deps, options, outcome.dual, outcome.usage, gatedAny)
+
   const { result, usage } = outcome
   const verdict = verdictFor(result)
   deps.log('review.done', {
@@ -216,6 +227,66 @@ export async function runJob(
   )
   await reportUsage(deps, options, request.message, usage)
   return 'findings'
+}
+
+const DUAL_JOB_OUTCOME: Record<PrOutcome, JobOutcome> = {
+  approved: 'approved',
+  approvedPartial: 'approvedPartial',
+  cleanNotCounted: 'cleanNotCounted',
+  findings: 'findings',
+  blocked: 'error',
+  error: 'error',
+  headMoved: 'headMoved',
+}
+
+function dualReaction(emoji: JobEmoji, outcome: PrOutcome): string {
+  switch (outcome) {
+    case 'approved':
+      return emoji.pass
+    case 'approvedPartial':
+      return emoji.approvalPartial
+    case 'cleanNotCounted':
+      return emoji.approvalNotCounted
+    case 'findings':
+      return emoji.findings
+    case 'headMoved':
+      return emoji.headMoved
+    default:
+      return emoji.error
+  }
+}
+
+/**
+ * Reactions and the thread for a dual-mode run (spec 5.9). The reaction is the worst outcome
+ * across the request's PRs; the thread is always posted, since it carries each PR's pre-flight,
+ * engine states and review link. As in single mode, a clean result never stamps over a PR the
+ * human-review gate took: that request settles as `skipped`.
+ */
+async function finishDual(
+  request: ReviewRequest,
+  emoji: JobEmoji,
+  deps: JobDeps,
+  options: JobOptions,
+  report: DualReport,
+  usage: RunUsage,
+  gatedAny: boolean
+): Promise<JobOutcome> {
+  const worst = worstOutcome(report.prs.map(pr => pr.outcome))
+  deps.log('review.done', {
+    prs: report.prs.map(pr => pr.url),
+    verdict: worst,
+    statuses: report.prs.map(pr => `${pr.url}=${pr.outcome}`),
+    tokensUsed: usage.tokensUsed,
+    attempts: usage.attempts,
+  })
+  await finishAck(deps, emoji, request.message)
+  const clean = worst === 'approved' || worst === 'approvedPartial' || worst === 'cleanNotCounted'
+  if (!(clean && gatedAny)) {
+    await swallow(deps, 'reaction.dual.failed', () => deps.addReaction(request.message, dualReaction(emoji, worst)))
+  }
+  await swallow(deps, 'thread.dual.failed', () => deps.postThreadReply(request.message, renderDualThread(report)))
+  await reportUsage(deps, options, request.message, usage)
+  return clean && gatedAny ? 'skipped' : DUAL_JOB_OUTCOME[worst]
 }
 
 /** The usage a failed run managed to report, or a single-attempt placeholder when it carried none. */

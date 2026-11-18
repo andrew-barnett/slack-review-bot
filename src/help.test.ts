@@ -72,3 +72,14 @@ test('renderHelp builds the reaction legend from the configured emoji', t => {
   t.notOk(text.includes(':approved_stamp:'), 'not a stale default')
   t.end()
 })
+
+// In dual mode the legend must explain the gate's extra reactions, or a partial or not-counted
+// approval reads as a plain pass.
+test('renderHelp explains the dual-mode reactions only in dual mode', t => {
+  const dual = renderHelp({ ...emoji, dual: { approvalPartial: 'large_yellow_circle', approvalNotCounted: 'white_circle', headMoved: 'arrows_counterclockwise' } })
+  t.ok(dual.includes(':large_yellow_circle: approved, but more reviews are still needed'))
+  t.ok(dual.includes(':white_circle: both clean, but my approval would not count here'))
+  t.ok(dual.includes(':arrows_counterclockwise: the PR changed during the review'))
+  t.notOk(renderHelp(emoji).includes('Two engines'), 'single mode is unchanged')
+  t.end()
+})

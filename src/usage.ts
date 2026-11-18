@@ -155,10 +155,22 @@ export function formatActive(ms: number): string {
  * than a row of zeros.
  */
 export function renderUsageLine(usage: RunUsage): string {
-  const parts: string[] = [
-    usage.tokensUsed === undefined ? 'tokens n/a' : `${formatTokensExact(usage.tokensUsed)} tokens`,
-  ]
+  // Dual mode reports each engine on its own (spec 5.9), never a blended figure.
+  if (usage.engines) {
+    if (usage.engines.length === 0) return '🧮 no engine ran'
+    return `🧮 ${usage.engines.map(e => `${ENGINE_NAME[e.engine]} ${usageParts(e.usage).join(' · ')}`).join(' | ')}`
+  }
+  return `🧮 ${usageParts(usage).join(' · ')}`
+}
+
+const ENGINE_NAME: Record<EngineName, string> = { codex: 'Codex', claude: 'Claude' }
+
+function usageParts(usage: RunUsage): string[] {
+  let tokens = usage.tokensUsed === undefined ? 'tokens n/a' : `${formatTokensExact(usage.tokensUsed)} tokens`
+  // Subscription auth makes Claude's cost a notional figure, not a charge, so it says so.
+  if (usage.claude) tokens += ` ($${usage.claude.costUsd.toFixed(2)} notional)`
+  const parts = [tokens]
   if (usage.activeMs !== undefined && usage.activeMs > 0) parts.push(`${formatActive(usage.activeMs)} active`)
   parts.push(`${usage.attempts} attempt${usage.attempts === 1 ? '' : 's'}`)
-  return `🧮 ${parts.join(' · ')}`
+  return parts
 }

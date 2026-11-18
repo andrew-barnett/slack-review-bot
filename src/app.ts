@@ -265,6 +265,9 @@ async function main(): Promise<void> {
               findings: config.findingsEmoji,
               error: config.errorEmoji,
               humanReview: config.humanReviewEmoji,
+              dual: isDualMode(config)
+                ? { approvalPartial: config.approvalPartialEmoji, approvalNotCounted: config.approvalNotCountedEmoji, headMoved: config.headMovedEmoji }
+                : undefined,
             })
           )
         } catch (error) {
@@ -366,6 +369,9 @@ async function main(): Promise<void> {
             findings: config.findingsEmoji,
             error: config.errorEmoji,
             humanReview: config.humanReviewEmoji,
+            approvalPartial: config.approvalPartialEmoji,
+            approvalNotCounted: config.approvalNotCountedEmoji,
+            headMoved: config.headMovedEmoji,
             removeAckOnComplete: config.removeAckOnComplete,
           },
           deps,
