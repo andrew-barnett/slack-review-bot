@@ -56,7 +56,7 @@ The same image runs under Docker Compose on the operator's laptop now, and on EC
 - **Does not hold:** engine credentials of any kind, or AWS credentials.
   - `ENGINE_GH_TOKEN` is not known to the orchestrator. The dual-mode startup check that the engine token differs from the approver token moves to the launcher, which has both.
   - `CODEARTIFACT_REFRESH=false`: the registry token is the worker's.
-- **Job server:** listens on an internal-only Compose network (`jobs`, `internal: true`) and publishes no ports. It also joins a second network with egress, for Slack and GitHub.
+- **Job server:** listens on an internal-only Compose network (`jobs`, `internal: true`) and publishes no ports. It also joins a second network with egress, for Slack and GitHub. The launcher starts it with the fixed container name `slack-review-bot-orchestrator`, so workers reach it at `http://slack-review-bot-orchestrator:8080` (`ORCHESTRATOR_URL`) without depending on whether `compose run` registers a service-name alias.
 - **Cursor:** `CURSOR_FILE` lives on a named volume `orchestrator-state`, mounted only into the orchestrator.
 
 ### 3.3 Job protocol (`src/jobs/`)
@@ -126,27 +126,47 @@ Replaces today's daemon LaunchAgent. It runs under the operator's account and is
    - assume `SlackReviewBotSecretsReaderRole` (from `LAUNCHER_AWS_PROFILE`, default `staging`) and fetch `/slack-review-bot/*`;
    - check `APPROVER_GH_TOKEN` ≠ `ENGINE_GH_TOKEN`;
    - generate `LAUNCH_KEY`, which goes to the orchestrator only;
-   - run `docker compose up -d orchestrator`, passing the orchestrator's secrets as environment-sourced Compose `secrets:`.
+   - start the orchestrator in the foreground as a supervised child process, `docker compose run --rm -T --name slack-review-bot-orchestrator orchestrator`, and write its secret bundle to the container's **stdin** (3.6.1).
 
-   The values exist only in the launcher's memory and in the containers' `/run/secrets` tmpfs. Nothing is written to the host disk.
+   The values exist only in the launcher's memory and in the container processes' memory. Nothing is written to the host disk, the Docker VM's disk, or a container's filesystem.
 2. **Worker loop**, with `WORKER_SLOTS` loops in parallel (default `2 × CONCURRENCY`, so a parallel dual run gets one worker per engine). Each iteration:
    - assume `SlackReviewBotEngineRole` (`--duration-seconds` per Phase 2a's `engineSessionSeconds`);
    - mint a CodeArtifact token (domain `trade-platform`, owner `153538148884`, `us-east-2`);
    - create a one-use claim ticket from `LAUNCH_KEY` (3.3);
-   - run `docker compose run --rm worker` with those values;
+   - run `docker compose run --rm -T worker` and write the worker's bundle (engine token, AWS session, npm token, claim ticket) to its stdin;
    - after the worker exits, back off 1 s, then repeat.
 
    Failing to mint credentials backs off exponentially (up to 5 minutes) and logs the STS error line, never a credential.
-3. **SIGTERM:** forwards a stop to the orchestrator (which runs its shutdown contract) and to the running workers, then exits.
+3. **SIGTERM: drain first, then stop workers.**
+   1. Stop the worker loops from starting new workers, but leave running workers alone.
+   2. Send SIGTERM to the orchestrator only, and wait for it to exit. While it drains under the contract in https://github.com/andrew-barnett/slack-review-bot/issues/32, in-flight jobs must keep their workers. Killing a worker mid-drain would turn an unfinished review into "worker lost" and settle its cursor entry as an error, so the request would never be replayed.
+   3. If the orchestrator escalates to a forced shutdown, it cancels its jobs itself (the `409` path in 3.3), so workers exit on their own.
+   4. After the orchestrator exits, SIGTERM any worker that is still running, wait up to 30 s, then SIGKILL it and exit.
 
-**Credential exposure on the host.** `docker compose run -e` puts values in the container's config, which `docker inspect` can read. On a single-user laptop this is the same trust level as the operator's own shell. Workers instead receive their values as Compose `secrets:` from the launcher's environment, and `worker.ts` reads `/run/secrets/*` and exports them into its own environment before spawning engines.
+   A second SIGTERM to the launcher skips straight to step 4 for workers, and forwards a second SIGTERM to the orchestrator, which is its existing forced-shutdown trigger.
+
+#### 3.6.1 Secret delivery over stdin
+
+Two delivery routes were considered and rejected:
+- `-e` / `environment:` puts values in the container's config, which `docker inspect` can read, on the Docker VM's disk.
+- Compose's file- and environment-sourced `secrets:` copy the value into the container's filesystem before it starts (`pkg/compose/secrets.go`). For the long-lived orchestrator, that would leave the approver and Slack tokens on disk for its whole life.
+
+Instead, both entrypoints:
+1. read **one** JSON line from stdin (`{"SLACK_BOT_TOKEN": …}`), at most 64 KiB and within 10 s, or exit non-zero;
+2. close stdin;
+3. hold the values in memory.
+
+- **Worker:** exports its values into its own process environment for the engine children, as Phase 2a expects.
+- **Orchestrator:** puts its values only into its config object, never into its own environment, matching today's daemon-secret scrubbing.
+- **No secret-bearing variables in the image or Compose file.** `compose.yaml` sets `stdin_open: true` for both services.
+- **Doctor:** the worker doctor checks (3.7) also assert that `/run/secrets` doesn't exist.
 
 ### 3.7 Doctor
 
 - **New `--role orchestrator|worker` flag.** In a container (detected), the launchd PATH check and the env-file mode check are skipped.
 - **`checkRoleIdentity`:** uses `OPERATOR_GH_LOGIN` (a launcher setting) instead of reading the operator's `gh` login, which doesn't exist in a container.
 - **Worker checks**, run with `docker compose run --rm worker doctor --role worker`. These are the acceptance criteria of https://github.com/andrew-barnett/slack-review-bot/issues/64:
-  - `APPROVER_GH_TOKEN`, `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` are absent from the environment, from `/run/secrets`, and from a filesystem grep of `/home/bot` and `/tmp`;
+  - `APPROVER_GH_TOKEN`, `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` are absent from the environment and from a filesystem grep of `/home/bot` and `/tmp`, and `/run/secrets` doesn't exist;
   - `gh auth status` with `GH_TOKEN` unset reports not logged in;
   - `aws sts get-caller-identity` returns `assumed-role/SlackReviewBotEngineRole/…`, and `secretsmanager describe-secret --secret-id /slack-review-bot/SLACK_BOT_TOKEN` is denied;
   - `/proc` lists no process outside the worker's own PID namespace;
