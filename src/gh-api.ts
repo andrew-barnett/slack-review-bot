@@ -4,7 +4,15 @@
 
 import { execFile } from 'child_process'
 
-export type GhCallOptions = { env?: NodeJS.ProcessEnv; input?: string }
+export type GhCallOptions = {
+  /**
+   * Replaces the entire child environment (does not merge with process.env). Callers must pass
+   * a complete environment, e.g. `{ ...process.env, GH_TOKEN }`, since token separation requires
+   * the approver token to reach the child in isolation without process.env.
+   */
+  env?: NodeJS.ProcessEnv
+  input?: string
+}
 
 /** Runs `gh` with the given args and returns stdout. Swapped out in tests. */
 export type GhRunner = (args: string[], opts?: GhCallOptions) => Promise<string>
@@ -36,6 +44,9 @@ const realExec: ExecFn = (bin, args, opts) =>
       }
       resolve({ stdout: String(stdout) })
     })
+    // Guard against EPIPE if the child exits or is SIGKILLed before stdin drains; the callback
+    // already reports the failure, so ignore the error.
+    child.stdin?.on('error', () => {})
     child.stdin?.end(input ?? '')
   })
 

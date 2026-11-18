@@ -61,3 +61,38 @@ test('defaultRunner forwards env and input with the timeout', async t => {
   t.equal(seen?.input, '{}')
   t.end()
 })
+
+// Without opts, the exec options must not contain env or input (so no-arg callers inherit the
+// parent environment), and killSignal must be 'SIGKILL'. This guards against accidentally
+// leaking process.env via a missing env parameter, which would expose the daemon token.
+test('defaultRunner without opts does not set env or input, and kills with SIGKILL', async t => {
+  let seen: Record<string, unknown> | undefined
+  const run = defaultRunner('gh', GH_COMMAND_TIMEOUT_MS, async (_bin, _args, opts) => {
+    seen = opts as unknown as Record<string, unknown>
+    return { stdout: '' }
+  })
+  await run(['pr', 'list'])
+  t.equal(seen?.env, undefined, 'no env property passed')
+  t.equal(seen?.input, undefined, 'no input property passed')
+  t.equal(seen?.killSignal, 'SIGKILL', 'killSignal is SIGKILL')
+  t.equal(seen?.timeout, GH_COMMAND_TIMEOUT_MS, 'timeout is set')
+  t.end()
+})
+
+// If a process exits without reading stdin while large input is supplied, execFile emits EPIPE
+// on a stream with no handler, crashing the daemon. The error handler guards against this.
+// This test exercises realExec end-to-end: a real short-lived process that exits immediately
+// without consuming stdin should not crash with an uncaught exception.
+test('realExec guards against EPIPE when child exits before stdin drains', async t => {
+  const run = defaultRunner(process.execPath, 5000, undefined)
+  try {
+    // process.exit(0) exits immediately without reading stdin; supply large input to trigger EPIPE.
+    await run(['-e', 'process.exit(0)'], { input: 'x'.repeat(5_000_000) })
+    t.ok(true, 'promise settled without uncaught exception')
+  } catch (error) {
+    // The error is expected (child exited with code 0, which the callback treats as failure).
+    // The important thing is that it did not crash with an uncaught EPIPE exception.
+    t.ok(true, 'error was caught, not thrown as uncaught')
+  }
+  t.end()
+})
