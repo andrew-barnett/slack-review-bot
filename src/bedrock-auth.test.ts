@@ -324,3 +324,21 @@ test('resolveBedrockAuth supports an assumed-role source with the default run ti
   }
   t.end()
 })
+
+// Only the role-chaining rejection earns the one-hour retry: any other STS failure (AccessDenied,
+// an expired operator session) must surface after a single call, not be masked by a second attempt.
+test('resolveBedrockAuth does not retry a non-chaining assume-role failure', async t => {
+  const durations: number[] = []
+  const exec: Exec = async (_file, args) => {
+    durations.push(Number(args[args.indexOf('--duration-seconds') + 1]))
+    throw Object.assign(new Error('AccessDenied'), { code: 254, stderr: 'An error occurred (AccessDenied) when calling the AssumeRole operation' })
+  }
+  try {
+    await resolveBedrockAuth(bedrockConfig({ ENGINE_AWS_PROFILE: 'operator' }), 'claude', 'denied', exec)
+    t.fail('expected the mint to fail')
+  } catch (error) {
+    t.match((error as Error).message, /AccessDenied/, 'the STS reason surfaces')
+  }
+  t.equal(durations.length, 1, 'assume-role ran exactly once')
+  t.end()
+})

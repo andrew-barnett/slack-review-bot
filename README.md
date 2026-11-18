@@ -755,6 +755,10 @@ The variables are `ENGINE_AUTH`, `BEDROCK_REGION`, `CODEX_BEDROCK_MODEL`,
   maximum. The intended role is `SlackReviewBotEngineRole`, which can invoke Bedrock models and
   nothing else. If the mint fails, the review fails with STS's reason (for example
   `AccessDenied` or an expired operator session), and the engine is not run.
+  Use an **IAM-user** profile for `ENGINE_AWS_PROFILE`. If that profile is itself an assumed
+  role, the call is role chaining, which STS caps at one hour. The daemon then retries once
+  with a one-hour session, so any engine run longer than an hour fails on its model calls
+  when the session expires.
 - **Static mode** (`ENGINE_ROLE_ARN` empty). `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and
   optionally `AWS_SESSION_TOKEN` are read from the daemon environment at startup. This is for a
   launcher that injects credentials, such as a container. Startup then deletes the three

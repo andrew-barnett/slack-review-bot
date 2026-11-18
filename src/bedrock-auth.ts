@@ -42,6 +42,8 @@ export interface BedrockAuth {
 const MIN_SESSION_SECONDS = 900
 /** The engine role's maximum session (4 hours). */
 const MAX_SESSION_SECONDS = 14400
+/** STS's cap on a session reached by role chaining (the source credentials are themselves a role). */
+const CHAINED_SESSION_SECONDS = 3600
 /** STS's limit on a role session name. */
 const MAX_SESSION_NAME = 64
 /** The prefix of the error every assume-role failure carries. */
@@ -209,14 +211,26 @@ export async function resolveBedrockAuth(
 ): Promise<BedrockAuth> {
   let credentials: AwsCredentials
   if (config.engineRoleArn) {
-    credentials = await assumeEngineRole({
-      roleArn: config.engineRoleArn,
-      profile: config.engineAwsProfile,
-      region: config.bedrockRegion,
-      durationSeconds: engineSessionSeconds(config.runTimeoutMs),
-      sessionName: engineSessionName(runId),
-      exec,
-    })
+    const assume = (durationSeconds: number) =>
+      assumeEngineRole({
+        roleArn: config.engineRoleArn,
+        profile: config.engineAwsProfile,
+        region: config.bedrockRegion,
+        durationSeconds,
+        sessionName: engineSessionName(runId),
+        exec,
+      })
+    const wanted = engineSessionSeconds(config.runTimeoutMs)
+    try {
+      credentials = await assume(wanted)
+    } catch (error) {
+      // When ENGINE_AWS_PROFILE is itself an assumed role, this is a role-chaining hop, which STS
+      // caps at one hour whatever the target role allows. Retry once at the cap rather than failing
+      // every review; a run longer than an hour then fails on its model calls, which the README
+      // documents (an IAM-user profile gets the full session).
+      if (wanted <= CHAINED_SESSION_SECONDS || !/role chaining/i.test((error as Error).message)) throw error
+      credentials = await assume(CHAINED_SESSION_SECONDS)
+    }
   } else if (config.engineAwsStatic) {
     credentials = config.engineAwsStatic
   } else {
