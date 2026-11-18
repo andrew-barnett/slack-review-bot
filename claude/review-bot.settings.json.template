@@ -1,0 +1,47 @@
+{
+  "permissions": {
+    "defaultMode": "dontAsk",
+    "deny": [
+      "Read(/__ENV_DIR__/**)",
+      "Read(/__GH_CONFIG_DIR__/**)",
+      "Edit(/__ENV_DIR__/**)",
+      "Edit(/__GH_CONFIG_DIR__/**)",
+      "Edit(/__WORKSPACE_ROOT__/**)"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true,
+    "allowUnsandboxedCommands": false,
+    "filesystem": {
+      "denyRead": ["__ENV_DIR__", "__GH_CONFIG_DIR__"],
+      "allowWrite": [
+        "__WORKTREE_ROOT__",
+        "__HOME__/.npm",
+        "__HOME__/.cache",
+        "__HOME__/Library/Caches",
+        "__HOME__/Library/pnpm"
+      ]
+    },
+    "network": {
+      "allowedDomains": [
+        "github.com",
+        "api.github.com",
+        "codeload.github.com",
+        "*.githubusercontent.com",
+        "registry.npmjs.org",
+        "*.d.codeartifact.us-east-2.amazonaws.com"
+      ]
+    }
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "python3 \"__PROFILE_DIR__/hooks/block-secret-reads.py\"" }
+        ]
+      }
+    ]
+  }
+}
