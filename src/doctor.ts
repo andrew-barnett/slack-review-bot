@@ -8,12 +8,16 @@
 //
 // Exit code is 1 if any check failed, so it can gate a launch.
 
-import { spawn } from 'child_process'
+import { execFile, spawn } from 'child_process'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
+import { promisify } from 'util'
 import { WebClient } from '@slack/web-api'
+import { resolveBedrockAuth, type BedrockAuth } from './bedrock-auth'
 import { isDualMode, loadConfig, looksLikeUserId, scrubDaemonSecrets, type Config, type ReviewConfig } from './config'
+import { redactSecrets } from './redact'
+import type { Exec } from './registry-auth'
 import { readCursorFile } from './cursor'
 import {
   DOCTOR_PROBE_PR_VAR,
@@ -313,9 +317,113 @@ async function resolveAgentPath(): Promise<string | undefined> {
   return `${prefix}:${code === 0 ? output.trim() : LAUNCHD_BASE_PATH}`
 }
 
-/** The tools the agent must resolve: Claude joins the list only in dual mode. */
+/**
+ * The tools the agent must resolve: Claude joins the list only in dual mode, and `aws` only in
+ * bedrock role mode, where the daemon mints engine credentials with `aws sts assume-role`.
+ */
 export function agentTools(config: ReviewConfig): string[] {
-  return isDualMode(config) ? ['codex', 'claude', 'gh', 'git', 'npm'] : ['codex', 'gh', 'git', 'npm']
+  const tools = isDualMode(config) ? ['codex', 'claude', 'gh', 'git', 'npm'] : ['codex', 'gh', 'git', 'npm']
+  if (config.engineAuth === 'bedrock' && config.engineRoleArn) tools.push('aws')
+  return tools
+}
+
+const execFileAsync = promisify(execFile)
+
+/** The mint's exec, bounded like every other doctor command so a wedged `aws` fails the check. */
+const boundedExec: Exec = (file, args) =>
+  execFileAsync(file, args, { timeout: CHECK_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL' })
+
+/**
+ * The environment the identity probe runs in: only PATH, HOME, the engine credentials and the
+ * region, with the AWS config and shared-credentials files pointed at /dev/null, so the answer
+ * can only come from the minted credentials and never from a profile on disk.
+ */
+export function bedrockProbeEnv(pathValue: string, home: string, auth: BedrockAuth): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    PATH: pathValue,
+    HOME: home,
+    AWS_ACCESS_KEY_ID: auth.credentials.accessKeyId,
+    AWS_SECRET_ACCESS_KEY: auth.credentials.secretAccessKey,
+    AWS_REGION: auth.region,
+    AWS_CONFIG_FILE: '/dev/null',
+    AWS_SHARED_CREDENTIALS_FILE: '/dev/null',
+  }
+  if (auth.credentials.sessionToken) env.AWS_SESSION_TOKEN = auth.credentials.sessionToken
+  return env
+}
+
+/** The role name an assumed-role ARN carries: the last path segment of the role ARN. */
+function roleName(roleArn: string): string {
+  return roleArn.slice(roleArn.indexOf(':role/') + ':role/'.length).split('/').pop() ?? ''
+}
+
+/** The Arn field of `sts get-caller-identity` JSON, found inside output that may carry stderr too. */
+function callerArn(output: string): string | undefined {
+  const start = output.indexOf('{')
+  const end = output.lastIndexOf('}')
+  if (start === -1 || end <= start) return undefined
+  try {
+    const arn = (JSON.parse(output.slice(start, end + 1)) as { Arn?: unknown }).Arn
+    return typeof arn === 'string' ? arn : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * ENGINE_AUTH=bedrock (issue #69): prove the engines will get working, correctly scoped credentials.
+ * In role mode `aws` must resolve, the mint must succeed, and the minted credentials alone must
+ * identify as the engine role; in static mode the captured credentials' identity is reported. The
+ * credentials are never printed: errors carry only the STS reason, redacted again here.
+ */
+export async function checkBedrock(
+  config: ReviewConfig,
+  agentPath: string | undefined,
+  deps: {
+    runCommand?: CommandRunner
+    exec?: Exec
+    find?: (tool: string, pathValue: string) => string | undefined
+    pathValue?: string
+    home?: string
+  } = {}
+): Promise<CheckResult[]> {
+  const runCommand = deps.runCommand ?? run
+  const pathValue = agentPath ?? deps.pathValue ?? process.env.PATH ?? ''
+  const home = deps.home ?? os.homedir()
+  const role = Boolean(config.engineRoleArn)
+  const results: CheckResult[] = []
+  if (role) {
+    const found = (deps.find ?? findOnPath)('aws', pathValue)
+    if (!found) {
+      return [{ name: 'bedrock aws cli', status: 'fail', detail: '`aws` does not resolve on PATH; the daemon cannot mint engine credentials' }]
+    }
+    results.push({ name: 'bedrock aws cli', status: 'ok', detail: found })
+  }
+  let auth: BedrockAuth
+  try {
+    auth = await resolveBedrockAuth(config, 'claude', 'doctor', deps.exec ?? boundedExec)
+  } catch (error) {
+    return [...results, { name: 'bedrock credentials', status: 'fail', detail: redactSecrets(error instanceof Error ? error.message : String(error)) }]
+  }
+  results.push({
+    name: 'bedrock credentials',
+    status: 'ok',
+    detail: role ? `assumed ${config.engineRoleArn}` : 'static credentials from the daemon environment',
+  })
+  const { code, output } = await runCommand('aws', ['sts', 'get-caller-identity', '--output', 'json'], bedrockProbeEnv(pathValue, home, auth))
+  const arn = code === 0 ? callerArn(output) : undefined
+  if (!arn) {
+    const reason = redactSecrets(output.trim().split('\n')[0]?.slice(0, 300) || `exit ${code}`)
+    return [...results, { name: 'bedrock identity', status: 'fail', detail: `sts get-caller-identity failed with the engine credentials: ${reason}` }]
+  }
+  if (!role) return [...results, { name: 'bedrock identity', status: 'ok', detail: arn }]
+  const want = `:assumed-role/${roleName(config.engineRoleArn)}/`
+  return [
+    ...results,
+    arn.includes(want)
+      ? { name: 'bedrock identity', status: 'ok', detail: arn }
+      : { name: 'bedrock identity', status: 'fail', detail: `the engine credentials identify as ${arn}, not the role ${config.engineRoleArn}` },
+  ]
 }
 
 /**
@@ -649,7 +757,7 @@ async function main(): Promise<void> {
   }
 
   // The tokens now live only on `config`; no check below may find them in the process environment.
-  scrubDaemonSecrets(process.env)
+  scrubDaemonSecrets(process.env, config)
   const client = new WebClient(config.botToken)
   const agentPath = await resolveAgentPath()
   const results: CheckResult[] = [
@@ -663,6 +771,7 @@ async function main(): Promise<void> {
     await checkBinary('codex binary', config.codexBin, agentPath),
     await checkCodexProfile(config),
     ...(isDualMode(config) ? await checkDualMode(config, agentPath) : []),
+    ...(config.engineAuth === 'bedrock' ? await checkBedrock(config, agentPath) : []),
     ...checkRoots(config),
     ...checkCursor(config),
     ...(await checkHistoryAccess(client, config)),
