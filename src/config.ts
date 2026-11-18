@@ -11,6 +11,26 @@ import * as os from 'os'
 import * as path from 'path'
 import { defaultLoginScriptPath } from './registry-auth'
 
+/** The review engines the bot can run. */
+export type EngineName = 'codex' | 'claude'
+/** Whether a dual run starts both engines at once or one after the other. */
+export type EngineSchedule = 'parallel' | 'serial'
+
+const ENGINE_NAMES: readonly EngineName[] = ['codex', 'claude']
+
+/** The role account's PAT the daemon approves with. Never reaches an engine child. */
+export const APPROVER_TOKEN_VAR = 'APPROVER_GH_TOKEN'
+/** The role account's read-only token, handed to engines as GH_TOKEN in dual mode. */
+export const ENGINE_TOKEN_VAR = 'ENGINE_GH_TOKEN'
+/** Daemon-held secrets: denied to every child and deleted from process.env at startup. */
+export const DAEMON_SECRET_VARS: readonly string[] = [APPROVER_TOKEN_VAR, ENGINE_TOKEN_VAR]
+
+/**
+ * Whether dual mode can run in this build. False until the orchestrator lands
+ * (https://github.com/andrew-barnett/slack-review-bot/issues/61); startup refuses dual mode while it is.
+ */
+export const DUAL_MODE_AVAILABLE = false
+
 /**
  * Everything needed to run a review. Deliberately free of Slack credentials so the
  * local CLI (`npm run review`) can drive an identical Codex run without a bot token.
@@ -71,6 +91,20 @@ export interface ReviewConfig {
   codeartifactRefreshEnabled: boolean
   /** Absolute path to the vendored CodeArtifact login script the refresh runs. */
   codeartifactLoginScript: string
+  /** Engines to run: `['codex']` (single mode) or both (dual mode). */
+  reviewEngines: EngineName[]
+  /** Dual mode only: run the engines at once or one after the other. */
+  engineSchedule: EngineSchedule
+  /** Serial order; equals `reviewEngines` in single mode. */
+  engineOrder: EngineName[]
+  /** Dual mode only: the approver PAT. Empty in single mode. Never logged, never passed to a child. */
+  approverGhToken: string
+  /** Dual mode only: the read-only engine token. Empty in single mode. */
+  engineGhToken: string
+  /** Claude Code binary (Plan 2). */
+  claudeBin: string
+  /** Dedicated Claude config dir for the engine (Plan 2). */
+  claudeConfigDir: string
 }
 
 export interface Config extends ReviewConfig {
@@ -266,9 +300,61 @@ export function looksLikeUserId(id: string): boolean {
   return /^[UW][A-Z0-9]{2,}$/.test(id)
 }
 
+/** Parse REVIEW_ENGINES: unset means Codex alone; the only other accepted shape is both engines. */
+export function parseEngines(raw: string | undefined): EngineName[] {
+  const list = parseList(raw)
+  if (list.length === 0) return ['codex']
+  for (const name of list) {
+    if (!ENGINE_NAMES.includes(name as EngineName)) {
+      throw new Error(`REVIEW_ENGINES: unknown engine "${name}" (expected "codex" or "codex,claude")`)
+    }
+  }
+  const shape = [...list].sort().join(',')
+  if (list.length !== new Set(list).size || (shape !== 'codex' && shape !== 'claude,codex')) {
+    throw new Error(`REVIEW_ENGINES must be "codex" or "codex,claude" (got "${raw}")`)
+  }
+  return list as EngineName[]
+}
+
+/** Parse ENGINE_SCHEDULE: parallel unless set to serial. */
+export function parseSchedule(raw: string | undefined): EngineSchedule {
+  if (raw === undefined || raw.trim() === '') return 'parallel'
+  if (raw === 'parallel' || raw === 'serial') return raw
+  throw new Error(`ENGINE_SCHEDULE must be "parallel" or "serial" (got "${raw}")`)
+}
+
+/** Parse ENGINE_ORDER as a permutation of the configured engines; ignored in single mode. */
+export function parseEngineOrder(raw: string | undefined, engines: EngineName[]): EngineName[] {
+  if (engines.length < 2) return [...engines]
+  const order = raw === undefined || raw.trim() === '' ? ['codex', 'claude'] : parseList(raw)
+  const valid =
+    order.length === engines.length &&
+    new Set(order).size === order.length &&
+    engines.every(engine => order.includes(engine))
+  if (!valid) {
+    throw new Error(`ENGINE_ORDER must list each of ${engines.join(', ')} exactly once (got "${raw}")`)
+  }
+  return order as EngineName[]
+}
+
+/** True when more than one engine is configured. */
+export function isDualMode(config: Pick<ReviewConfig, 'reviewEngines'>): boolean {
+  return config.reviewEngines.length > 1
+}
+
+/**
+ * Delete the daemon-held GitHub tokens from an environment once config has read them, so no
+ * later spawn that inherits process.env (the CodeArtifact login script, a bare `gh`) carries them.
+ */
+export function scrubDaemonSecrets(env: NodeJS.ProcessEnv): void {
+  for (const name of DAEMON_SECRET_VARS) delete env[name]
+}
+
 export function loadReviewConfig(env: NodeJS.ProcessEnv = process.env): ReviewConfig {
   const home = env.HOME || os.homedir()
-  return {
+  const reviewEngines = parseEngines(env.REVIEW_ENGINES)
+  const dual = reviewEngines.length > 1
+  const config: ReviewConfig = {
     ackEmoji: env.ACK_EMOJI || 'eyes',
     queuedEmoji: env.QUEUED_EMOJI || 'hourglass_flowing_sand',
     passEmoji: env.PASS_EMOJI || 'approved_stamp',
@@ -305,7 +391,22 @@ export function loadReviewConfig(env: NodeJS.ProcessEnv = process.env): ReviewCo
     codexEnvPassthrough: parseList(env.CODEX_ENV_PASSTHROUGH),
     codeartifactRefreshEnabled: parseBool(env.CODEARTIFACT_REFRESH, true),
     codeartifactLoginScript: env.CODEARTIFACT_LOGIN_SCRIPT || defaultLoginScriptPath(),
+    reviewEngines,
+    engineSchedule: parseSchedule(env.ENGINE_SCHEDULE),
+    engineOrder: parseEngineOrder(env.ENGINE_ORDER, reviewEngines),
+    approverGhToken: dual ? env[APPROVER_TOKEN_VAR] ?? '' : '',
+    engineGhToken: dual ? env[ENGINE_TOKEN_VAR] ?? '' : '',
+    claudeBin: env.CLAUDE_BIN || 'claude',
+    claudeConfigDir: env.CLAUDE_CONFIG_DIR_REVIEW || path.join(home, '.claude-review-bot'),
   }
+  if (dual) {
+    if (!config.approverGhToken) throw new Error(`${APPROVER_TOKEN_VAR} is required when REVIEW_ENGINES=codex,claude`)
+    if (!config.engineGhToken) throw new Error(`${ENGINE_TOKEN_VAR} is required when REVIEW_ENGINES=codex,claude`)
+    if (config.approverGhToken === config.engineGhToken) {
+      throw new Error(`${APPROVER_TOKEN_VAR} and ${ENGINE_TOKEN_VAR} must be different tokens (the engine token must be read-only)`)
+    }
+  }
+  return config
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
