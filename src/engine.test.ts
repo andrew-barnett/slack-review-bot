@@ -196,3 +196,83 @@ test('an engine prefixes its progress lines with its name', async t => {
   t.deepEqual(lines, ['[codex] npm ci'])
   t.end()
 })
+
+// --- ENGINE_AUTH (issue #69) ---
+
+const bedrockFor = (engine: string, runId: string) => ({
+  region: 'us-east-2',
+  model: `${engine}-model`,
+  credentials: { accessKeyId: `id-for-${runId}`, secretAccessKey: 'fake-secret-' + 'value-xyz' },
+})
+
+// Credentials are minted per attempt, keyed by the attempt's runId, so a stall retry gets a fresh
+// session instead of one that may expire mid-retry. Each engine asks with its own name.
+test('both engines resolve Bedrock auth per attempt and pass it to the run', async t => {
+  const asked: string[] = []
+  const engineAuth = async (engine: 'codex' | 'claude', runId: string) => {
+    asked.push(`${engine}:${runId}`)
+    return bedrockFor(engine, runId)
+  }
+  const codexSeen: Array<CodexRunOptions['bedrock']> = []
+  let calls = 0
+  const runCodex = (async (options: CodexRunOptions) => {
+    codexSeen.push(options.bedrock)
+    calls += 1
+    if (calls === 1) throw new CodexStalledError('stalled', 60_000, snapshot(1000))
+    return { result: { results: [clean(URL1), clean(URL2)] }, rawFinalMessage: '', activeMs: 10 }
+  }) as unknown as typeof runCodexReportOnly
+  await makeCodexEngine(config, { runCodex, engineAuth }).run(input)
+  t.deepEqual(asked, ['codex:C1-11.codex', 'codex:C1-11.codex.retry1'], 'one resolve per attempt')
+  t.deepEqual(
+    codexSeen.map(b => b?.credentials.accessKeyId),
+    ['id-for-C1-11.codex', 'id-for-C1-11.codex.retry1'],
+    'each attempt runs with its own credentials'
+  )
+
+  let claudeSeen: ClaudeRunOptions['bedrock']
+  const runClaude = (async (options: ClaudeRunOptions) => {
+    claudeSeen = options.bedrock
+    const usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0, numTurns: 0, durationMs: 0 }
+    return { result: { results: [clean(URL1), clean(URL2)] }, usage, tokensUsed: 0, activeMs: 1, permissionDenials: 0 }
+  }) as unknown as typeof runClaudeReview
+  await makeClaudeEngine(config, { runClaude, engineAuth }).run(input)
+  t.equal(claudeSeen?.model, 'claude-model', 'Claude gets its own model')
+  t.end()
+})
+
+// Subscription mode resolves to undefined, and an engine with no resolver at all must behave
+// exactly as before: no bedrock option reaches the run.
+test('an engine passes no Bedrock auth in subscription mode', async t => {
+  const seen: Array<CodexRunOptions['bedrock'] | 'unset'> = []
+  const runCodex = (async (options: CodexRunOptions) => {
+    seen.push('bedrock' in options && options.bedrock !== undefined ? options.bedrock : 'unset')
+    return { result: { results: [clean(URL1), clean(URL2)] }, rawFinalMessage: '', activeMs: 1 }
+  }) as unknown as typeof runCodexReportOnly
+  await makeCodexEngine(config, { runCodex, engineAuth: async () => undefined }).run(input)
+  await makeCodexEngine(config, { runCodex }).run(input)
+  t.deepEqual(seen, ['unset', 'unset'])
+  t.end()
+})
+
+// A failed mint (AccessDenied, an expired operator session) must fail the engine without running
+// it and without retrying, since retrying cannot fix it, and the error must reach the gate as an
+// engine error, never as a clean pass.
+test('an engine reports a failed credential mint as a non-retried error', async t => {
+  let runs = 0
+  let resolves = 0
+  const runCodex = (async () => {
+    runs += 1
+    return { result: { results: [clean(URL1), clean(URL2)] }, rawFinalMessage: '', activeMs: 1 }
+  }) as unknown as typeof runCodexReportOnly
+  const engineAuth = async () => {
+    resolves += 1
+    throw new Error('could not assume the engine role: An error occurred (AccessDenied)')
+  }
+  const out = await makeCodexEngine(config, { runCodex, engineAuth }).run(input)
+  t.equal(runs, 0, 'the engine never ran')
+  t.equal(resolves, 1, 'not retried')
+  t.deepEqual(out.results, [])
+  t.match(out.error ?? '', /could not assume the engine role: An error occurred \(AccessDenied\)/)
+  t.equal(out.usage.attempts, 1)
+  t.end()
+})

@@ -4,6 +4,7 @@ import { spawn } from 'child_process'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
+import { bedrockCodexArgs, withBedrockCodexEnv, type BedrockAuth } from './bedrock-auth'
 import { CODEX_ENV_ALLOWLIST, CODEX_ENV_ALLOWLIST_PREFIXES, DAEMON_SECRET_VARS } from './config'
 import { type DeadlineDeps, type DeadlineSnapshot } from './deadline'
 import {
@@ -68,6 +69,13 @@ export interface CodexRunOptions {
   envPassthrough?: string[]
   /** Dual mode: the read-only engine token, set as the child's GH_TOKEN. Undefined in single mode. */
   engineGhToken?: string
+  /**
+   * ENGINE_AUTH=bedrock: this attempt's Bedrock region, model and minted credentials. The
+   * credentials go into the child's AWS variables and the provider overrides into its arguments,
+   * with an `AWS_*` shell exclude so model-directed commands never see them. Undefined in
+   * subscription mode, which leaves the run exactly as before.
+   */
+  bedrock?: BedrockAuth
   /**
    * Registry the spawned child registers into for its lifetime, so a daemon shutdown can signal
    * every in-flight `codex exec` process group instead of orphaning it. Optional: the CLI has none.
@@ -180,6 +188,11 @@ export function buildCodexArgs(options: {
   schemaPath: string
   outputPath: string
   prompt: string
+  /**
+   * `-c key=value` pairs placed right after the profile (Bedrock's provider overrides). A `-c`
+   * after `exec` takes precedence over the profile layer.
+   */
+  extraConfig?: string[]
 }): string[] {
   return [
     'exec',
@@ -187,6 +200,7 @@ export function buildCodexArgs(options: {
     // sandbox network on, caches writable. Never mutate the base config instead — that
     // would silently de-restrict every interactive Codex session too.
     '--profile', options.profile,
+    ...(options.extraConfig ?? []),
     '--cd', options.workspaceRoot,
     // The workspace root is writable by virtue of being the workspace; the worktree
     // root sits outside it and has to be granted explicitly.
@@ -232,6 +246,7 @@ async function runCodexWith<T>(
   let env = buildChildEnv(process.env, options.envPassthrough)
   if (options.disableGitSigning) env = withGitSigningDisabled(env)
   if (options.engineGhToken) env = withEngineGhToken(env, options.engineGhToken)
+  if (options.bedrock) env = withBedrockCodexEnv(env, options.bedrock)
 
   const args = buildCodexArgs({
     profile: options.profile,
@@ -240,6 +255,7 @@ async function runCodexWith<T>(
     schemaPath,
     outputPath,
     prompt: options.prompt,
+    extraConfig: options.bedrock ? bedrockCodexArgs(options.bedrock) : undefined,
   })
 
   fs.mkdirSync(options.worktreeRoot, { recursive: true })

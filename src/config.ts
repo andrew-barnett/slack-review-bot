@@ -9,12 +9,32 @@
 
 import * as os from 'os'
 import * as path from 'path'
+import type { AwsCredentials } from './bedrock-auth'
 import { defaultLoginScriptPath } from './registry-auth'
 
 /** The review engines the bot can run. */
 export type EngineName = 'codex' | 'claude'
 /** Whether a dual run starts both engines at once or one after the other. */
 export type EngineSchedule = 'parallel' | 'serial'
+/**
+ * How the engines reach their models: the operator's own subscriptions (Codex's ChatGPT login and
+ * Claude's OAuth token), or AWS Bedrock with short-lived credentials that can only invoke models.
+ */
+export type EngineAuth = 'subscription' | 'bedrock'
+
+const ENGINE_AUTH_MODES: readonly EngineAuth[] = ['subscription', 'bedrock']
+
+/**
+ * The static AWS variables captured as engine credentials in bedrock mode without a role ARN (a
+ * launcher injects them). Deleted from the daemon environment once captured, so they reach engine
+ * children only by explicit injection.
+ */
+export const ENGINE_AWS_STATIC_VARS: readonly string[] = ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN']
+
+/** The shape of an IAM role ARN; anything else is refused before it reaches `aws sts`. */
+const ROLE_ARN = /^arn:aws:iam::\d{12}:role\/[\w+=,.@/-]+$/
+/** Region and model IDs are interpolated into Codex's TOML `-c` overrides, so only this charset is safe. */
+const TOML_SAFE_ID = /^[A-Za-z0-9._:-]+$/
 
 const ENGINE_NAMES: readonly EngineName[] = ['codex', 'claude']
 
@@ -123,6 +143,34 @@ export interface ReviewConfig {
   claudeBin: string
   /** Dedicated Claude config dir for the engine (Plan 2). */
   claudeConfigDir: string
+  /**
+   * How the engines authenticate to their models (issue #69). `subscription` (the default) changes
+   * nothing; `bedrock` routes both engines through AWS Bedrock with short-lived credentials.
+   */
+  engineAuth: EngineAuth
+  /** Bedrock mode: the AWS region both engines call Bedrock in. */
+  bedrockRegion: string
+  /** Bedrock mode: the model ID Codex uses (a cross-region inference profile). */
+  codexBedrockModel: string
+  /** Bedrock mode: the model ID Claude Code uses (a cross-region inference profile). */
+  claudeBedrockModel: string
+  /**
+   * Bedrock mode, optional: Codex's context window for the Bedrock model, in tokens. Codex has no
+   * metadata for Bedrock model IDs and falls back to defaults; this overrides that fallback.
+   */
+  codexBedrockContextWindow?: number
+  /**
+   * Bedrock mode: the role the daemon assumes per attempt to mint engine credentials. It can only
+   * invoke Bedrock models. Empty means static credentials from the daemon env ({@link engineAwsStatic}).
+   */
+  engineRoleArn: string
+  /** Bedrock mode: the AWS profile the daemon calls `sts assume-role` with. Empty means the default chain. */
+  engineAwsProfile: string
+  /**
+   * Bedrock mode without a role ARN: static credentials captured from the daemon env (the container
+   * case, where a launcher injects them). Never logged; scrubDaemonSecrets removes the variables.
+   */
+  engineAwsStatic?: AwsCredentials
 }
 
 export interface Config extends ReviewConfig {
@@ -369,12 +417,91 @@ export function isDualMode(config: Pick<ReviewConfig, 'reviewEngines'>): boolean
   return config.reviewEngines.length > 1
 }
 
+/** Parse ENGINE_AUTH: unset means subscription; anything but the two modes is an error. */
+export function parseEngineAuth(raw: string | undefined): EngineAuth {
+  if (raw === undefined || raw.trim() === '') return 'subscription'
+  if ((ENGINE_AUTH_MODES as readonly string[]).includes(raw)) return raw as EngineAuth
+  throw new Error(`ENGINE_AUTH must be one of ${ENGINE_AUTH_MODES.map(m => `"${m}"`).join(', ')} (got "${raw}")`)
+}
+
 /**
- * Delete the daemon-held GitHub tokens from an environment once config has read them, so no
- * later spawn that inherits process.env (the CodeArtifact login script, a bare `gh`) carries them.
+ * Parse CODEX_BEDROCK_CONTEXT_WINDOW: absent when unset, otherwise a positive integer. A bad value
+ * is an error rather than a silent default, because it is spliced into a Codex `-c` override.
  */
-export function scrubDaemonSecrets(env: NodeJS.ProcessEnv): void {
+export function parseContextWindow(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw.trim() === '') return undefined
+  if (!/^[1-9]\d*$/.test(raw.trim())) {
+    throw new Error(`CODEX_BEDROCK_CONTEXT_WINDOW must be a positive integer (got "${raw}")`)
+  }
+  return Number(raw.trim())
+}
+
+/**
+ * Delete the daemon-held secrets from an environment once config has read them, so no later spawn
+ * that inherits the daemon's environment (the CodeArtifact login script, a bare `gh`) carries them:
+ * always the GitHub tokens, and, only when config captured them as static engine credentials, the
+ * AWS key variables. Without that, the approver's `gh` calls and the CodeArtifact login (which needs
+ * the operator's own profile) would silently run as the engine role. Subscription mode is unchanged.
+ */
+export function scrubDaemonSecrets(env: NodeJS.ProcessEnv, config?: Pick<ReviewConfig, 'engineAwsStatic'>): void {
   for (const name of DAEMON_SECRET_VARS) delete env[name]
+  if (config?.engineAwsStatic) {
+    for (const name of ENGINE_AWS_STATIC_VARS) delete env[name]
+  }
+}
+
+type BedrockConfig = Pick<
+  ReviewConfig,
+  | 'engineAuth'
+  | 'bedrockRegion'
+  | 'codexBedrockModel'
+  | 'claudeBedrockModel'
+  | 'codexBedrockContextWindow'
+  | 'engineRoleArn'
+  | 'engineAwsProfile'
+  | 'engineAwsStatic'
+>
+
+/**
+ * Read the Bedrock settings. The defaults are always filled in, but only bedrock mode validates
+ * them or captures credentials, so a stale value can never stop a subscription install starting.
+ */
+function loadBedrockConfig(env: NodeJS.ProcessEnv): BedrockConfig {
+  const out: BedrockConfig = {
+    engineAuth: parseEngineAuth(env.ENGINE_AUTH),
+    bedrockRegion: env.BEDROCK_REGION || 'us-east-2',
+    codexBedrockModel: env.CODEX_BEDROCK_MODEL || 'us.openai.gpt-5.5',
+    claudeBedrockModel: env.CLAUDE_BEDROCK_MODEL || 'us.anthropic.claude-opus-5-5',
+    engineRoleArn: env.ENGINE_ROLE_ARN ?? '',
+    engineAwsProfile: env.ENGINE_AWS_PROFILE ?? '',
+  }
+  if (out.engineAuth !== 'bedrock') return out
+  for (const [name, value] of [
+    ['BEDROCK_REGION', out.bedrockRegion],
+    ['CODEX_BEDROCK_MODEL', out.codexBedrockModel],
+    ['CLAUDE_BEDROCK_MODEL', out.claudeBedrockModel],
+  ] as const) {
+    if (!TOML_SAFE_ID.test(value)) throw new Error(`${name} may contain only letters, digits and . _ : - (got "${value}")`)
+  }
+  const window = parseContextWindow(env.CODEX_BEDROCK_CONTEXT_WINDOW)
+  if (window !== undefined) out.codexBedrockContextWindow = window
+  if (out.engineRoleArn) {
+    // The value is not echoed: a malformed one may be a secret pasted into the wrong variable.
+    if (!ROLE_ARN.test(out.engineRoleArn)) {
+      throw new Error('ENGINE_ROLE_ARN is not an IAM role ARN (want arn:aws:iam::<12 digits>:role/<name>)')
+    }
+    return out
+  }
+  const accessKeyId = env.AWS_ACCESS_KEY_ID ?? ''
+  const secretAccessKey = env.AWS_SECRET_ACCESS_KEY ?? ''
+  if (!accessKeyId || !secretAccessKey) {
+    throw new Error(
+      'ENGINE_AUTH=bedrock needs ENGINE_ROLE_ARN, or static AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in the daemon environment'
+    )
+  }
+  const sessionToken = env.AWS_SESSION_TOKEN
+  out.engineAwsStatic = { accessKeyId, secretAccessKey, ...(sessionToken ? { sessionToken } : {}) }
+  return out
 }
 
 export function loadReviewConfig(env: NodeJS.ProcessEnv = process.env): ReviewConfig {
@@ -430,6 +557,7 @@ export function loadReviewConfig(env: NodeJS.ProcessEnv = process.env): ReviewCo
     engineGhToken: dual ? env[ENGINE_TOKEN_VAR] ?? '' : '',
     claudeBin: env.CLAUDE_BIN || 'claude',
     claudeConfigDir: env.CLAUDE_CONFIG_DIR_REVIEW || path.join(home, '.claude-review-bot'),
+    ...loadBedrockConfig(env),
   }
   // A non-approval must never wear the approval stamp, in any mode.
   for (const [name, value] of [

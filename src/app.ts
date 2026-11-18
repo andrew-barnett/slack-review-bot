@@ -22,6 +22,7 @@ import {
   SHUTDOWN_POLL_MS,
 } from './codex'
 import { assertModeAvailable, isDualMode, loadConfig, looksLikeUserId, scrubDaemonSecrets } from './config'
+import { makeEngineAuth } from './bedrock-auth'
 import { ensureRegistryAuth } from './registry-auth'
 import { createShutdownController } from './shutdown'
 import { openCursorStore, openNullCursorStore } from './cursor'
@@ -81,9 +82,20 @@ function installCrashHandlers(): void {
 async function main(): Promise<void> {
   installCrashHandlers()
   const config = loadConfig()
-  // The tokens now live only in `config`; drop them from the environment every later spawn inherits.
-  scrubDaemonSecrets(process.env)
+  // The tokens (and any static engine AWS keys) now live only in `config`; drop them from the
+  // environment every later spawn inherits.
+  scrubDaemonSecrets(process.env, config)
   assertModeAvailable(config)
+  if (config.engineAuth === 'bedrock') {
+    // Which credential source is in use, never the credentials themselves.
+    log('config.engine_auth', {
+      mode: 'bedrock',
+      source: config.engineRoleArn ? 'role' : 'static',
+      region: config.bedrockRegion,
+      codexModel: config.codexBedrockModel,
+      claudeModel: config.claudeBedrockModel,
+    })
+  }
   const denied = deniedPassthrough(config.codexEnvPassthrough)
   if (denied.length) {
     log('config.passthrough_denied', { names: denied, hint: 'daemon-held tokens never reach the review child' })
@@ -148,6 +160,8 @@ async function main(): Promise<void> {
     registry: childRegistry,
     gh: approverGh,
     isShuttingDown: () => shutdown.forced,
+    // ENGINE_AUTH=bedrock mints engine credentials per attempt; subscription mode resolves nothing.
+    engineAuth: makeEngineAuth(config),
     refreshAuth: () =>
       ensureRegistryAuth({
         scriptPath: config.codeartifactLoginScript,

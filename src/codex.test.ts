@@ -65,6 +65,47 @@ test('buildCodexArgs skips the git repo check', t => {
   t.end()
 })
 
+// Bedrock (issue #69): the `-c` overrides must come after `exec` and right after the profile, so
+// they take precedence over the profile layer; without extraConfig the argv is exactly as before.
+test('buildCodexArgs places extra config overrides right after the profile', t => {
+  const base = { profile: 'p', workspaceRoot: '/w', worktreeRoot: '/t', schemaPath: '/s', outputPath: '/o', prompt: 'x' }
+  const args = buildCodexArgs({ ...base, extraConfig: ['-c', 'model="m"'] })
+  t.deepEqual(args.slice(0, 5), ['exec', '--profile', 'p', '-c', 'model="m"'])
+  t.deepEqual(buildCodexArgs(base).slice(0, 4), ['exec', '--profile', 'p', '--cd'], 'unchanged without overrides')
+  t.end()
+})
+
+// A bedrock attempt must hand Codex the minted keys and the provider overrides (including the
+// AWS_* shell exclude), and must not leave a profile that could pick the operator's credentials.
+// A subscription run must carry none of it.
+test('runCodexReview applies Bedrock env and overrides only when bedrock is set', async t => {
+  const seen: Array<{ args: string[]; env: NodeJS.ProcessEnv }> = []
+  const spawner = ((_bin: string, args: string[], opts: { env: NodeJS.ProcessEnv }) => {
+    seen.push({ args, env: opts.env })
+    const child = new FakeChild()
+    setImmediate(() => child.emit('close', 1))
+    return child
+  }) as unknown as Spawner
+  const bedrock = {
+    region: 'us-east-2',
+    model: 'us.openai.gpt-5.5',
+    credentials: { accessKeyId: 'ASIA' + 'TESTTESTTESTTEST', secretAccessKey: 'fake-secret-' + 'xyzxyzxyzxyz', sessionToken: 'fake-session-' + 'xyzxyzxyz' },
+  }
+  await runCodexReview({ ...runOptions(), bedrock }, spawner, fakeClock().deps).catch(() => undefined)
+  await runCodexReview(runOptions(), spawner, fakeClock().deps).catch(() => undefined)
+  const [withBedrock, plain] = seen
+  t.equal(withBedrock.env.AWS_ACCESS_KEY_ID, bedrock.credentials.accessKeyId)
+  t.equal(withBedrock.env.AWS_SECRET_ACCESS_KEY, bedrock.credentials.secretAccessKey)
+  t.equal(withBedrock.env.AWS_SESSION_TOKEN, bedrock.credentials.sessionToken)
+  t.equal(withBedrock.env.AWS_REGION, 'us-east-2')
+  t.notOk('AWS_PROFILE' in withBedrock.env, 'no profile')
+  t.ok(withBedrock.args.includes('model_provider="amazon-bedrock-runtime"'), 'provider override')
+  t.ok(withBedrock.args.includes('shell_environment_policy.exclude=["AWS_*"]'), 'the shell exclude is present')
+  t.notOk(Object.keys(plain.env).some(k => k.startsWith('AWS_')), 'subscription run has no AWS variables')
+  t.notOk(plain.args.includes('-c'), 'subscription run has no overrides')
+  t.end()
+})
+
 // The Codex profile sets shell_environment_policy.inherit = "all", so anything left in
 // The whole daemon environment is visible to model-generated shell commands and untrusted PR
 // test code, so the Codex child is built from an ALLOWLIST: the toolchain basics and the
