@@ -23,7 +23,7 @@ import {
   lookupLogin,
   probeEngineReadOnly,
 } from './doctor-dual'
-import { defaultRunner } from './gh-api'
+import { defaultRunner, type GhRunner } from './gh-api'
 
 export type CheckStatus = 'ok' | 'warn' | 'fail'
 
@@ -197,18 +197,37 @@ export async function checkEmoji(client: WebClient, config: Config): Promise<Che
   }
 }
 
-function run(
+/** Ceiling on any one external check command, so a wedged binary fails the check instead of hanging the doctor. */
+export const CHECK_COMMAND_TIMEOUT_MS = 30_000
+
+export type CommandResult = { code: number; output: string }
+export type CommandRunner = (command: string, args: string[], env?: NodeJS.ProcessEnv) => Promise<CommandResult>
+
+/** Run a command to completion, SIGKILLing it after `timeoutMs` (the same bound the gh runner uses). */
+export function run(
   command: string,
   args: string[],
-  env: NodeJS.ProcessEnv = process.env
-): Promise<{ code: number; output: string }> {
+  env: NodeJS.ProcessEnv = process.env,
+  timeoutMs: number = CHECK_COMMAND_TIMEOUT_MS
+): Promise<CommandResult> {
   return new Promise(resolve => {
     const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], env })
     let output = ''
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill('SIGKILL')
+    }, timeoutMs)
     child.stdout.on('data', chunk => (output += chunk))
     child.stderr.on('data', chunk => (output += chunk))
-    child.on('error', error => resolve({ code: -1, output: String(error) }))
-    child.on('close', code => resolve({ code: code ?? -1, output }))
+    child.on('error', error => {
+      clearTimeout(timer)
+      resolve({ code: -1, output: String(error) })
+    })
+    child.on('close', code => {
+      clearTimeout(timer)
+      resolve(timedOut ? { code: -1, output: `timed out after ${timeoutMs}ms` } : { code: code ?? -1, output })
+    })
   })
 }
 
@@ -312,9 +331,14 @@ function checkAgentToolchain(agentPath: string | undefined, wanted: string[]): C
 }
 
 /** Run against the agent's PATH when there is one, so this agrees with what the daemon sees. */
-async function checkBinary(name: string, bin: string, agentPath: string | undefined): Promise<CheckResult> {
+async function checkBinary(
+  name: string,
+  bin: string,
+  agentPath: string | undefined,
+  runCommand: CommandRunner = run
+): Promise<CheckResult> {
   const env = agentPath === undefined ? process.env : { ...process.env, PATH: agentPath }
-  const { code, output } = await run(bin, ['--version'], env)
+  const { code, output } = await runCommand(bin, ['--version'], env)
   if (code !== 0) {
     const where = agentPath === undefined ? '' : " using the agent's PATH"
     return {
@@ -332,13 +356,13 @@ async function checkBinary(name: string, bin: string, agentPath: string | undefi
  * daemon env file and gh config dir are not config fields, so the installer resolves them from
  * its own defaults and variables, as the daemon's other checks do.
  */
-async function checkClaudeProfile(config: Config): Promise<CheckResult> {
+export async function checkClaudeProfile(config: Config, runCommand: CommandRunner = run): Promise<CheckResult> {
   const name = 'claude profile'
   const script = path.join(__dirname, '..', 'scripts', 'install-claude-profile.sh')
   if (!fs.existsSync(script)) {
     return { name, status: 'fail', detail: `installer not found at ${script}` }
   }
-  const { code, output } = await run(script, [
+  const { code, output } = await runCommand(script, [
     '--check',
     '--dir',
     config.claudeConfigDir,
@@ -348,8 +372,8 @@ async function checkClaudeProfile(config: Config): Promise<CheckResult> {
     config.worktreeRoot,
   ])
   return code === 0
-    ? { name, status: 'ok', detail: output.trim().split('\n').pop() ?? 'valid' }
-    : { name, status: 'fail', detail: output.trim().split('\n')[0] ?? `exit ${code}` }
+    ? { name, status: 'ok', detail: output.trim().split('\n').pop() || 'valid' }
+    : { name, status: 'fail', detail: output.trim().split('\n')[0] || `exit ${code}` }
 }
 
 /**
@@ -357,19 +381,24 @@ async function checkClaudeProfile(config: Config): Promise<CheckResult> {
  * engine binary and its isolated profile, one role account behind both tokens, an engine token
  * that cannot write, and an approver token no engine can see.
  */
-async function checkDualMode(config: Config, agentPath: string | undefined): Promise<CheckResult[]> {
-  const gh = defaultRunner('gh')
+export async function checkDualMode(
+  config: Config,
+  agentPath: string | undefined,
+  deps: { gh?: GhRunner; base?: NodeJS.ProcessEnv; runCommand?: CommandRunner } = {}
+): Promise<CheckResult[]> {
+  const gh = deps.gh ?? defaultRunner('gh')
+  const runCommand = deps.runCommand ?? run
   // main() has scrubbed both daemon tokens from the process environment; ghEnvAs also strips
   // every other GitHub token, so each lookup runs as exactly one identity.
-  const base = process.env
+  const base = deps.base ?? process.env
   const [approver, engine, operator] = await Promise.all([
     lookupLogin(gh, ghEnvAs(base, config.approverGhToken)),
     lookupLogin(gh, ghEnvAs(base, config.engineGhToken)),
     lookupLogin(gh, ghEnvAs(base)),
   ])
   return [
-    await checkBinary('claude binary', config.claudeBin, agentPath),
-    await checkClaudeProfile(config),
+    await checkBinary('claude binary', config.claudeBin, agentPath, runCommand),
+    await checkClaudeProfile(config, runCommand),
     checkRoleIdentity(approver, engine, operator),
     await probeEngineReadOnly(gh, base, config.engineGhToken, base[DOCTOR_PROBE_PR_VAR]),
     checkChildEnvIsolation(config, base),

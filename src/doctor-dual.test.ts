@@ -1,6 +1,6 @@
 import test from 'tape'
-import { loadReviewConfig } from './config'
-import { agentTools, wantedEmoji } from './doctor'
+import { loadConfig, loadReviewConfig } from './config'
+import { CHECK_COMMAND_TIMEOUT_MS, agentTools, checkClaudeProfile, checkDualMode, run, wantedEmoji } from './doctor'
 import {
   PROBE_EVENT,
   checkChildEnvIsolation,
@@ -74,7 +74,9 @@ test('checkRoleIdentity enforces one role account distinct from the operator', t
   t.equal(checkRoleIdentity(role, { login: 'someone-else' }, { login: 'operator' }).status, 'fail', 'two different accounts')
   t.equal(checkRoleIdentity(role, role, { login: 'role-bot' }).status, 'fail', 'the role account is the operator')
   t.equal(checkRoleIdentity({ error: 'HTTP 401' }, role, { login: 'operator' }).status, 'fail', 'a dead approver token')
-  t.equal(checkRoleIdentity(role, role, { error: 'not logged in' }).status, 'warn', 'operator unknown is unverifiable, not wrong')
+  // An unreadable operator login (gh logged out, timed out, no auth under launchd) must fail: it is
+  // the only guard against a self-approving role account, and a skipped comparison must not pass.
+  t.equal(checkRoleIdentity(role, role, { error: 'not logged in' }).status, 'fail', 'operator unreadable fails closed')
   t.end()
 })
 
@@ -142,5 +144,101 @@ test('checkChildEnvIsolation catches the approver token under a passthrough name
   t.equal(result.status, 'fail')
   t.ok(result.detail.includes('codex via MY_TOOL_TOKEN'))
   t.ok(result.detail.includes('claude via MY_TOOL_TOKEN'))
+  t.end()
+})
+
+// A probe the runner completes (exit 0), with a body that parses or not, means GitHub accepted the
+// POST. Regression caught: an unparseable 2xx body surfaced as "no HTTP status", hiding that a
+// review may have been created; it must be the loud "can write; delete that review" failure.
+test('probeEngineReadOnly treats a completed probe as accepted, even with an unparseable body', async t => {
+  const pr = 'https://github.com/o/r/pull/7'
+  for (const body of ['{"id":1}', '', '<html>not json']) {
+    const result = await probeEngineReadOnly(async () => body, {}, ENGINE, pr)
+    t.equal(result.status, 'fail', `body ${JSON.stringify(body)} fails`)
+    t.ok(result.detail.includes('can write'), `body ${JSON.stringify(body)} is reported as write-capable`)
+  }
+  t.end()
+})
+
+// Only 403 passes through the runner path: 422 (write-capable) and 404 (probe PR unreadable)
+// must both fail, so a missing probe PR can never pass a write-capable token.
+test('probeEngineReadOnly fails on 422 and 404', async t => {
+  const pr = 'https://github.com/o/r/pull/7'
+  t.equal((await probeEngineReadOnly(failingWith(422), {}, ENGINE, pr)).status, 'fail', '422')
+  t.equal((await probeEngineReadOnly(failingWith(404), {}, ENGINE, pr)).status, 'fail', '404')
+  t.end()
+})
+
+// run() must be bounded: a wedged `claude --version` or installer --check would otherwise hang the
+// doctor forever. A command that never exits has to come back as a failed result.
+test('run kills a command that never exits', async t => {
+  t.ok(CHECK_COMMAND_TIMEOUT_MS > 0 && Number.isFinite(CHECK_COMMAND_TIMEOUT_MS), 'the default bound is finite')
+  const result = await run(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { PATH: '/usr/bin' }, 300)
+  t.equal(result.code, -1)
+  t.ok(/timed out/.test(result.output))
+  t.end()
+})
+
+const fullConfig = loadConfig({
+  HOME: '/home/u',
+  SLACK_BOT_TOKEN: 'xoxb-fake',
+  SLACK_APP_TOKEN: 'xapp-fake',
+  REVIEW_ENGINES: 'codex,claude',
+  APPROVER_GH_TOKEN: APPROVER,
+  ENGINE_GH_TOKEN: ENGINE,
+  WORKSPACE_ROOT: '/ws/root',
+  WORKTREE_ROOT: '/wt/root',
+  CLAUDE_CONFIG_DIR_REVIEW: '/profile/dir',
+})
+
+// The installer must validate the same roots the engine runs with. Regression caught: omitting the
+// roots lets --check validate the installer's defaults instead of the configured grants.
+test('checkClaudeProfile passes the configured roots to the installer', async t => {
+  const calls: string[][] = []
+  const result = await checkClaudeProfile(fullConfig, async (_cmd, args) => {
+    calls.push(args)
+    return { code: 0, output: 'profile ok\n' }
+  })
+  t.equal(result.status, 'ok')
+  const args = calls[0]
+  t.equal(args[args.indexOf('--dir') + 1], '/profile/dir')
+  t.equal(args[args.indexOf('--workspace-root') + 1], '/ws/root')
+  t.equal(args[args.indexOf('--worktree-root') + 1], '/wt/root')
+  t.ok(args.includes('--check'))
+  t.end()
+})
+
+// A checker that fails without printing anything must still say why. Regression caught: `??` kept
+// the empty string, producing a failure with a blank detail.
+test('checkClaudeProfile falls back to the exit code on empty output', async t => {
+  const failed = await checkClaudeProfile(fullConfig, async () => ({ code: 3, output: '  \n' }))
+  t.equal(failed.status, 'fail')
+  t.equal(failed.detail, 'exit 3')
+  const ok = await checkClaudeProfile(fullConfig, async () => ({ code: 0, output: '' }))
+  t.equal(ok.detail, 'valid')
+  t.end()
+})
+
+// Each identity lookup must run under its own token. Regression caught: the approver lookup using
+// the engine token (or the reverse) would pass the role-account check without testing the approver
+// token at all. Tokens are identified by label only; no value is ever asserted or printed.
+test('checkDualMode runs the approver lookup with the approver token', async t => {
+  const labels: string[] = []
+  const gh: GhRunner = async (args, opts) => {
+    const token = opts?.env?.GH_TOKEN
+    const label = token === APPROVER ? 'approver' : token === ENGINE ? 'engine' : 'none'
+    if (args[1] === 'user') {
+      labels.push(label)
+      return JSON.stringify({ login: label === 'none' ? 'operator' : 'role-bot' })
+    }
+    throw Object.assign(new Error('gh: exit 1'), { stderr: 'gh: forbidden (HTTP 403)' })
+  }
+  const results = await checkDualMode(fullConfig, undefined, {
+    gh,
+    base: { PATH: '/bin' },
+    runCommand: async () => ({ code: 0, output: 'ok' }),
+  })
+  t.deepEqual(labels, ['approver', 'engine', 'none'], 'approver, engine and operator lookups each use their own identity')
+  t.equal(results.find(r => r.name === 'role account')?.status, 'ok')
   t.end()
 })

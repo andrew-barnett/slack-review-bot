@@ -66,10 +66,12 @@ export function checkRoleIdentity(approver: LoginLookup, engine: LoginLookup, op
     }
   }
   if ('error' in operator) {
+    // Unverifiable is not safe: this is the only guard against the role account being the operator
+    // (self-approvals that never count), so a skipped comparison must not pass.
     return {
       name,
-      status: 'warn',
-      detail: `${approver.login} (both tokens); the operator's gh login is unknown (${operator.error}), so it cannot be compared`,
+      status: 'fail',
+      detail: `the operator's gh login is unreadable (${operator.error}), so the role account cannot be checked against it — make the operator's gh login readable to the doctor (gh auth login as the operator, with gh on the doctor's PATH)`,
     }
   }
   if (operator.login.toLowerCase() === approver.login.toLowerCase()) {
@@ -129,6 +131,9 @@ export async function probeEngineReadOnly(
     })
     return classifyProbe({ accepted: true })
   } catch (error) {
+    // A 2xx whose body would not parse threw SyntaxError after GitHub accepted the request: that
+    // is a created review, not a missing status.
+    if (error instanceof SyntaxError) return classifyProbe({ accepted: true })
     return classifyProbe({ status: (error as { status?: number }).status })
   }
 }
