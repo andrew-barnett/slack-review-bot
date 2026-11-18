@@ -18,9 +18,10 @@ export interface ApproverGitHub {
   getPullRequest(pr: PullRequestRef): Promise<PullRequestInfo>
   permission(pr: PullRequestRef, login: string): Promise<Permission>
   branchRules(pr: PullRequestRef, branch: string): Promise<unknown[]>
-  classicProtection(pr: PullRequestRef, branch: string): Promise<unknown | null>   // null = not protected (404)
-  fileAt(pr: PullRequestRef, path: string, ref: string): Promise<string | null>      // null = no such file (404)
-  codeownersErrorCount(pr: PullRequestRef, ref: string): Promise<number>
+  classicProtection(pr: PullRequestRef, branch: string): Promise<unknown | null>   // null = "Branch not protected" 404; any other failure rejects
+  fileAt(pr: PullRequestRef, path: string, ref: string): Promise<string | null>      // null = no such file (404); non-base64 content (e.g. over 1 MB) rejects
+  /** Number of CODEOWNERS errors GitHub reports at `ref`; null when GitHub answers 404, i.e. it sees no CODEOWNERS file. */
+  codeownersErrorCount(pr: PullRequestRef, ref: string): Promise<number | null>
   isTeamMember(org: string, team: string, login: string): Promise<boolean>
   reviews(pr: PullRequestRef): Promise<ReviewFact[]>
   latestPush(pr: PullRequestRef, headRef: string): Promise<LatestPush | null>          // null = no record
@@ -109,18 +110,31 @@ export function makeApproverGitHub(token: string, run: GhRunner = defaultRunner(
       return ghApiLines<unknown>(asApprover, `${repoPath(pr)}/rules/branches/${encodeURIComponent(branch)}`)
     },
     async classicProtection(pr, branch) {
-      return orNullOn404(ghApi<unknown>(asApprover, `${repoPath(pr)}/branches/${encodeURIComponent(branch)}/protection`))
+      try {
+        return await ghApi<unknown>(asApprover, `${repoPath(pr)}/branches/${encodeURIComponent(branch)}/protection`)
+      } catch (error) {
+        // Only GitHub's explicit "Branch not protected" 404 means no protection. Any other 404
+        // (a hidden or renamed repo or branch, a token that cannot see it) is unreadable, never
+        // "no requirement".
+        if (error instanceof GhApiError && error.status === 404 && /branch not protected/i.test(error.detail)) return null
+        throw error
+      }
     },
     async fileAt(pr, filePath, ref) {
       const file = await orNullOn404(
-        ghApi<{ content: string; encoding: string }>(asApprover, `${repoPath(pr)}/contents/${filePath}?ref=${encodeURIComponent(ref)}`)
+        ghApi<{ content?: string; encoding?: string }>(asApprover, `${repoPath(pr)}/contents/${filePath}?ref=${encodeURIComponent(ref)}`)
       )
-      return file ? Buffer.from(file.content, 'base64').toString('utf8') : null
+      if (!file) return null
+      // A file over 1 MB comes back with encoding "none" and empty content; decoding that would
+      // read as an empty file. Anything but base64 content is unreadable.
+      if (file.encoding !== 'base64' || typeof file.content !== 'string') {
+        throw new Error(`contents of ${filePath} are not base64 (encoding ${String(file.encoding)}); the file may be too large to read`)
+      }
+      return Buffer.from(file.content, 'base64').toString('utf8')
     },
     async codeownersErrorCount(pr, ref) {
       const r = await orNullOn404(ghApi<{ errors: unknown[] }>(asApprover, `${repoPath(pr)}/codeowners/errors?ref=${encodeURIComponent(ref)}`))
-      // 404 means there is no CODEOWNERS file, so there are no errors to report.
-      return r ? r.errors.length : 0
+      return r ? r.errors.length : null
     },
     async isTeamMember(org, team, login) {
       const r = await orNullOn404(

@@ -49,12 +49,46 @@ type Params = Record<string, unknown>
 const num = (v: unknown) => (typeof v === 'number' ? v : 0)
 const bool = (v: unknown) => v === true
 
+/** `pull_request` ruleset parameters this tool understands (or knows cannot block an approval). */
+const KNOWN_PULL_REQUEST_PARAMS: ReadonlySet<string> = new Set([
+  'required_approving_review_count',
+  'require_code_owner_review',
+  'require_last_push_approval',
+  'dismiss_stale_reviews_on_push',
+  'required_review_thread_resolution',
+  'allowed_merge_methods',
+  'automatic_copilot_code_review_enabled',
+])
+
+/** A `pull_request` rule carries a parameter this tool does not model; the source is unverifiable. */
+export class UnsupportedRulesetParameter extends Error {
+  constructor(readonly parameter: string) {
+    super(`unsupported pull_request ruleset parameter ${parameter}`)
+    this.name = 'UnsupportedRulesetParameter'
+  }
+}
+
+const isSet = (v: unknown): boolean =>
+  Array.isArray(v) ? v.length > 0
+    : v !== null && typeof v === 'object' ? Object.keys(v).length > 0
+    : typeof v === 'number' ? v !== 0
+    : typeof v === 'string' ? v !== ''
+    : v === true
+
+/**
+ * Fail closed on a rule this tool does not model (e.g. a future required-reviewers parameter):
+ * ignoring it would predict an approval counts when GitHub would not count it. Throws
+ * {@link UnsupportedRulesetParameter} when such a parameter is set to a non-empty value.
+ */
 export function rulesFromRulesets(rules: unknown[]): PullRequestRules {
   return mergeRules(
     rules
       .filter((r): r is { type: string; parameters?: Params } => (r as { type?: string })?.type === 'pull_request')
       .map(r => {
         const p = r.parameters ?? {}
+        for (const [name, value] of Object.entries(p)) {
+          if (!KNOWN_PULL_REQUEST_PARAMS.has(name) && isSet(value)) throw new UnsupportedRulesetParameter(name)
+        }
         return {
           requiredApprovals: num(p.required_approving_review_count),
           requireCodeOwnerReview: bool(p.require_code_owner_review),
@@ -233,14 +267,25 @@ export async function gatherEligibilityFacts(
     attempt(() => gh.permission(pr, botLogin)),
     attempt(() => gh.reviews(pr)),
   ])
+  let rulesetRules: PullRequestRules | null = null
+  let rulesetName = 'rulesets'
+  if (rulesets !== null) {
+    try {
+      rulesetRules = rulesFromRulesets(rulesets)
+    } catch (error) {
+      // Any failure to interpret the rulesets is unreadable; name an unsupported parameter.
+      rulesetName = error instanceof UnsupportedRulesetParameter ? `rulesets (unsupported parameter ${error.parameter})` : 'rulesets (unparseable)'
+    }
+  }
   const ruleSources = [
-    { name: 'rulesets', rules: rulesets === null ? null : rulesFromRulesets(rulesets) },
+    { name: rulesetName, rules: rulesetRules },
     { name: 'classic protection', rules: classic },
   ]
   const rules = mergeRules(ruleSources.flatMap(s => (s.rules ? [s.rules] : [])))
 
   // CODEOWNERS: the first file that exists, read from the base branch.
   let codeowners: string | null = ''
+  let fileFound = false
   if (rules.requireCodeOwnerReview) {
     for (const candidate of CODEOWNERS_PATHS) {
       // fileAt resolves null for a missing file (try the next location) and rejects on any other
@@ -249,13 +294,34 @@ export async function gatherEligibilityFacts(
         const text = await gh.fileAt(pr, candidate, info.base)
         if (text === null) continue
         codeowners = text
+        fileFound = true
       } catch {
         codeowners = null
       }
       break
     }
   }
-  const codeownersErrors = rules.requireCodeOwnerReview ? await attempt(() => gh.codeownersErrorCount(pr, info.base)) : 0
+  let codeownersErrors: number | null = 0
+  if (rules.requireCodeOwnerReview) {
+    // GitHub's errors endpoint answers 404 when it sees no CODEOWNERS file; cross-check that
+    // against the file reads so an incomplete or inconsistent view reads as unreadable.
+    let errorCount: number | null | undefined // undefined = the read failed
+    try {
+      errorCount = await gh.codeownersErrorCount(pr, info.base)
+    } catch {
+      errorCount = undefined
+    }
+    codeownersErrors = typeof errorCount === 'number' ? errorCount : null
+    if (codeowners !== null) {
+      if (errorCount === null) {
+        if (fileFound) codeowners = null // we read a file, GitHub says there is none
+      } else if (typeof errorCount === 'number' && !fileFound) {
+        codeowners = null // every location was 404, GitHub says a file exists
+      }
+    }
+    // Consistent "no file" on both sides: nothing to report.
+    if (errorCount === null && codeowners === '') codeownersErrors = 0
+  }
 
   // Permissions of every other reviewer whose review the evaluator weighs: approvers (do they
   // count?) and change requesters (does the request block?). The bot's own reviews are excluded.

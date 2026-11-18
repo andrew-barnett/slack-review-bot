@@ -54,9 +54,20 @@ test('postReview posts commit_id, event, body and RIGHT-side comments on stdin',
 
 // 404 on classic protection means "not protected" (no requirement), while 403 means the token
 // could not read it. Conflating them would either invent or hide a requirement.
-test('classicProtection maps 404 to null and rethrows other failures', async t => {
-  const absent = makeApproverGitHub('tok', recorder({ 'repos/o/r/branches/main/protection': httpError(404) }).run)
+test('classicProtection maps a "Branch not protected" 404 to null and rethrows other failures', async t => {
+  const notProtected = Object.assign(new Error('failed'), { stderr: 'gh: Branch not protected (HTTP 404)' })
+  const absent = makeApproverGitHub('tok', recorder({ 'repos/o/r/branches/main/protection': notProtected }).run)
   t.equal(await absent.classicProtection(pr, 'main'), null)
+  // Regression caught: a bare "Not Found" 404 (renamed/hidden repo or branch) was read as "no
+  // protection", silently inventing a no-requirement verdict.
+  const missing = Object.assign(new Error('failed'), { stderr: 'gh: Not Found (HTTP 404)' })
+  const ambiguous = makeApproverGitHub('tok', recorder({ 'repos/o/r/branches/main/protection': missing }).run)
+  try {
+    await ambiguous.classicProtection(pr, 'main')
+    t.fail('a plain Not Found 404 must reject')
+  } catch (error) {
+    t.equal((error as { status?: number }).status, 404)
+  }
   const denied = makeApproverGitHub('tok', recorder({ 'repos/o/r/branches/main/protection': httpError(403) }).run)
   try {
     await denied.classicProtection(pr, 'main')
@@ -64,6 +75,34 @@ test('classicProtection maps 404 to null and rethrows other failures', async t =
   } catch (error) {
     t.equal((error as { status?: number }).status, 403)
   }
+  t.end()
+})
+
+// fileAt must return text only for base64 content. Regression caught: a file over 1 MB comes back
+// with encoding "none" and empty content, which decoded to '' and read as an empty CODEOWNERS.
+test('fileAt decodes base64, rejects other encodings, and maps 404 to null', async t => {
+  const path = 'repos/o/r/contents/CODEOWNERS?ref=main'
+  const ok = makeApproverGitHub('tok', recorder({ [path]: JSON.stringify({ encoding: 'base64', content: Buffer.from('* @x').toString('base64') }) }).run)
+  t.equal(await ok.fileAt(pr, 'CODEOWNERS', 'main'), '* @x')
+  const big = makeApproverGitHub('tok', recorder({ [path]: JSON.stringify({ encoding: 'none', content: '' }) }).run)
+  try {
+    await big.fileAt(pr, 'CODEOWNERS', 'main')
+    t.fail('encoding none must reject')
+  } catch {
+    t.pass('encoding none rejects')
+  }
+  const missing = makeApproverGitHub('tok', recorder({ [path]: httpError(404) }).run)
+  t.equal(await missing.fileAt(pr, 'CODEOWNERS', 'main'), null)
+  t.end()
+})
+
+// codeownersErrorCount must distinguish "no file" (404) from "N errors", so the pre-flight can
+// cross-check it against the file reads. Regression caught: 404 was folded into 0 errors.
+test('codeownersErrorCount returns null for 404 and the count otherwise', async t => {
+  const path = 'repos/o/r/codeowners/errors?ref=main'
+  t.equal(await makeApproverGitHub('tok', recorder({ [path]: httpError(404) }).run).codeownersErrorCount(pr, 'main'), null)
+  t.equal(await makeApproverGitHub('tok', recorder({ [path]: '{"errors":[{},{}]}' }).run).codeownersErrorCount(pr, 'main'), 2)
+  t.equal(await makeApproverGitHub('tok', recorder({ [path]: '{"errors":[]}' }).run).codeownersErrorCount(pr, 'main'), 0)
   t.end()
 })
 

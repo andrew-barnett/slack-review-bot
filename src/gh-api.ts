@@ -70,7 +70,12 @@ export function defaultRunner(
 
 /** A failed `gh api` call, with the HTTP status when gh reported one. */
 export class GhApiError extends Error {
-  constructor(message: string, readonly status: number | undefined) {
+  /**
+   * `detail` is gh's own error text (stderr plus message). It is kept off `message` so logs stay
+   * constant; callers use it only to tell apart failures that share a status, e.g. a 404 for
+   * "Branch not protected" versus a 404 for a missing resource.
+   */
+  constructor(message: string, readonly status: number | undefined, readonly detail: string = '') {
     super(message)
     this.name = 'GhApiError'
   }
@@ -85,7 +90,8 @@ export function httpStatusOf(error: unknown): number | undefined {
 
 function toGhApiError(path: string, error: unknown): GhApiError {
   const status = httpStatusOf(error)
-  return new GhApiError(`gh api ${path} failed${status ? ` (HTTP ${status})` : ''}`, status)
+  const detail = `${(error as { stderr?: string })?.stderr ?? ''} ${(error as Error)?.message ?? ''}`.trim()
+  return new GhApiError(`gh api ${path} failed${status ? ` (HTTP ${status})` : ''}`, status, detail)
 }
 
 /** Call `gh api` and parse the JSON response; a body goes over stdin. */

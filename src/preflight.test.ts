@@ -416,3 +416,56 @@ test('permissions are fetched for change requesters, not only approvers', async 
   t.deepEqual(asked.filter(l => l !== 'role-bot'), ['Carol'])
   t.end()
 })
+
+const OWNER_REVIEW = [{ type: 'pull_request', parameters: { require_code_owner_review: true } }]
+
+// GitHub's errors endpoint says 404 when it sees no CODEOWNERS file. The pre-flight cross-checks
+// that with the file reads. Regression caught: a 404 was folded into "0 errors", so a file the
+// reads missed (or a file GitHub does not see) passed as a clean, empty CODEOWNERS.
+test('CODEOWNERS file reads are cross-checked against the errors endpoint', async t => {
+  const gather = (fileAt: ApproverGitHub['fileAt'], codeownersErrorCount: ApproverGitHub['codeownersErrorCount']) =>
+    gatherEligibilityFacts(fakeGh({ branchRules: async () => OWNER_REVIEW, fileAt, codeownersErrorCount }), prRef, info, ['a.ts'], 'role-bot')
+
+  const none = await gather(async () => null, async () => null)
+  t.equal(none.codeowners, '', 'no file anywhere and 404 from GitHub is a consistent no-file')
+  t.equal(none.codeownersErrors, 0)
+
+  const hidden = await gather(async () => null, async () => 0)
+  t.equal(hidden.codeowners, null, 'all reads 404 but GitHub says a file exists is unreadable')
+
+  const phantom = await gather(async (_pr, p) => (p === 'CODEOWNERS' ? '* @x' : null), async () => null)
+  t.equal(phantom.codeowners, null, 'a file was read but GitHub says there is none is unreadable')
+
+  const found = await gather(async (_pr, p) => (p === 'CODEOWNERS' ? '* @x' : null), async () => 0)
+  t.equal(found.codeowners, '* @x', 'consistent file and zero errors is readable')
+  t.equal(found.codeownersErrors, 0)
+
+  const failed = await gather(async () => null, async () => { throw new Error('HTTP 500') })
+  t.equal(failed.codeownersErrors, null, 'a failed errors read stays unreadable')
+  t.equal(evaluateEligibility(failed).verdict, 'wontCount')
+  t.equal(evaluateEligibility(hidden).verdict, 'wontCount')
+  t.end()
+})
+
+// A pull_request rule parameter this tool does not model could be a requirement it would miss
+// (for example required reviewers). Regression caught: unknown parameters were silently ignored,
+// predicting "counts" where GitHub would not count the approval.
+test('an unknown non-empty pull_request ruleset parameter makes the rulesets unreadable', async t => {
+  const gather = (parameters: Record<string, unknown>) =>
+    gatherEligibilityFacts(fakeGh({ branchRules: async () => [{ type: 'pull_request', parameters }] }), prRef, info, ['a.ts'], 'role-bot')
+
+  const set = await gather({ required_reviewers: [{ reviewer: { id: 1 } }] })
+  t.equal(set.ruleSources[0].rules, null)
+  const e = evaluateEligibility(set)
+  t.equal(e.verdict, 'wontCount')
+  t.match(e.reasons.join(' '), /required_reviewers/, 'the reason names the parameter')
+
+  const empty = await gather({ required_reviewers: [], some_flag: false, some_count: 0, some_text: '', some_obj: {} })
+  t.notEqual(empty.ruleSources[0].rules, null, 'empty or falsy unknown parameters are ignored')
+
+  const known = await gather({ required_approving_review_count: 2, required_review_thread_resolution: true, allowed_merge_methods: ['merge'], automatic_copilot_code_review_enabled: true })
+  t.deepEqual(known.ruleSources[0].rules, { requiredApprovals: 2, requireCodeOwnerReview: false, requireLastPushApproval: false, dismissStaleReviews: false }, 'known parameters are unaffected')
+
+  t.throws(() => rulesFromRulesets([{ type: 'pull_request', parameters: { x_new: true } }]), /x_new/)
+  t.end()
+})
