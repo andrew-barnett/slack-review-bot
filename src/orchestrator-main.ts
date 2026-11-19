@@ -4,7 +4,7 @@
 
 import { installCrashHandlers, log, runDaemon } from './daemon'
 import { startContainerRuntime } from './jobs/runtime'
-import { orchestratorConfig } from './orchestrator'
+import { orchestratorConfig, smokeJob } from './orchestrator'
 import { redactSecrets, registerHeldSecret } from './redact'
 import { ORCHESTRATOR_BUNDLE, readSecretBundle } from './secret-bundle'
 
@@ -13,6 +13,14 @@ async function main(): Promise<void> {
   const bundle = await readSecretBundle(process.stdin, ORCHESTRATOR_BUNDLE)
   for (const value of Object.values(bundle)) registerHeldSecret(value)
   const { config, launchKey } = orchestratorConfig(bundle, process.env)
+  if (process.env.SMOKE === '1') {
+    // The job server and the smoke route only; no Slack connection (spec section 6).
+    const smoke = await startContainerRuntime(config, launchKey, log, { smoke: smokeJob(config) })
+    log('smoke.ready', { port: smoke.port() })
+    await new Promise<void>(resolve => process.once('SIGTERM', () => resolve()))
+    await smoke.close()
+    process.exit(0)
+  }
   const container = await startContainerRuntime(config, launchKey, log)
   await runDaemon({ config, container })
 }
