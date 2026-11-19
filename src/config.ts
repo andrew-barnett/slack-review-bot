@@ -10,6 +10,7 @@
 import * as os from 'os'
 import * as path from 'path'
 import type { AwsCredentials } from './bedrock-auth'
+import { defaultPricesFile } from './pricing'
 import { defaultLoginScriptPath } from './registry-auth'
 
 /** The review engines the bot can run. */
@@ -174,8 +175,9 @@ export interface ReviewConfig {
   /** Bedrock mode: the model ID Claude Code uses (a cross-region inference profile). */
   claudeBedrockModel: string
   /**
-   * Bedrock mode, optional: Codex's context window for the Bedrock model, in tokens. Codex has no
-   * metadata for Bedrock model IDs and falls back to defaults; this overrides that fallback.
+   * Bedrock mode: Codex's context window for the Bedrock model, in tokens. Codex has no metadata for
+   * Bedrock model IDs and falls back to defaults; this overrides that fallback. Defaults to
+   * {@link DEFAULT_CODEX_BEDROCK_CONTEXT_WINDOW} in bedrock mode; unset in subscription mode.
    */
   codexBedrockContextWindow?: number
   /**
@@ -254,6 +256,18 @@ export interface Config extends ReviewConfig {
    * where letting a review finish is preferable to replaying it.
    */
   shutdownDrainMs: number
+  /** BEDROCK_MONTHLY_CAP_USD: the bot's monthly Bedrock spend cap. Never shown in Slack (spec section 1). */
+  spendCapUsd: number
+  /** SPEND_ALERT_PERCENTS: percentages of the cap that post a channel alert, ascending. */
+  spendAlertPercents: number[]
+  /** SPEND_ALERT_HERE_PERCENTS: which of those alerts carry `<!here>`. */
+  spendAlertHerePercents: number[]
+  /** SPEND_ALERT_CHANNEL, else the first SLACK_CHANNEL_IDS entry; empty means alerts are only logged. */
+  spendAlertChannel: string
+  /** BEDROCK_PRICES_FILE: the price table spend is computed from. */
+  bedrockPricesFile: string
+  /** Where the month-to-date ledger's spend-YYYY-MM.jsonl journals live: the cursor file's directory (spec section 7). */
+  spendDir: string
 }
 
 /**
@@ -385,6 +399,60 @@ export function looksLikeUserId(id: string): boolean {
   return /^[UW][A-Z0-9]{2,}$/.test(id)
 }
 
+/** Parse BEDROCK_MONTHLY_CAP_USD: a positive number of US dollars; unset means 1000. */
+export function parseCapUsd(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === '') return 1000
+  const text = raw.trim()
+  const n = /^\d+(\.\d+)?$/.test(text) ? Number(text) : Number.NaN
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error(`BEDROCK_MONTHLY_CAP_USD must be a positive number of US dollars, like 1000 (got "${raw}")`)
+  }
+  return n
+}
+
+/** Split a list of whole numbers; an entry that is not all digits becomes NaN so the caller can reject it. */
+function parseIntegerList(raw: string): number[] {
+  return parseList(raw).map(s => (/^\d+$/.test(s) ? Number(s) : Number.NaN))
+}
+
+/** Parse SPEND_ALERT_PERCENTS: integers 1-99, strictly ascending; unset or empty means 25,50,75,90. */
+export function parseAlertPercents(raw: string | undefined): number[] {
+  if (raw === undefined || raw.trim() === '') return [25, 50, 75, 90]
+  const percents = parseIntegerList(raw)
+  const valid =
+    percents.every(n => Number.isInteger(n) && n >= 1 && n <= 99) &&
+    percents.every((n, i) => i === 0 || n > percents[i - 1])
+  if (!valid) {
+    throw new Error(`SPEND_ALERT_PERCENTS must be integers from 1 to 99 in strictly ascending order (got "${raw}")`)
+  }
+  return percents
+}
+
+/**
+ * Parse SPEND_ALERT_HERE_PERCENTS against the alert percents. Unset means whichever of 75 and 90 are alert
+ * percents (ruling 6); explicitly empty means no threshold alert carries `<!here>`.
+ */
+export function parseHerePercents(raw: string | undefined, alertPercents: number[]): number[] {
+  if (raw === undefined) return [75, 90].filter(p => alertPercents.includes(p))
+  const percents = parseIntegerList(raw)
+  for (const p of percents) {
+    if (!alertPercents.includes(p)) {
+      throw new Error(`SPEND_ALERT_HERE_PERCENTS: ${Number.isNaN(p) ? 'a non-integer entry' : p} is not in SPEND_ALERT_PERCENTS (${alertPercents.join(',')})`)
+    }
+  }
+  return percents
+}
+
+/** Parse SPEND_ALERT_CHANNEL: a Slack channel ID; unset means the first allowlisted channel, or none. */
+export function parseAlertChannel(raw: string | undefined, channelIds: string[]): string {
+  if (raw === undefined || raw.trim() === '') return channelIds[0] ?? ''
+  const id = raw.trim()
+  if (!/^[CGD][A-Z0-9]{2,}$/.test(id)) {
+    throw new Error(`SPEND_ALERT_CHANNEL must be a Slack channel ID like C0123456789, not a name (got "${raw}")`)
+  }
+  return id
+}
+
 /** Parse RUNTIME: unset means the launchd daemon. */
 export function parseRuntime(raw: string | undefined): Runtime {
   if (raw === undefined || raw.trim() === '') return 'launchd'
@@ -459,6 +527,14 @@ export function parseEngineAuth(raw: string | undefined): EngineAuth {
 }
 
 /**
+ * Codex's context window in bedrock mode when CODEX_BEDROCK_CONTEXT_WINDOW is unset. OpenAI models on
+ * Bedrock bill a whole request at long-context rates once its input exceeds 272K tokens, and the
+ * spend price table holds only the short-context rates, so capping Codex here keeps the cap's
+ * arithmetic exact. Raising it means also pricing long-context requests.
+ */
+export const DEFAULT_CODEX_BEDROCK_CONTEXT_WINDOW = 272000
+
+/**
  * Parse CODEX_BEDROCK_CONTEXT_WINDOW: absent when unset, otherwise a positive integer. A bad value
  * is an error rather than a silent default, because it is spliced into a Codex `-c` override.
  */
@@ -529,8 +605,8 @@ function loadBedrockConfig(env: NodeJS.ProcessEnv): BedrockConfig {
   if (!BEDROCK_PROJECT_ID.test(out.codexBedrockProject)) {
     throw new Error(`CODEX_BEDROCK_PROJECT must look like proj_<lowercase letters and digits> (got "${out.codexBedrockProject}")`)
   }
-  const window = parseContextWindow(env.CODEX_BEDROCK_CONTEXT_WINDOW)
-  if (window !== undefined) out.codexBedrockContextWindow = window
+  out.codexBedrockContextWindow =
+    parseContextWindow(env.CODEX_BEDROCK_CONTEXT_WINDOW) ?? DEFAULT_CODEX_BEDROCK_CONTEXT_WINDOW
   if (out.engineRoleArn) {
     // The value is not echoed: a malformed one may be a secret pasted into the wrong variable.
     if (!ROLE_ARN.test(out.engineRoleArn)) {
@@ -635,13 +711,17 @@ export function loadReviewConfig(env: NodeJS.ProcessEnv = process.env): ReviewCo
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const home = env.HOME || os.homedir()
+  const stateDir = path.join(home, '.local', 'state', 'slack-review-bot')
+  const cursorFile = env.CURSOR_FILE ?? path.join(stateDir, 'cursors.json')
+  const channelIds = parseList(env.SLACK_CHANNEL_IDS)
+  const spendAlertPercents = parseAlertPercents(env.SPEND_ALERT_PERCENTS)
   return {
     ...loadReviewConfig(env),
     botToken: required(env, 'SLACK_BOT_TOKEN'),
     appToken: required(env, 'SLACK_APP_TOKEN'),
-    channelIds: parseList(env.SLACK_CHANNEL_IDS),
+    channelIds,
     ignoreUserIds: parseUserIds(env.SLACK_IGNORE_USER_IDS),
-    cursorFile: env.CURSOR_FILE ?? path.join(home, '.local', 'state', 'slack-review-bot', 'cursors.json'),
+    cursorFile,
     replayEnabled: parseBool(env.REPLAY_ENABLED, true),
     // A day: long enough to cover an overnight restart or a closed laptop, short enough that
     // a PR posted before a long weekend is not reviewed on Monday against a branch that has
@@ -668,5 +748,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // letting a review right at the finish line settle. Raise it (with a matching supervisor grace)
     // to prefer draining over replaying.
     shutdownDrainMs: parsePositiveInt(env.SHUTDOWN_DRAIN_MS, 5_000),
+    // The monthly Bedrock spend cap (spec section 4). Parsed always; the price file is read only when the
+    // cap is active (ruling 3), by openSpendCap at daemon startup.
+    spendCapUsd: parseCapUsd(env.BEDROCK_MONTHLY_CAP_USD),
+    spendAlertPercents,
+    spendAlertHerePercents: parseHerePercents(env.SPEND_ALERT_HERE_PERCENTS, spendAlertPercents),
+    spendAlertChannel: parseAlertChannel(env.SPEND_ALERT_CHANNEL, channelIds),
+    bedrockPricesFile: env.BEDROCK_PRICES_FILE || defaultPricesFile(),
+    // Beside the cursor file (on the orchestrator state volume in the container). An empty CURSOR_FILE
+    // disables the cursor, never the ledger (ruling 9).
+    spendDir: cursorFile ? path.dirname(cursorFile) : stateDir,
   }
 }

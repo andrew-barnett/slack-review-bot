@@ -247,7 +247,10 @@ export async function runWorker(deps: WorkerDeps): Promise<WorkerExit> {
     if (engine === 'codex') {
       const o = await deps.runCodex({ ...common, codexBin: deps.config.codexBin, profile: deps.config.codexProfile })
       // The raw final message is not sent: the orchestrator re-validates `result` and needs nothing else.
-      body = { ok: true, outcome: { result: o.result, tokensUsed: o.tokensUsed, activeMs: o.activeMs } }
+      body = {
+        ok: true,
+        outcome: { result: o.result, tokensUsed: o.tokensUsed, activeMs: o.activeMs, ...(o.codexUsage ? { codexUsage: o.codexUsage } : {}) },
+      }
     } else {
       const o = await deps.runClaude({ ...common, claudeBin: deps.config.claudeBin, configDir: deps.config.claudeConfigDir })
       body = { ok: true, outcome: { result: o.result, usage: o.usage, tokensUsed: o.tokensUsed, activeMs: o.activeMs, permissionDenials: o.permissionDenials } }

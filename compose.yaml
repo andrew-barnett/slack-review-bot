@@ -48,6 +48,15 @@ services:
       - HUMAN_REVIEW_EMOJI
       - ROLE_GH_LOGIN
       - OPERATOR_GH_LOGIN
+      # The monthly Bedrock spend cap (spec section 4): the orchestrator prices each engine run, so it
+      # also needs the model IDs the workers use.
+      - BEDROCK_MONTHLY_CAP_USD
+      - SPEND_ALERT_PERCENTS
+      - SPEND_ALERT_HERE_PERCENTS
+      - SPEND_ALERT_CHANNEL
+      - BEDROCK_PRICES_FILE
+      - CODEX_BEDROCK_MODEL
+      - CLAUDE_BEDROCK_MODEL
 
   worker:
     image: ${SRB_IMAGE:-slack-review-bot:local}

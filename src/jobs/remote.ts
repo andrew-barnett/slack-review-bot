@@ -9,7 +9,7 @@ import { redactSecrets } from '../redact'
 import { parseReviewResultV2, type EngineRunResult } from '../schema'
 import type { ClaudeUsageDetail } from '../usage'
 import type { JobBroker, SubmitHooks } from './broker'
-import { nonNegative, optionalNonNegative, record, usageOf } from './errors'
+import { codexUsageOf, nonNegative, optionalNonNegative, record, usageOf } from './errors'
 import { toWireOptions } from './protocol'
 
 export const WAITING_LINE = 'waiting for a worker'
@@ -27,13 +27,15 @@ export function normalizeCodexOutcome(raw: unknown): CodexRunOutcome<EngineRunRe
   const o = record(raw)
   const activeMs = nonNegative(o.activeMs)
   const tokensUsed = optionalNonNegative(o.tokensUsed)
+  // Validated like Claude's usage: non-negative numbers, defaulting to zero (spec 6 wire).
+  const codexUsage = codexUsageOf(o.codexUsage)
   let result: EngineRunResult
   try {
     result = parseReviewResultV2(JSON.stringify(o.result ?? null))
   } catch (error) {
-    throw new CodexOutputError(`the worker returned an unusable result: ${message(error)}`, tokensUsed, activeMs)
+    throw new CodexOutputError(`the worker returned an unusable result: ${message(error)}`, tokensUsed, activeMs, codexUsage)
   }
-  return { result, rawFinalMessage: '', tokensUsed, activeMs }
+  return { result, rawFinalMessage: '', tokensUsed, activeMs, ...(codexUsage ? { codexUsage } : {}) }
 }
 
 const ZERO_USAGE: ClaudeUsageDetail = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0, numTurns: 0, durationMs: 0 }

@@ -276,3 +276,35 @@ test('an engine reports a failed credential mint as a non-retried error', async 
   t.equal(out.usage.attempts, 1)
   t.end()
 })
+
+// Spec 6: a stalled attempt's completed turns are charged along with the retry's. Regression caught:
+// the stall error's codexUsage dropped in AttemptFailure, so the ledger missed the first attempt.
+test('the Codex engine sums Codex usage across a stalled attempt and the retry', async t => {
+  const first = { inputTokens: 100, cachedInputTokens: 10, cacheWriteTokens: 0, outputTokens: 20, reasoningTokens: 5 }
+  const second = { inputTokens: 50, cachedInputTokens: 0, cacheWriteTokens: 2, outputTokens: 10, reasoningTokens: 1 }
+  let calls = 0
+  const runCodex = (async () => {
+    calls += 1
+    if (calls === 1) throw new CodexStalledError('stalled', 60_000, snapshot(100), first)
+    return { result: { results: [clean(URL1), clean(URL2)] }, rawFinalMessage: '', tokensUsed: 63, activeMs: 1000, codexUsage: second }
+  }) as unknown as typeof runCodexReportOnly
+  const out = await makeCodexEngine(config, { runCodex }).run(input)
+  t.equal(out.error, undefined)
+  t.deepEqual(out.usage.codex, { inputTokens: 150, cachedInputTokens: 10, cacheWriteTokens: 2, outputTokens: 30, reasoningTokens: 6 })
+  t.equal(out.usage.tokensUsed, 135 + 63, 'the stalled attempt\'s tokens are charged as well as the retry\'s')
+  t.end()
+})
+
+// Spec 6: a timeout is terminal, but its completed turns still cost money. Regression caught: a
+// timed-out Codex run recorded as free.
+test('the Codex engine keeps Codex usage from a timeout', async t => {
+  const usage = { inputTokens: 40, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 4, reasoningTokens: 0 }
+  const runCodex = (async () => {
+    throw new CodexTimeoutError('timed out', snapshot(500), usage)
+  }) as unknown as typeof runCodexReportOnly
+  const out = await makeCodexEngine(config, { runCodex }).run(input)
+  t.ok(out.error, 'the timeout is reported as the engine error')
+  t.deepEqual(out.usage.codex, usage)
+  t.equal(out.usage.tokensUsed, 44)
+  t.end()
+})

@@ -7,12 +7,12 @@ import { ClaudeRunError, type ClaudeFailureKind } from '../claude'
 import { CodexOutputError, CodexStalledError, CodexTimeoutError } from '../codex'
 import type { DeadlineSnapshot } from '../deadline'
 import { redactSecrets } from '../redact'
-import type { ClaudeUsageDetail } from '../usage'
+import type { ClaudeUsageDetail, CodexUsageDetail } from '../usage'
 
 export type SerializedRunError =
-  | { class: 'CodexStalledError'; message: string; stallMs: number; snapshot: DeadlineSnapshot }
-  | { class: 'CodexTimeoutError'; message: string; snapshot: DeadlineSnapshot }
-  | { class: 'CodexOutputError'; message: string; tokensUsed?: number; activeMs: number }
+  | { class: 'CodexStalledError'; message: string; stallMs: number; snapshot: DeadlineSnapshot; codexUsage?: CodexUsageDetail }
+  | { class: 'CodexTimeoutError'; message: string; snapshot: DeadlineSnapshot; codexUsage?: CodexUsageDetail }
+  | { class: 'CodexOutputError'; message: string; tokensUsed?: number; activeMs: number; codexUsage?: CodexUsageDetail }
   | { class: 'ClaudeRunError'; message: string; kind: ClaudeFailureKind; activeMs: number; usage?: ClaudeUsageDetail }
   | { class: 'Error'; message: string }
 
@@ -55,13 +55,34 @@ export function usageOf(value: unknown): ClaudeUsageDetail | undefined {
   }
 }
 
+/** Codex's usage breakdown with every field forced to a finite, non-negative number (spec 6 wire). */
+export function codexUsageOf(value: unknown): CodexUsageDetail | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const u = value as Record<string, unknown>
+  return {
+    inputTokens: nonNegative(u.inputTokens),
+    cachedInputTokens: nonNegative(u.cachedInputTokens),
+    cacheWriteTokens: nonNegative(u.cacheWriteTokens),
+    outputTokens: nonNegative(u.outputTokens),
+    reasoningTokens: nonNegative(u.reasoningTokens),
+  }
+}
+
 /** The worker side: describe a thrown value so the orchestrator can rebuild it. */
 export function serializeRunError(error: unknown): SerializedRunError {
+  // Each Codex failure keeps the turns it completed (spec 6); absent stays absent.
+  const codex = (u: CodexUsageDetail | undefined) => (u ? { codexUsage: { ...u } } : {})
   if (error instanceof CodexStalledError) {
-    return { class: 'CodexStalledError', message: text(error.message), stallMs: error.stallMs, snapshot: { ...error.snapshot } }
+    return {
+      class: 'CodexStalledError',
+      message: text(error.message),
+      stallMs: error.stallMs,
+      snapshot: { ...error.snapshot },
+      ...codex(error.codexUsage),
+    }
   }
   if (error instanceof CodexTimeoutError) {
-    return { class: 'CodexTimeoutError', message: text(error.message), snapshot: { ...error.snapshot } }
+    return { class: 'CodexTimeoutError', message: text(error.message), snapshot: { ...error.snapshot }, ...codex(error.codexUsage) }
   }
   if (error instanceof CodexOutputError) {
     return {
@@ -69,6 +90,7 @@ export function serializeRunError(error: unknown): SerializedRunError {
       message: text(error.message),
       activeMs: error.activeMs,
       ...(error.tokensUsed !== undefined ? { tokensUsed: error.tokensUsed } : {}),
+      ...codex(error.codexUsage),
     }
   }
   if (error instanceof ClaudeRunError) {
@@ -89,11 +111,11 @@ export function deserializeRunError(value: unknown): Error {
   const message = text(e.message)
   switch (e.class) {
     case 'CodexStalledError':
-      return new CodexStalledError(message, nonNegative(e.stallMs), snapshotOf(e.snapshot))
+      return new CodexStalledError(message, nonNegative(e.stallMs), snapshotOf(e.snapshot), codexUsageOf(e.codexUsage))
     case 'CodexTimeoutError':
-      return new CodexTimeoutError(message, snapshotOf(e.snapshot))
+      return new CodexTimeoutError(message, snapshotOf(e.snapshot), codexUsageOf(e.codexUsage))
     case 'CodexOutputError':
-      return new CodexOutputError(message, optionalNonNegative(e.tokensUsed), nonNegative(e.activeMs))
+      return new CodexOutputError(message, optionalNonNegative(e.tokensUsed), nonNegative(e.activeMs), codexUsageOf(e.codexUsage))
     case 'ClaudeRunError': {
       // An unknown kind is treated as output: never retryable, never a timeout's budget claim.
       const kind = typeof e.kind === 'string' && CLAUDE_KINDS.has(e.kind) ? (e.kind as ClaudeFailureKind) : 'output'

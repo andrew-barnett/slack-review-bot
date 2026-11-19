@@ -150,3 +150,22 @@ test('every launchd template header names each placeholder its body uses', t => 
   }
   t.end()
 })
+
+// Spec 4: the orchestrator prices spend, so it needs the spend settings and the model IDs it prices by.
+// Regression caught: CODEX_BEDROCK_MODEL reaching only the worker, so the orchestrator priced a custom
+// model at the default model's entry.
+test('compose.yaml gives the orchestrator the spend settings and the Bedrock model IDs', t => {
+  const orchestrator = envNames(service(read('compose.yaml'), 'orchestrator'))
+  for (const name of [
+    'BEDROCK_MONTHLY_CAP_USD',
+    'SPEND_ALERT_PERCENTS',
+    'SPEND_ALERT_HERE_PERCENTS',
+    'SPEND_ALERT_CHANNEL',
+    'BEDROCK_PRICES_FILE',
+    'CODEX_BEDROCK_MODEL',
+    'CLAUDE_BEDROCK_MODEL',
+  ]) {
+    t.ok(orchestrator.has(name), `${name} reaches the orchestrator`)
+  }
+  t.end()
+})

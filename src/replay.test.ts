@@ -282,3 +282,27 @@ test('the summary counts what was queued, not what was planned', async t => {
   t.equal(summary.dispatched, 0, 'a request nobody queued is not reported as queued')
   t.end()
 })
+
+// A dispatcher that refuses a request (the spend cap) records its cursor and returns false; replay
+// then calls `begin` on it as if it were declined. Regression caught: the refused message re-pended
+// behind an older review still running, so the watermark never passed it after that review settled.
+test('a request refused and recorded by the dispatcher does not hold the watermark', async t => {
+  const running = msg(30)
+  const refused = msg(20)
+  const h = harness(
+    { C1: { messages: [refused], truncated: false } },
+    { version: 1, channels: { C1: { ts: '1.000000', done: [], updatedAt: '' } } }
+  )
+  // An earlier review is still running in this channel.
+  h.cursors.begin('C1', running.ts as string)
+  // Stands in for the cap refusal in daemon.ts: settle the request, then report it not queued.
+  h.deps.dispatch = async message => {
+    h.cursors.record(message.channel as string, message.ts as string)
+    return false
+  }
+  await replayMissed(['C1'], h.deps)
+  t.deepEqual(h.cursors.inFlight('C1'), [running.ts], 'only the running review is pending')
+  h.cursors.settle('C1', running.ts as string)
+  t.equal(h.cursors.watermark('C1'), refused.ts, 'the watermark advances past the refused request')
+  t.end()
+})

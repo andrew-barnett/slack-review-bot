@@ -5,6 +5,7 @@ import * as path from 'path'
 import { loadConfig, type Config, type ReviewConfig } from './config'
 import type { RemoteRunners } from './jobs/remote'
 import { LAUNCH_KEY_BYTES } from './jobs/ticket'
+import type { SpendCap } from './spend-cap'
 
 export interface SmokeReply {
   runId: string
@@ -16,7 +17,7 @@ export interface SmokeReply {
  * SMOKE=1 only (spec section 6): one canned Codex attempt through the job broker. The worker runs
  * it with a stub engine binary; the reply carries the results and every status line seen.
  */
-export function smokeJob(config: ReviewConfig): (runners: RemoteRunners) => () => Promise<SmokeReply> {
+export function smokeJob(config: ReviewConfig, spend?: Pick<SpendCap, 'record'>): (runners: RemoteRunners) => () => Promise<SmokeReply> {
   return runners => async () => {
     const runId = `smoke-${Date.now()}`
     const lines: string[] = []
@@ -31,6 +32,25 @@ export function smokeJob(config: ReviewConfig): (runners: RemoteRunners) => () =
       runId,
       onProgress: line => void lines.push(line),
     })
+    // Recorded like a review's engine run, so the compose smoke proves Codex usage reaches the spend journal.
+    await spend?.record(
+      {
+        attempts: 1,
+        engines: [
+          {
+            engine: 'codex',
+            usage: {
+              attempts: 1,
+              activeMs: outcome.activeMs,
+              ...(outcome.tokensUsed !== undefined ? { tokensUsed: outcome.tokensUsed } : {}),
+              ...(outcome.codexUsage ? { codex: outcome.codexUsage } : {}),
+            },
+          },
+        ],
+      },
+      runId,
+      Date.now()
+    )
     return { runId, results: outcome.result.results, lines }
   }
 }

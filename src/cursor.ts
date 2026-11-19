@@ -147,11 +147,14 @@ export class CursorTracker {
   /**
    * Note that work has started on a message. Holds the watermark below it until `settle`,
    * which is what makes an interrupted review replay instead of vanishing.
+   *
+   * A no-op for a message already settled: replay calls `begin` on every request the dispatcher
+   * did not queue, including one it refused and recorded, and nothing would ever settle it again.
    */
   begin(channel: string, ts: string): void {
     const state = this.channels.get(channel) ?? this.blank()
     this.channels.set(channel, state)
-    if (compareTs(ts, state.ts) <= 0) return
+    if (compareTs(ts, state.ts) <= 0 || state.done.has(ts)) return
     state.pending.add(ts)
   }
 

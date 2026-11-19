@@ -188,8 +188,14 @@ export function slackClientOptions(timeoutMs: number): WebClientOptions {
 /** Web API implementations of the reaction and thread effects the job needs. */
 export function makeSlackEffects(
   client: WebClient
-): Pick<JobDeps, 'addReaction' | 'removeReaction' | 'postThreadReply' | 'messageExists'> {
+): Pick<JobDeps, 'addReaction' | 'removeReaction' | 'postThreadReply' | 'messageExists'> & {
+  /** A top-level message in a channel: the spend alerts (spec section 8). */
+  postChannelMessage(channel: string, text: string): Promise<void>
+} {
   return {
+    async postChannelMessage(channel: string, text: string): Promise<void> {
+      await client.chat.postMessage({ channel, text, unfurl_links: false, unfurl_media: false })
+    },
     async messageExists(message: MessageRef): Promise<boolean> {
       // A single-message window at exactly this ts: inclusive bounds set to the same value
       // return that one message if it is still there, and nothing once it has been deleted.

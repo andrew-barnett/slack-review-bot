@@ -55,6 +55,7 @@ COPY package.json ./
 COPY scripts ./scripts
 COPY claude ./claude
 COPY codex ./codex
+COPY pricing ./pricing
 COPY docker/entrypoint.sh /usr/local/bin/srb-entrypoint
 
 ENV HOME=/home/bot \

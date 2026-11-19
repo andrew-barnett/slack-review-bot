@@ -176,6 +176,9 @@ export async function runJob(
     // (issue #32). Without this the operator sees a misleading error and the PR is dropped.
     if (deps.isShuttingDown?.()) {
       deps.log('review.aborted.shutdown', { prs: reviewUrls })
+      // Spend already happened: record it (the ledger must see it before the replay spends again),
+      // but post nothing, so the replay's own thread is the only one.
+      deps.recordUsage?.(usageForError(error))
       return 'skipped'
     }
     deps.log('review.failed', { prs: reviewUrls, error: String(error) })
@@ -196,6 +199,8 @@ export async function runJob(
     // on the next start (issue #32); reporting it here would post a second set on the replay.
     if (deps.isShuttingDown?.()) {
       deps.log('review.aborted.shutdown', { prs: reviewUrls })
+      // As in the catch above: record the spend, post nothing.
+      deps.recordUsage?.(outcome.usage)
       return 'skipped'
     }
     return finishDual(request, emoji, deps, options, outcome.dual, outcome.usage, gatedAny)

@@ -27,6 +27,12 @@ import {
 } from './codex'
 import { parseTokensUsed } from './usage'
 
+/** One `codex exec --json` turn.completed line (codex-cli 0.169.0 field names). */
+function turnCompleted(input: number, output = 0, cached = 0, reasoning = 0): string {
+  const usage = { input_tokens: input, cached_input_tokens: cached, cache_write_input_tokens: 0, output_tokens: output, reasoning_output_tokens: reasoning }
+  return `${JSON.stringify({ type: 'turn.completed', usage })}\n`
+}
+
 function argValue(args: string[], flag: string): string | undefined {
   const index = args.indexOf(flag)
   return index === -1 ? undefined : args[index + 1]
@@ -338,10 +344,10 @@ test('runCodexReview returns the parsed final message and stops the deadline on 
   t.end()
 })
 
-// The run has to surface what it cost: Codex's "tokens used" total, parsed out of the
-// transcript, and the active time the deadline charged. This is what the status totals and the
-// per-review thread line are built from.
-test('runCodexReview reports the token total and active time on a completed run', async t => {
+// The run has to surface what it cost. Under --json that is the summed turn.completed usage (spec 6),
+// its token total, and the active time the deadline charged. This is what the spend ledger, the status
+// totals and the per-review thread line are built from.
+test('runCodexReview reports the Codex usage, its token total and active time on a completed run', async t => {
   const child = new FakeChild()
   let outputPath = ''
   const spawner = ((_bin: string, args: string[]) => {
@@ -353,8 +359,8 @@ test('runCodexReview reports the token total and active time on a completed run'
   const run = runCodexReview(runOptions(), spawner, clock.deps)
   await settle()
   clock.tick(10_000) // one heartbeat of active time
-  // Codex prints its running total to the transcript; the two-line form is what `codex exec` emits.
-  child.stdout.write('reviewing...\ntokens used\n300,448\n')
+  // Under --json, Codex reports each turn's usage as a turn.completed event on stdout.
+  child.stdout.write(`{"type":"turn.started"}\n${turnCompleted(300_000, 48, 400)}`)
   await settle()
   fs.writeFileSync(
     outputPath,
@@ -364,7 +370,8 @@ test('runCodexReview reports the token total and active time on a completed run'
   )
   child.emit('close', 0)
   const outcome = await run
-  t.equal(outcome.tokensUsed, 300_448, 'the token total is parsed from the transcript')
+  t.deepEqual(outcome.codexUsage, { inputTokens: 300_000, cachedInputTokens: 400, cacheWriteTokens: 0, outputTokens: 48, reasoningTokens: 0 })
+  t.equal(outcome.tokensUsed, 300_448, 'the token total is the sum of the usage fields')
   t.equal(outcome.activeMs, 10_000, 'the active time charged to the run is reported')
   t.end()
 })
@@ -412,7 +419,7 @@ test('runCodexReview throws CodexOutputError with usage when the final message i
   )
   await settle()
   clock.tick(10_000)
-  child.stdout.write('tokens used\n250,000\n')
+  child.stdout.write(turnCompleted(250_000))
   await settle()
   fs.writeFileSync(outputPath, 'this is not json') // finished, but unparseable output
   child.emit('close', 0)
@@ -420,7 +427,8 @@ test('runCodexReview throws CodexOutputError with usage when the final message i
   const error = await run
   t.ok(error instanceof CodexOutputError, 'a malformed final message is a CodexOutputError')
   if (error instanceof CodexOutputError) {
-    t.equal(error.tokensUsed, 250_000, 'the token total the run printed is carried')
+    t.equal(error.tokensUsed, 250_000, 'the token total the run reported is carried')
+    t.deepEqual(error.codexUsage, { inputTokens: 250_000, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 })
     t.equal(error.activeMs, 10_000, 'the active time the run spent is carried')
   }
   t.end()
@@ -439,7 +447,7 @@ test('runCodexReview throws CodexOutputError with usage when no final message is
   )
   await settle()
   clock.tick(10_000)
-  child.stdout.write('tokens used\n80,000\n')
+  child.stdout.write(turnCompleted(80_000))
   await settle()
   child.emit('close', 1) // closes without ever writing the output file
 
@@ -447,6 +455,7 @@ test('runCodexReview throws CodexOutputError with usage when no final message is
   t.ok(error instanceof CodexOutputError, 'no final message is a CodexOutputError')
   if (error instanceof CodexOutputError) {
     t.equal(error.tokensUsed, 80_000, 'usage rides on the error even with no output file')
+    t.deepEqual(error.codexUsage, { inputTokens: 80_000, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 })
     t.ok(String(error).includes('produced no final message'), String(error))
   }
   t.end()
@@ -1113,5 +1122,128 @@ test('runCodexReportOnly writes schema v2 and parses a v2 final message', async 
   const outcome = await run
   t.ok(schema.properties?.results?.items?.required?.includes('reviewedSha'), 'the v2 schema was handed to Codex')
   t.equal(outcome.result.results[0].verdict, 'clean')
+  t.end()
+})
+
+// Spec 6: usage comes from --json events. Without the flag Codex prints no events and every run would
+// be recorded with no usage. Regression caught: --json dropped from the argument list.
+test('buildCodexArgs asks codex exec for --json events', t => {
+  const args = buildCodexArgs({ profile: 'p', workspaceRoot: '/w', worktreeRoot: '/t', schemaPath: '/s', outputPath: '/o', prompt: 'x' })
+  t.ok(args.includes('--json'))
+  t.equal(args[args.length - 1], 'x', 'the prompt stays the trailing positional')
+  t.end()
+})
+
+// Ruling 11: the transcript footer is no longer read for Codex, so text in a reviewed diff that looks
+// like "tokens used N" can never stand in for (or fake) the run's real usage.
+test('runCodexReview no longer reads a "tokens used" footer as usage', async t => {
+  const child = new FakeChild()
+  let outputPath = ''
+  const spawner = ((_bin: string, args: string[]) => {
+    outputPath = args[args.indexOf('--output-last-message') + 1]
+    return child
+  }) as unknown as Spawner
+  const run = runCodexReview(runOptions(), spawner, fakeClock().deps)
+  await settle()
+  child.stdout.write('tokens used\n300,448\n')
+  await settle()
+  fs.writeFileSync(
+    outputPath,
+    JSON.stringify({ results: [{ url: 'https://github.com/o/r/pull/1', status: 'passed', summary: '', pushedTestCommits: false, reviewUrl: '' }] })
+  )
+  child.emit('close', 0)
+  const outcome = await run
+  t.equal(outcome.tokensUsed, undefined)
+  t.equal(outcome.codexUsage, undefined)
+  t.end()
+})
+
+// Spec 6: a stall carries the usage of the turns that completed before it. Today it carried none, so a
+// stalled run's spend was invisible to the cap.
+test('runCodexReview carries the completed turns\' usage on a stall', async t => {
+  const child = new FakeChild()
+  const clock = fakeClock()
+  const run = runCodexReview({ ...runOptions(), stallTimeoutMs: 40_000 }, (() => child) as unknown as Spawner, clock.deps).then(
+    () => undefined,
+    (error: unknown) => error
+  )
+  await settle()
+  child.stdout.write(turnCompleted(1000, 100))
+  await settle()
+  for (let i = 0; i < 4; i += 1) clock.tick(10_000)
+  await settle()
+  const error = await run
+  t.ok(error instanceof CodexStalledError, 'still the retryable stall')
+  if (error instanceof CodexStalledError) {
+    t.deepEqual(error.codexUsage, { inputTokens: 1000, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 100, reasoningTokens: 0 })
+  }
+  t.end()
+})
+
+// Spec 6: a timeout carries the usage of the turns that completed before the kill.
+test('runCodexReview carries the completed turns\' usage on a timeout', async t => {
+  const child = new FakeChild()
+  const clock = fakeClock()
+  const run = runCodexReview(runOptions(), (() => child) as unknown as Spawner, clock.deps).then(
+    () => undefined,
+    (error: unknown) => error
+  )
+  await settle()
+  child.stdout.write(turnCompleted(500, 50, 0, 5))
+  await settle()
+  for (let i = 0; i < 6; i += 1) clock.tick(10_000)
+  await settle()
+  const error = await run
+  t.ok(error instanceof CodexTimeoutError, 'still the terminal timeout')
+  if (error instanceof CodexTimeoutError) {
+    t.deepEqual(error.codexUsage, { inputTokens: 500, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 50, reasoningTokens: 5 })
+  }
+  t.end()
+})
+
+// Ruling 10: the status reply's live line shows what the run is doing, not raw JSON events.
+test('runCodexReview shows --json events as human progress lines, never raw JSON', async t => {
+  const child = new FakeChild()
+  let outputPath = ''
+  const spawner = ((_bin: string, args: string[]) => {
+    outputPath = args[args.indexOf('--output-last-message') + 1]
+    return child
+  }) as unknown as Spawner
+  const progress: string[] = []
+  const run = runCodexReview({ ...runOptions(), timeoutMs: 10 * 60_000, onProgress: line => progress.push(line) }, spawner, fakeClock().deps)
+  await settle()
+  child.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { id: 'i1', type: 'agent_message', text: 'reading the diff' } })}\n`)
+  child.stdout.write(turnCompleted(10, 1))
+  await settle()
+  t.deepEqual(progress, ['reading the diff'])
+  fs.writeFileSync(
+    outputPath,
+    JSON.stringify({ results: [{ url: 'https://github.com/o/r/pull/1', status: 'passed', summary: '', pushedTestCommits: false, reviewUrl: '' }] })
+  )
+  child.emit('close', 0)
+  await run
+  t.end()
+})
+
+// Ruling P3: the "produced no final message" text is posted to Slack. Under --json the transcript is
+// JSONL; failure mode caught: the error tail being the last 1,500 characters of raw events.
+test('the no-final-message error tail is readable lines, not raw JSONL', async t => {
+  const child = new FakeChild()
+  const run = runCodexReview(runOptions(), (() => child) as unknown as Spawner, fakeClock().deps).then(
+    () => undefined,
+    (error: unknown) => error
+  )
+  await settle()
+  child.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { id: 'i1', type: 'agent_message', text: 'reading the diff' } })}\n`)
+  child.stdout.write(`{"type":"turn.started"}\n${turnCompleted(10, 1)}`)
+  child.stdout.write('warning: plain stderr line\n')
+  await settle()
+  child.emit('close', 1) // closes without ever writing the output file
+  const error = await run
+  t.ok(error instanceof CodexOutputError)
+  const message = String(error)
+  t.ok(message.includes('reading the diff'), 'the agent message is shown')
+  t.ok(message.includes('warning: plain stderr line'), 'non-JSON lines are kept')
+  t.notOk(message.includes('{"type":'), 'no raw JSON event text')
   t.end()
 })

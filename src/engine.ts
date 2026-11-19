@@ -18,7 +18,7 @@ import type { PullRequestRef } from './parse-message'
 import { buildReportOnlyPrompt } from './prompt'
 import { redactSecrets } from './redact'
 import { reconcileResultsV2, type EnginePrResult, type EngineRunResult } from './schema'
-import type { ClaudeUsageDetail, RunUsage } from './usage'
+import { addCodexUsage, codexTotalTokens, type ClaudeUsageDetail, type CodexUsageDetail, type RunUsage } from './usage'
 
 export interface EnginePr {
   ref: PullRequestRef
@@ -61,6 +61,7 @@ export interface AttemptSuccess {
   activeMs: number
   tokensUsed?: number
   claude?: ClaudeUsageDetail
+  codex?: CodexUsageDetail
 }
 
 /** A failed attempt; only a stall is retried. */
@@ -71,7 +72,9 @@ export class AttemptFailure extends Error {
     readonly activeMs: number,
     readonly tokensUsed?: number,
     /** Claude's usage breakdown as far as the failed attempt got. */
-    readonly claude?: ClaudeUsageDetail
+    readonly claude?: ClaudeUsageDetail,
+    /** Codex's usage breakdown as far as the failed attempt got (spec 6). */
+    readonly codex?: CodexUsageDetail
   ) {
     super(message)
     this.name = 'AttemptFailure'
@@ -126,6 +129,7 @@ export async function runWithStallRetries(
   // consumed even though its result was discarded.
   let tokens: number | undefined
   let claude: ClaudeUsageDetail | undefined
+  let codex: CodexUsageDetail | undefined
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const runId = attempt === 0 ? baseRunId : `${baseRunId}.retry${attempt}`
     if (deps.refreshAuth) await deps.refreshAuth()
@@ -134,10 +138,11 @@ export async function runWithStallRetries(
       charged += ok.activeMs
       tokens = addTokens(tokens, ok.tokensUsed)
       claude = addClaudeUsage(claude, ok.claude)
+      codex = addCodexUsage(codex, ok.codex)
       return {
         engine,
         results: reconcileResultsV2(urls, ok.result).results,
-        usage: { tokensUsed: tokens, activeMs: charged, attempts: attempt + 1, ...(claude ? { claude } : {}) },
+        usage: { tokensUsed: tokens, activeMs: charged, attempts: attempt + 1, ...(claude ? { claude } : {}), ...(codex ? { codex } : {}) },
       }
     } catch (error) {
       const failure =
@@ -145,6 +150,7 @@ export async function runWithStallRetries(
       charged += failure.activeMs
       tokens = addTokens(tokens, failure.tokensUsed)
       claude = addClaudeUsage(claude, failure.claude)
+      codex = addCodexUsage(codex, failure.codex)
       if (failure.stalled && attempt < attempts - 1) {
         deps.log?.('engine.retry', { engine, runId: baseRunId, attempt: attempt + 1, of: attempts })
         continue
@@ -154,7 +160,13 @@ export async function runWithStallRetries(
       return {
         engine,
         results: [],
-        usage: { tokensUsed: tokens, activeMs: charged > 0 ? charged : undefined, attempts: attempt + 1, ...(claude ? { claude } : {}) },
+        usage: {
+          tokensUsed: tokens,
+          activeMs: charged > 0 ? charged : undefined,
+          attempts: attempt + 1,
+          ...(claude ? { claude } : {}),
+          ...(codex ? { codex } : {}),
+        },
         error: redactSecrets(message),
       }
     }
@@ -238,11 +250,19 @@ export function makeCodexEngine(config: ReviewConfig, deps: EngineDeps = {}): En
               log: deps.log,
               onProgress: progress('codex', input),
             })
-            return { result: o.result, activeMs: o.activeMs, tokensUsed: o.tokensUsed }
+            return { result: o.result, activeMs: o.activeMs, tokensUsed: o.tokensUsed, ...(o.codexUsage ? { codex: o.codexUsage } : {}) }
           } catch (error) {
-            if (error instanceof CodexStalledError) throw new AttemptFailure(error.message, true, error.snapshot.activeMs)
-            if (error instanceof CodexTimeoutError) throw new AttemptFailure(error.message, false, error.snapshot.activeMs)
-            if (error instanceof CodexOutputError) throw new AttemptFailure(error.message, false, error.activeMs, error.tokensUsed)
+            // Every Codex failure carries the turns it completed, so a killed attempt is still charged.
+            const spent = (u: CodexUsageDetail | undefined) => (u ? codexTotalTokens(u) : undefined)
+            if (error instanceof CodexStalledError) {
+              throw new AttemptFailure(error.message, true, error.snapshot.activeMs, spent(error.codexUsage), undefined, error.codexUsage)
+            }
+            if (error instanceof CodexTimeoutError) {
+              throw new AttemptFailure(error.message, false, error.snapshot.activeMs, spent(error.codexUsage), undefined, error.codexUsage)
+            }
+            if (error instanceof CodexOutputError) {
+              throw new AttemptFailure(error.message, false, error.activeMs, error.tokensUsed, undefined, error.codexUsage)
+            }
             throw error
           }
         },

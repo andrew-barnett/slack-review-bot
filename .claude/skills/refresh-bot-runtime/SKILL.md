@@ -5,7 +5,7 @@ description: Use when updating what the slack-review-bot image runs - bumping th
 
 # Refresh the bot's runtime
 
-The container image is fixed at build time. Four things in it go stale and are refreshed here:
+The container image is fixed at build time. Five things in it go stale and are refreshed here:
 
 | What | Pinned in | Consumed by |
 |---|---|---|
@@ -13,6 +13,7 @@ The container image is fixed at build time. Four things in it go stale and are r
 | Bedrock model IDs | defaults in `src/config.ts` (`codexBedrockModel`, `claudeBedrockModel`); overridable per install via `CODEX_BEDROCK_MODEL` / `CODEX_BEDROCK_PROJECT` / `CLAUDE_BEDROCK_MODEL` / `CODEX_BEDROCK_CONTEXT_WINDOW` in `launcher.conf` | `src/bedrock-auth.ts` (`ANTHROPIC_MODEL` for Claude; `-c model=...` for Codex) |
 | CLI versions | `Dockerfile` `ARG GH_VERSION`, `AWSCLI_VERSION`, `CODEX_VERSION`, `CLAUDE_CODE_VERSION` | the image |
 | Base image | `Dockerfile` `FROM node:22-bookworm-slim` (both stages) | the image |
+| Bedrock prices | `pricing/bedrock-prices.json` (USD per million tokens, keyed by model ID, with the source URL and date checked) | `src/pricing.ts` → the monthly spend cap (`src/spend-cap.ts`) |
 
 Do only the sections the request needs, but always finish with **Verify** and **Ship**.
 
@@ -55,7 +56,7 @@ The engine role (`SlackReviewBotEngineRole`, policy `iam/policies/SlackReviewBot
      - Check the account's invocation logging: `aws bedrock get-model-invocation-logging-configuration --region us-east-2 --profile staging`. Logging to our own CloudWatch/S3 stays inside the company and is acceptable; report what it says in the PR either way.
    - **Gate C, good enough at review:** run each surviving candidate, and the current model, on the same fixed set of 3-5 past PRs of this repo whose real problems are known (pick merged PRs whose review rounds found BLOCKING issues; list them and their known issues in the PR). Run each one with `npm run review -- --report-only --engine <codex|claude> <PR URL>`, with `ENGINE_AUTH=bedrock` and the candidate in `CODEX_BEDROCK_MODEL` / `CLAUDE_BEDROCK_MODEL`. Report-only mode posts nothing, so it is safe on real, merged PRs. Never drop the flag here: without it `npm run review` posts a real review and can APPROVE. A merged PR cannot be reviewed in place: report-only mode still checks the base and returns `blocked` (`stale base`) once the base has moved on. So, once per eval PR, recreate it in a private scratch repository (e.g. `andrew-barnett/srb-model-eval`, created by the user): push the PR's merge-base commit as a base branch and its head commit as a head branch, and open a PR there. Reuse those scratch PRs for every candidate and every future refresh; nothing moves them, so every candidate reviews the same commit. A candidate passes if it finds at least the known BLOCKING issues the current model finds, and its findings are not mostly noise. Record the results per PR.
    - **Then cheapest wins:** among candidates that pass all three gates, pick the lowest cost per review. Cost per review = the run logs' token usage × the candidate's on-demand input/output (and cached-input) prices from the AWS Bedrock pricing page. Fall back to list prices with a typical review's token counts if the logs lack a breakdown, and say so. Lower `model_reasoning_effort` is a cost lever too; test it the same way.
-   - Codex-specific: the model must be one the pinned `CODEX_VERSION` knows. Codex prints `Model metadata for <id> not found. Defaulting to fallback metadata` for IDs it doesn't know; that is acceptable only with `CODEX_BEDROCK_CONTEXT_WINDOW` set from the model's AWS model card. Prefer bumping `CODEX_VERSION` (section 3).
+   - Codex-specific: the model must be one the pinned `CODEX_VERSION` knows. Codex prints `Model metadata for <id> not found. Defaulting to fallback metadata` for IDs it doesn't know; that is acceptable because `CODEX_BEDROCK_CONTEXT_WINDOW` (default `272000`, the OpenAI short-context threshold the spend price table assumes) overrides the fallback. Check the candidate's AWS model card still uses that threshold; if it differs, the default and the price table must change together. Prefer bumping `CODEX_VERSION` (section 3).
    - The pick goes to the user with the table (model, gates A-C, cost per review) before any default changes. Moving to a pricier model is always the user's call.
 3. Smoke-test each candidate as the engine role before changing anything. This needs an AWS profile that assumes `arn:aws:iam::153538148884:role/SlackReviewBotEngineRole` from `staging`; the user creates it (don't read or edit `~/.aws/config` yourself). Below it is called `srb-engine`; ask the user for its real name.
    ```sh
@@ -73,6 +74,15 @@ The engine role (`SlackReviewBotEngineRole`, policy `iam/policies/SlackReviewBot
 4. Apply the choice. Either:
    - **Per install, no code change:** set `CODEX_BEDROCK_MODEL` / `CLAUDE_BEDROCK_MODEL` (and `CODEX_BEDROCK_CONTEXT_WINDOW`) in `~/.config/slack-review-bot/launcher.conf` and restart the launcher; or
    - **New default (preferred when it should apply everywhere):** change the defaults in `src/config.ts` `loadBedrockConfig`, then `grep -rn '<old-id>' --exclude-dir=node_modules --exclude-dir=dist .` and update every hit: tests (`src/config.test.ts`, `src/bedrock-auth.test.ts`, `src/codex.test.ts`, `src/claude.test.ts`, `src/worker.test.ts` at the time of writing), `README.md`, and both Codex profiles (`codex/review-bot.config.toml.template`, `codex/review-bot.config.container.toml`, whose `model =` is the subscription-path model name and changes only if the OpenAI model family changed). Leave dated specs/plans under `docs/superpowers/` alone — they are history.
+
+5. **Update the price table** whenever a model ID changes (a new default or a per-install override), and at least whenever this section runs. The daemon refuses to start in Bedrock mode if a configured model has no price.
+   1. Open https://aws.amazon.com/bedrock/pricing/, on-demand, region US East (Ohio) (`us-east-2`). Prices come from that page only; if you cannot open it, stop and ask the user.
+   2. In `pricing/bedrock-prices.json`, add or update the entry keyed by the exact model ID: `input`, `cachedInput` (cache read; the `input` price if none is listed), `cacheWrite` (the 5-minute write price; `0` if none is listed), `output`, all in USD per **million** tokens. Keep entries for models that are not configured: they are the reference prices for the next candidate comparison. Mantle model IDs (`openai.*`, Codex) and bedrock-runtime profile IDs (`us.*`) are separate keys.
+   3. Set `source` to `https://aws.amazon.com/bedrock/pricing/ (on-demand, us-east-2), checked YYYY-MM-DD` with today's date.
+   4. Keep `codexTokenSemantics` as it is unless Bedrock's or OpenAI's documentation now states how `cached_input_tokens` and `reasoning_output_tokens` relate to input and output; quote the sentence and URL in the PR if you change a flag.
+   5. Check: `node -e "const t=require('./pricing/bedrock-prices.json');console.log(t.source);console.table(t.models)"` matches the page value for value, and `npx ts-node --compiler-options '{"module":"commonjs"}' --transpile-only src/pricing-file.test.ts` passes.
+   6. A per-install override (`CODEX_BEDROCK_MODEL` / `CLAUDE_BEDROCK_MODEL` in `launcher.conf`) needs its entry in this table too, and the container runtime needs an image rebuild (section 4) before the override takes effect.
+6. **Keep the AWS Budget in step with the cap.** Once the Budget backstop from the spend-cap spec (section 10) exists, its limit is 1.10 × `BEDROCK_MONTHLY_CAP_USD`. Whenever the cap changes, change the Budget limit in the same change set. Until section 10 ships there is no Budget to update; say so in the PR.
 
 ## 3. CLI versions and base image
 
