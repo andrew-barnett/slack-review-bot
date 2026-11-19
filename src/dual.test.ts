@@ -470,3 +470,51 @@ test('combineUsage sums tokens and active time and keeps each engine', t => {
   t.deepEqual(u.engines?.map(e => e.engine), ['codex', 'claude'])
   t.end()
 })
+
+// Spec D8 / ruling 2: single mode in the container runtime is the dual runner with one engine and
+// approvals off. A clean result is one COMMENT at the pinned SHA, never an APPROVE.
+test('dual runner with approvals off posts a clean COMMENT for one clean engine', async t => {
+  const w = world()
+  const out = await run(deps(w, [engine('claude')], { approvals: false }))
+  t.deepEqual(w.posted.map(p => [p.event, p.commitId]), [['COMMENT', OLD]])
+  t.equal(out.dual!.prs[0].outcome, 'clean')
+  t.deepEqual(out.dual!.engines, ['claude'])
+  t.equal(out.result.results[0].status, 'passed', 'clean counts as passed in the legacy summary')
+  t.end()
+})
+
+// Findings still post a COMMENT; a report-only run changes nothing else about the gate.
+test('dual runner with approvals off still posts findings as a COMMENT', async t => {
+  const w = world()
+  const out = await run(deps(w, [engine('codex', 'findings')], { approvals: false }))
+  t.deepEqual(w.posted.map(p => p.event), ['COMMENT'])
+  t.equal(out.dual!.prs[0].outcome, 'findings')
+  t.end()
+})
+
+// An approval the bot already left at this SHA (from before the switch to report-only) stands; the
+// report-only run posts nothing new and reports 'clean', never 'approved'.
+test('dual runner with approvals off reports clean when an earlier review stands', async t => {
+  const w = world([OLD], {
+    botReviews: async () => [{ login: 'role-bot', state: 'APPROVED', commitId: OLD }],
+  })
+  const out = await run(deps(w, [engine('codex')], { approvals: false }))
+  t.deepEqual(w.posted, [])
+  t.equal(out.dual!.prs[0].outcome, 'clean')
+  t.ok(out.dual!.prs[0].alreadyReviewed)
+  t.end()
+})
+
+// Ruling 3 (F10): update-branch stays on with approvals off. Report-only engines never merge the base,
+// so without it every stale-base PR would come back 'blocked'. Regression caught: gating update-branch
+// on approvals.
+test('dual runner with approvals off still updates a stale branch and reviews the new head', async t => {
+  const w = world([OLD, NEW], { behindBy: async () => 1 })
+  const claude = engine('claude')
+  const out = await run(deps(w, [claude], { approvals: false }))
+  t.deepEqual(w.updates, [OLD], 'update-branch was sent for the stale head')
+  t.deepEqual(w.posted.map(p => [p.event, p.commitId]), [['COMMENT', NEW]], 'one clean COMMENT at the new head')
+  t.equal(out.dual!.prs[0].outcome, 'clean')
+  t.end()
+})
+

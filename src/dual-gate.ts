@@ -20,7 +20,8 @@ export interface EnginePass {
   result?: EnginePrResult
 }
 
-export type PrOutcome = 'approved' | 'approvedPartial' | 'cleanNotCounted' | 'findings' | 'blocked' | 'error' | 'headMoved'
+/** `clean` is the report-only outcome (approvals off): every engine clean, posted as a COMMENT. */
+export type PrOutcome = 'approved' | 'approvedPartial' | 'cleanNotCounted' | 'clean' | 'findings' | 'blocked' | 'error' | 'headMoved'
 
 export interface GateDecision {
   /** What to post; null posts nothing. */
@@ -142,6 +143,17 @@ export function decide(passes: EnginePass[], eligibility: Eligibility, engines: 
   return { event: 'COMMENT', outcome: 'cleanNotCounted' }
 }
 
+/**
+ * Approvals off (container single mode, spec D8): anything that would approve, or would note that an
+ * approval does not count, is posted as one COMMENT with the outcome `clean`. Everything else stands.
+ */
+export function reportOnly(decision: GateDecision): GateDecision {
+  if (decision.outcome === 'approved' || decision.outcome === 'approvedPartial' || decision.outcome === 'cleanNotCounted') {
+    return { event: 'COMMENT', outcome: 'clean' }
+  }
+  return decision
+}
+
 /** GitHub caps a review body and each comment at 65,536 characters; stay well under it. */
 export const MAX_GITHUB_TEXT = 60_000
 
@@ -165,6 +177,7 @@ const HEADLINE: Record<PrOutcome, string> = {
   approved: 'Both engines are clean. Approved.',
   approvedPartial: 'Both engines are clean. Approved; this approval does not satisfy every requirement on its own.',
   cleanNotCounted: "Both engines are clean, but an approval from this account would not satisfy this PR's rules, so this is a comment, not an approval.",
+  clean: 'Clean. This review is report-only, so it is a comment, not an approval.',
   findings: 'Findings. Not approved.',
   blocked: 'Not reviewed.',
   error: 'Not approved: an engine did not complete a valid review.',
@@ -189,7 +202,8 @@ export interface ComposeInput {
  */
 export function composeReview(input: ComposeInput): { body: string; comments: ReviewComment[] } {
   const { pinnedSha, passes, eligibility, outcome, commentable } = input
-  const lines: string[] = [`**Dual-engine review at \`${pinnedSha}\`.** ${HEADLINE[outcome]}`, '']
+  const title = passes.length === 1 ? 'Review' : 'Dual-engine review'
+  const lines: string[] = [`**${title} at \`${pinnedSha}\`.** ${HEADLINE[outcome]}`, '']
   lines.push(passes.map(p => `${ENGINE_LABEL[p.engine]}: ${sanitiseUntrustedText(p.detail)}`).join(' · '), '')
   lines.push(`Pre-flight: ${VERDICT_TEXT[eligibility.verdict]}.`)
   for (const reason of eligibility.reasons) lines.push(`- ${sanitiseUntrustedText(reason)}`)

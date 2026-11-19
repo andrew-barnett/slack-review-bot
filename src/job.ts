@@ -242,6 +242,8 @@ const DUAL_JOB_OUTCOME: Record<PrOutcome, JobOutcome> = {
   approved: 'approved',
   approvedPartial: 'approvedPartial',
   cleanNotCounted: 'cleanNotCounted',
+  // Report-only clean (ruling 2): a pass in `status`, never an approval.
+  clean: 'pass',
   findings: 'findings',
   blocked: 'error',
   error: 'error',
@@ -255,6 +257,7 @@ function dualReaction(emoji: JobEmoji, outcome: PrOutcome): string {
     case 'approvedPartial':
       return emoji.approvalPartial
     case 'cleanNotCounted':
+    case 'clean':
       return emoji.approvalNotCounted
     case 'findings':
       return emoji.findings
@@ -289,7 +292,7 @@ async function finishDual(
     attempts: usage.attempts,
   })
   await finishAck(deps, emoji, request.message)
-  const clean = worst === 'approved' || worst === 'approvedPartial' || worst === 'cleanNotCounted'
+  const clean = worst === 'approved' || worst === 'approvedPartial' || worst === 'cleanNotCounted' || worst === 'clean'
   if (!(clean && gatedAny)) {
     await swallow(deps, 'reaction.dual.failed', () => deps.addReaction(request.message, dualReaction(emoji, worst)))
   }
