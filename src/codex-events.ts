@@ -4,11 +4,16 @@
 // the line format: the usage reader sums every turn.completed on the raw stdout, and the progress
 // filter turns events into the human status lines the status reply shows (ruling 10).
 
-import { nonNegative as count, record as asRecord } from './jobs/errors'
 import { addCodexUsage, type CodexUsageDetail } from './usage'
 
 /** Longest line held while waiting for its newline; Codex events are far smaller. */
 export const CODEX_EVENT_LINE_LIMIT = 8 * 1024 * 1024
+
+/** A finite, non-negative count, or 0. */
+const count = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0)
+
+const asRecord = (value: unknown): Record<string, unknown> =>
+  value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
 
 /** One turn.completed `usage` object as a CodexUsageDetail; absent or malformed fields read as 0. */
 export function turnUsage(value: unknown): CodexUsageDetail {
