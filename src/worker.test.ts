@@ -10,6 +10,7 @@ import {
   CODEARTIFACT_REGISTRY,
   HEARTBEAT_FAILURE_LIMIT,
   PROGRESS_DRAIN_MS,
+  RESULT_ATTEMPTS,
   renderWorkerNpmrc,
   runWorker,
   workerWorktreeRoot,
@@ -47,6 +48,8 @@ function harness(claims: (ClaimOutcome | Error)[] = [{ status: 200, job: codexJo
   const calls = { progress: [] as ProgressBody[], results: [] as ResultBody[], logs: [] as string[], heartbeats: 0 }
   const heartbeat = { status: 200 as number | Error }
   const killed: string[] = []
+  // How many engine children are live; most tests run with one, as during a real engine run.
+  const children = { count: 1 }
   const timers: (() => void)[] = []
   const client: JobClient = {
     claim: async () => {
@@ -80,7 +83,7 @@ function harness(claims: (ClaimOutcome | Error)[] = [{ status: 200, job: codexJo
     runCodex: async () => ({ result: clean, rawFinalMessage: 'raw', tokensUsed: 3, activeMs: 4 }),
     runClaude: async () => ({ result: clean, usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0, numTurns: 1, durationMs: 1 }, tokensUsed: 2, activeMs: 5, permissionDenials: 0 }),
     resolveAuth: async () => auth,
-    registry: { add: () => {}, remove: () => {}, killAll: signal => (killed.push(signal), 1), size: () => 0 },
+    registry: { add: () => {}, remove: () => {}, killAll: signal => (killed.push(signal), 1), size: () => children.count },
     logDir: '/tmp/srb-run-test',
     log: () => {},
     now: () => clock,
@@ -94,7 +97,7 @@ function harness(claims: (ClaimOutcome | Error)[] = [{ status: 200, job: codexJo
     setTimer: fn => fn(),
     readFrom: () => Buffer.alloc(0),
   }
-  return { deps, calls, heartbeat, killed, timers }
+  return { deps, calls, heartbeat, killed, timers, children }
 }
 
 // Spec 3.4 step 3: a worker that never gets a job exits 0 after WORKER_IDLE_EXIT_MS, so the launcher
@@ -310,6 +313,81 @@ test('worker posts its result even when a progress post hangs', async t => {
   }
   t.equal(await runWorker(h.deps), 'done')
   t.equal(h.calls.results.length, 1)
+  t.end()
+})
+
+// A 409 that lands before the engine child exists must still stop the run: the worker must not start
+// PR code for a job the orchestrator already cancelled, and a later cancel signal must kill a child
+// that started meanwhile. Regression caught: one-shot cancellation that finds no child and never fires
+// again, leaving a full-timeout review nobody owns.
+test('worker does not start the engine after a cancel that arrived first', async t => {
+  const h = harness()
+  h.children.count = 0
+  h.heartbeat.status = 409
+  let ran = false
+  h.deps.resolveAuth = async () => {
+    await h.timers[0]()
+    return auth
+  }
+  h.deps.runCodex = async () => {
+    ran = true
+    return { result: clean, rawFinalMessage: 'raw', tokensUsed: 3, activeMs: 4 }
+  }
+  t.equal(await runWorker(h.deps), 'cancelled')
+  t.notOk(ran, 'the engine never started')
+  t.deepEqual(h.killed, [], 'there was nothing to kill yet')
+  t.equal(h.calls.results.length, 1)
+  const r = h.calls.results[0]
+  t.ok(!r.ok && r.error.class === 'CodexOutputError' && /before the engine started/.test(r.error.message))
+  t.end()
+})
+
+// Every cancel signal re-kills: a child spawned after the first 409 is still terminated by the next.
+test('worker kills a child that started after an earlier cancel', async t => {
+  const h = harness()
+  h.deps.runCodex = async () => {
+    h.children.count = 0
+    h.heartbeat.status = 409
+    await h.timers[0]()
+    h.children.count = 1
+    await h.timers[0]()
+    return { result: clean, rawFinalMessage: 'raw', tokensUsed: 3, activeMs: 4 }
+  }
+  await runWorker(h.deps)
+  t.deepEqual(h.killed, ['SIGTERM', 'SIGKILL'], 'the second cancel killed the late child')
+  t.end()
+})
+
+// A 5xx from the orchestrator may be transient, so the result is retried; a worker that cannot deliver
+// says so with its own event instead of claiming it posted.
+test('worker retries a result answered with 5xx and reports one it could not deliver', async t => {
+  const h = harness()
+  const statuses = [502, 200]
+  h.deps.client.result = async () => statuses.shift() ?? 200
+  const events: string[] = []
+  h.deps.log = event => events.push(event)
+  await runWorker(h.deps)
+  t.deepEqual(events.filter(e => e.startsWith('worker.result')), ['worker.result_failed', 'worker.result_posted'])
+  const g = harness()
+  g.deps.client.result = async () => 503
+  const gEvents: string[] = []
+  g.deps.log = event => gEvents.push(event)
+  await runWorker(g.deps)
+  t.equal(gEvents.filter(e => e === 'worker.result_failed').length, RESULT_ATTEMPTS)
+  t.ok(gEvents.includes('worker.result_undelivered'))
+  t.end()
+})
+
+// Only a 200 heartbeat proves the orchestrator is alive; a proxy answering 502 forever must count
+// toward worker-side loss detection.
+test('worker counts non-200 heartbeats as failures', async t => {
+  const h = harness()
+  h.heartbeat.status = 502
+  h.deps.runCodex = async () => {
+    for (let i = 0; i < HEARTBEAT_FAILURE_LIMIT; i += 1) await h.timers[0]()
+    return { result: clean, rawFinalMessage: 'raw', tokensUsed: 3, activeMs: 4 }
+  }
+  t.equal(await runWorker(h.deps), 'lost')
   t.end()
 })
 

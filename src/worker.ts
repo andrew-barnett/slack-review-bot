@@ -6,8 +6,8 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import type { BedrockAuth } from './bedrock-auth'
-import type { runClaudeReview } from './claude'
-import type { ChildRegistry, runCodexReportOnly } from './codex'
+import { ClaudeRunError, type runClaudeReview } from './claude'
+import { CodexOutputError, type ChildRegistry, type runCodexReportOnly } from './codex'
 import type { EngineName, ReviewConfig } from './config'
 import type { JobClient } from './jobs/client'
 import { serializeRunError } from './jobs/errors'
@@ -21,6 +21,7 @@ export const CHILD_KILL_GRACE_MS = 10_000
 export const PROGRESS_DRAIN_MS = 5_000
 /** Consecutive failed heartbeats (about a minute at 10 s) after which the orchestrator is gone. */
 export const HEARTBEAT_FAILURE_LIMIT = 6
+export const RESULT_ATTEMPTS = 3
 export const WORKER_NPMRC = '/home/bot/.npmrc-worker'
 export const CODEARTIFACT_REGISTRY = 'https://trade-platform-153538148884.d.codeartifact.us-east-2.amazonaws.com/npm/trade-platform/'
 
@@ -118,13 +119,22 @@ export async function runWorker(deps: WorkerDeps): Promise<WorkerExit> {
 
   let cancelled = false
   let lost = false
+  // Cancellation is not one-shot: a 409 can arrive before the engine child exists, so every later
+  // cancel signal kills again whatever is running by then, and the run refuses to start at all.
+  const kill = () => {
+    if (deps.registry.size() === 0) return
+    deps.registry.killAll('SIGTERM')
+    deps.setTimer(() => {
+      if (deps.registry.size() > 0) deps.registry.killAll('SIGKILL')
+    }, CHILD_KILL_GRACE_MS)
+  }
   const cancel = (why: 'cancel' | 'lost') => {
     if (why === 'lost') lost = true
-    if (cancelled) return
-    cancelled = true
-    deps.log('worker.cancelling', { jobId: job.jobId, why })
-    deps.registry.killAll('SIGTERM')
-    deps.setTimer(() => deps.registry.killAll('SIGKILL'), CHILD_KILL_GRACE_MS)
+    if (!cancelled) {
+      cancelled = true
+      deps.log('worker.cancelling', { jobId: job.jobId, why })
+    }
+    kill()
   }
   const onStatus = (status: number) => {
     if (status === 409) cancel('cancel')
@@ -134,7 +144,10 @@ export async function runWorker(deps: WorkerDeps): Promise<WorkerExit> {
   let heartbeatFailures = 0
   const beat = async () => {
     try {
-      onStatus(await deps.client.heartbeat(job))
+      const status = await deps.client.heartbeat(job)
+      onStatus(status)
+      // Only a 200 proves the orchestrator is there; a proxy answering 5xx forever is not.
+      if (status !== 200) throw new Error(`heartbeat answered HTTP ${status}`)
       heartbeatFailures = 0
     } catch (error) {
       heartbeatFailures += 1
@@ -200,6 +213,10 @@ export async function runWorker(deps: WorkerDeps): Promise<WorkerExit> {
   try {
     const worktreeRoot = workerWorktreeRoot(job.options.worktreeRoot, deps.config.worktreeRoot)
     const bedrock = await deps.resolveAuth(engine, job.options.runId)
+    if (cancelled) {
+      const why = 'cancelled before the engine started'
+      throw engine === 'codex' ? new CodexOutputError(why, undefined, 0) : new ClaudeRunError(why, 'output', 0)
+    }
     const common = {
       prompt: job.options.prompt,
       workspaceRoot: deps.config.workspaceRoot,
@@ -238,15 +255,19 @@ export async function runWorker(deps: WorkerDeps): Promise<WorkerExit> {
     deps.log('worker.lost', { jobId: job.jobId })
     return 'lost'
   }
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
+  let posted = false
+  for (let attempt = 1; attempt <= RESULT_ATTEMPTS && !posted; attempt += 1) {
     try {
       const status = await deps.client.result(job, body)
+      // A 5xx may be transient; anything else is final (200, or a 4xx a retry cannot change).
+      if (status >= 500) throw new Error(`result answered HTTP ${status}`)
       deps.log('worker.result_posted', { jobId: job.jobId, status, ok: body.ok })
-      break
+      posted = true
     } catch (error) {
       deps.log('worker.result_failed', { attempt, error: redactSecrets(String(error)) })
-      await deps.sleep(CLAIM_RETRY_MS)
+      if (attempt < RESULT_ATTEMPTS) await deps.sleep(CLAIM_RETRY_MS)
     }
   }
+  if (!posted) deps.log('worker.result_undelivered', { jobId: job.jobId })
   return cancelled ? 'cancelled' : 'done'
 }
