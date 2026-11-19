@@ -15,7 +15,23 @@ import * as path from 'path'
 import { promisify } from 'util'
 import { WebClient } from '@slack/web-api'
 import { resolveBedrockAuth, type BedrockAuth } from './bedrock-auth'
-import { isDualMode, loadConfig, looksLikeUserId, scrubDaemonSecrets, type Config, type ReviewConfig } from './config'
+import { isDualMode, loadConfig, loadReviewConfig, looksLikeUserId, scrubDaemonSecrets, type Config, type ReviewConfig } from './config'
+import { inContainer } from './container'
+import {
+  checkDaemonSecretsAbsent,
+  checkEngineRole,
+  checkGhLoggedOut,
+  checkNoDockerSocket,
+  checkPidNamespace,
+  checkSecretsDenied,
+  checkTokenIdentity,
+  engineAwsEnv,
+  parseDoctorRole,
+  type ContainerProbe,
+} from './doctor-container'
+import { orchestratorConfig } from './orchestrator'
+import { ORCHESTRATOR_BUNDLE, readSecretBundle, WORKER_DOCTOR_BUNDLE } from './secret-bundle'
+import { assertWorkerConfig } from './worker'
 import { redactSecrets } from './redact'
 import type { Exec } from './registry-auth'
 import { readCursorFile } from './cursor'
@@ -478,7 +494,7 @@ async function checkBinary(
  * daemon env file and gh config dir are not config fields, so the installer resolves them from
  * its own defaults and variables, as the daemon's other checks do.
  */
-export async function checkClaudeProfile(config: Config, runCommand: CommandRunner = run): Promise<CheckResult> {
+export async function checkClaudeProfile(config: Config, runCommand: CommandRunner = run, extraArgs: string[] = []): Promise<CheckResult> {
   const name = 'claude profile'
   const script = path.join(__dirname, '..', 'scripts', 'install-claude-profile.sh')
   if (!fs.existsSync(script)) {
@@ -492,6 +508,7 @@ export async function checkClaudeProfile(config: Config, runCommand: CommandRunn
     config.workspaceRoot,
     '--worktree-root',
     config.worktreeRoot,
+    ...extraArgs,
   ])
   return code === 0
     ? { name, status: 'ok', detail: output.trim().split('\n').pop() || 'valid' }
@@ -528,13 +545,13 @@ export async function checkDualMode(
 }
 
 /** Defers to the installer's own --check, so there is one definition of a valid profile. */
-async function checkCodexProfile(config: Config): Promise<CheckResult> {
+export async function checkCodexProfile(config: ReviewConfig, runCommand: CommandRunner = run, extraArgs: string[] = []): Promise<CheckResult> {
   const name = 'codex profile'
   const script = path.join(__dirname, '..', 'scripts', 'install-codex-profile.sh')
   if (!fs.existsSync(script)) {
     return { name, status: 'warn', detail: `installer not found at ${script}` }
   }
-  const { code, output } = await run(script, ['--check', '--name', config.codexProfile])
+  const { code, output } = await runCommand(script, ['--check', '--name', config.codexProfile, ...extraArgs])
   return code === 0
     ? { name, status: 'ok', detail: output.trim().split('\n').pop() ?? 'valid' }
     : { name, status: 'fail', detail: output.trim().split('\n')[0] ?? `exit ${code}` }
@@ -738,7 +755,95 @@ function checkCredentialsFile(): CheckResult {
   }
 }
 
+/** The live probe for the container checks. */
+function liveProbe(base: NodeJS.ProcessEnv): ContainerProbe {
+  const gh = defaultRunner('gh')
+  return {
+    env: base,
+    exists: p => fs.existsSync(p),
+    readFile: p => {
+      try {
+        return fs.readFileSync(p, 'utf8')
+      } catch {
+        return undefined
+      }
+    },
+    runCommand: run,
+    lookupLogin: token => lookupLogin(gh, ghEnvAs(base, token)),
+  }
+}
+
+/** `doctor --role worker` (spec 3.7): the bundle arrives on stdin exactly as for a real worker. */
+async function workerDoctor(): Promise<CheckResult[]> {
+  // Check the environment the container started with, before the bundle is merged and before
+  // scrubDaemonSecrets deletes APPROVER_GH_TOKEN: scrubbing first would hide exactly the leak this
+  // check exists to catch (a daemon token handed to the container that runs PR code).
+  const daemonSecrets = await checkDaemonSecretsAbsent(liveProbe({ ...process.env }))
+  const { WORKER_TICKET: _ticket, ...exported } = await readSecretBundle(process.stdin, WORKER_DOCTOR_BUNDLE)
+  Object.assign(process.env, exported)
+  const config = loadReviewConfig(process.env)
+  assertWorkerConfig(config)
+  scrubDaemonSecrets(process.env, config)
+  const probe = liveProbe(process.env)
+  const awsEnv = engineAwsEnv(process.env, config.engineAwsStatic!, config.bedrockRegion)
+  // The worker's profile files live under the image's HOME; these flags select the container checks.
+  const claudeArgs = ['--container', '--npmrc', process.env.npm_config_userconfig || '/home/bot/.npmrc-worker']
+  return [
+    daemonSecrets,
+    await checkGhLoggedOut(probe),
+    await checkEngineRole(probe, awsEnv),
+    await checkSecretsDenied(probe, awsEnv, config.bedrockRegion),
+    checkPidNamespace(probe),
+    checkNoDockerSocket(probe),
+    await checkTokenIdentity(probe, 'engine token', config.engineGhToken),
+    await checkClaudeProfile(config as Config, run, claudeArgs),
+    await checkCodexProfile(config, run, ['--container']),
+    // The worker logs runs to its own temp dir and ships them to the orchestrator; RUN_LOG_DIR is unused.
+    ...checkRoots(config as Config).filter(r => r.name !== 'run log dir'),
+  ]
+}
+
+/** `doctor --role orchestrator`: Slack, the approver identity, and the container's own isolation. */
+async function orchestratorDoctor(): Promise<CheckResult[]> {
+  const bundle = await readSecretBundle(process.stdin, ORCHESTRATOR_BUNDLE)
+  const { config } = orchestratorConfig(bundle, process.env)
+  const probe = liveProbe(process.env)
+  const client = new WebClient(config.botToken)
+  return [
+    await checkBotToken(client),
+    await checkAppToken(config.appToken),
+    ...(await checkChannels(client, config.channelIds)),
+    checkIgnoreList(config.ignoreUserIds),
+    await checkEmoji(client, config),
+    await checkGhLoggedOut(probe),
+    checkNoDockerSocket(probe),
+    checkPidNamespace(probe),
+    await checkTokenIdentity(probe, 'approver token', config.approverGhToken),
+    ...checkCursor(config),
+    ...(await checkHistoryAccess(client, config)),
+  ]
+}
+
+async function containerDoctor(role: 'orchestrator' | 'worker' | undefined): Promise<CheckResult[]> {
+  if (!role) {
+    return [{ name: 'role', status: 'fail', detail: 'in a container, run doctor --role orchestrator or --role worker' }]
+  }
+  try {
+    return role === 'worker' ? await workerDoctor() : await orchestratorDoctor()
+  } catch (error) {
+    return [{ name: `${role} setup`, status: 'fail', detail: redactSecrets(String(error)) }]
+  }
+}
+
 async function main(): Promise<void> {
+  const role = parseDoctorRole(process.argv.slice(2))
+  // Spec 3.7: in a container the launchd PATH and env-file checks do not apply.
+  if (role || inContainer()) {
+    const { lines, exitCode } = summarise(await containerDoctor(role))
+    process.stdout.write(`${lines.join('\n')}\n`)
+    process.exitCode = exitCode
+    return
+  }
   let config: Config
   try {
     config = loadConfig()

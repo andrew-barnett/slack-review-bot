@@ -1,6 +1,6 @@
 import test from 'tape'
 import { AGENT_NO_MENTION_NOTE } from './agent-note'
-import { composeReview, decide, passFor, skippedPass, type EnginePass, type PassState } from './dual-gate'
+import { composeReview, decide, passFor, reportOnly, skippedPass, type EnginePass, type PassState } from './dual-gate'
 import type { EngineRunOutcome } from './engine'
 import type { Eligibility } from './preflight'
 import type { EnginePrResult } from './schema'
@@ -274,5 +274,28 @@ test('composeReview caps an oversized body', t => {
   const fenceCount = (beforeTrunc.match(/```/g) || []).length
   t.equal(fenceCount % 2, 0, 'even number of fence markers before truncation')
 
+  t.end()
+})
+
+// Ruling 2: with approvals off, every outcome that would approve, or note a non-counting approval,
+// becomes one COMMENT with the outcome 'clean'. Regression caught: a report-only run posting APPROVE.
+test('reportOnly turns every approving outcome into a clean COMMENT and leaves the rest', t => {
+  t.deepEqual(reportOnly({ event: 'APPROVE', outcome: 'approved' }), { event: 'COMMENT', outcome: 'clean' })
+  t.deepEqual(reportOnly({ event: 'APPROVE', outcome: 'approvedPartial' }), { event: 'COMMENT', outcome: 'clean' })
+  t.deepEqual(reportOnly({ event: 'COMMENT', outcome: 'cleanNotCounted' }), { event: 'COMMENT', outcome: 'clean' })
+  t.deepEqual(reportOnly({ event: 'COMMENT', outcome: 'findings' }), { event: 'COMMENT', outcome: 'findings' })
+  t.deepEqual(reportOnly({ event: null, outcome: 'blocked' }), { event: null, outcome: 'blocked' })
+  t.deepEqual(reportOnly({ event: null, outcome: 'error' }), { event: null, outcome: 'error' })
+  t.end()
+})
+
+// A one-engine gate needs exactly that engine's pass; the default engine list (both) would call it
+// "missing an engine". The single-engine review body must not claim to be a dual-engine review.
+test('decide and composeReview handle a single configured engine', t => {
+  t.deepEqual(decide([pass('claude', 'clean')], counts, ['claude']), { event: 'APPROVE', outcome: 'approved' })
+  t.deepEqual(decide([pass('claude', 'clean')], counts), { event: null, outcome: 'error' }, 'the default is still both engines')
+  const { body } = composeReview({ pinnedSha: SHA, passes: [pass('claude', 'clean')], eligibility: counts, outcome: 'clean', commentable: new Map() })
+  t.ok(body.startsWith(`**Review at \`${SHA}\`.** Clean. This review is report-only, so it is a comment, not an approval.`))
+  t.notOk(body.includes('Dual-engine'))
   t.end()
 })

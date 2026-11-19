@@ -1,0 +1,84 @@
+# The laptop stack (spec 3.8). The launcher starts each container with
+# `docker compose run --rm -T --name <name> <service>` and writes its secrets to stdin; nothing here
+# carries a secret. Pass-through variables use the list form (`- NAME`): set in the launcher's
+# environment, they are passed; unset, they are absent.
+name: slack-review-bot
+
+services:
+  orchestrator:
+    image: ${SRB_IMAGE:-slack-review-bot:local}
+    command: ["orchestrator"]
+    networks: [jobs, egress]
+    volumes:
+      - orchestrator-state:/var/lib/slack-review-bot/state
+      - runs:/var/lib/slack-review-bot/runs
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stdin_open: true
+    mem_limit: 512m
+    environment:
+      - SLACK_CHANNEL_IDS
+      - SLACK_IGNORE_USER_IDS
+      - REVIEW_ENGINES
+      - ENGINE_ORDER
+      - ENGINE_SCHEDULE
+      - CONCURRENCY
+      - RUN_TIMEOUT_MS
+      - STALL_MAX_MS
+      - STALL_BACKOFF_MS
+      - SHUTDOWN_DRAIN_MS
+      - WORKER_IDLE_EXIT_MS
+      - REPLAY_ENABLED
+      - REPLAY_MAX_AGE_MS
+      - REPLAY_MAX_MESSAGES
+      - REPLAY_MAX_REQUESTS
+      - CATCHUP_INTERVAL_MS
+      - CATCHUP_ON_RECONNECT
+      - SLACK_REQUEST_TIMEOUT_MS
+      - REMOVE_ACK_ON_COMPLETE
+      - USAGE_REPLY_ENABLED
+      - ACK_EMOJI
+      - QUEUED_EMOJI
+      - PASS_EMOJI
+      - FINDINGS_EMOJI
+      - ERROR_EMOJI
+      - APPROVAL_NOT_COUNTED_EMOJI
+      - APPROVAL_PARTIAL_EMOJI
+      - HEAD_MOVED_EMOJI
+      - HUMAN_REVIEW_EMOJI
+      - ROLE_GH_LOGIN
+      - OPERATOR_GH_LOGIN
+
+  worker:
+    image: ${SRB_IMAGE:-slack-review-bot:local}
+    command: ["worker"]
+    networks: [jobs, egress]
+    read_only: false
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stdin_open: true
+    mem_limit: ${WORKER_MEMORY:-6g}
+    environment:
+      - ENGINE_AUTH=bedrock
+      - ORCHESTRATOR_URL=http://slack-review-bot-orchestrator:8080
+      - npm_config_userconfig=/home/bot/.npmrc-worker
+      - BEDROCK_REGION
+      - CODEX_BEDROCK_MODEL
+      - CLAUDE_BEDROCK_MODEL
+      - CODEX_BEDROCK_CONTEXT_WINDOW
+      - RUN_TIMEOUT_MS
+      - WORKER_IDLE_EXIT_MS
+      - CODEX_ENV_PASSTHROUGH
+      - DISABLE_GIT_SIGNING
+      - ROLE_GH_LOGIN
+      - OPERATOR_GH_LOGIN
+
+networks:
+  jobs:
+    internal: true
+  egress: {}
+
+volumes:
+  orchestrator-state: {}
+  runs: {}

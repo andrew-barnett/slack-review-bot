@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Thin wrapper around the TypeScript launcher (ruling 9). Usage: scripts/launcher [doctor orchestrator|worker]
+#
+# Loads the non-secret settings file here, not in the LaunchAgent, so every entry path (launchd,
+# and a terminal `scripts/launcher doctor worker`) sees the same settings, including the required
+# ROLE_GH_LOGIN and OPERATOR_GH_LOGIN. A file naming a secret variable is refused, as in
+# scripts/install-launcher.sh: secrets come from Secrets Manager only.
+set -euo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." > /dev/null 2>&1 && pwd)"
+CONF="${SLACK_REVIEW_BOT_LAUNCHER_CONF:-${HOME}/.config/slack-review-bot/launcher.conf}"
+if [ ! -f "${REPO}/dist/launcher.js" ]; then
+    echo "ERROR: ${REPO}/dist/launcher.js not found. Run 'npm ci && npm run build' first." >&2
+    exit 1
+fi
+# shellcheck source=launcher-conf-check.sh
+. "${REPO}/scripts/launcher-conf-check.sh"
+if [ -f "${CONF}" ]; then
+    if conf_sets_secret "${CONF}"; then
+        echo "ERROR: ${CONF} sets a secret variable; secrets come from Secrets Manager only." >&2
+        exit 1
+    fi
+    set -a
+    # shellcheck source=/dev/null
+    . "${CONF}"
+    set +a
+fi
+exec node "${REPO}/dist/launcher.js" "$@"

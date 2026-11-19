@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "defaultMode": "dontAsk",
+    "deny": [
+      "__DENY_READ_RULES__",
+      "__DENY_EDIT_RULES__",
+      "Edit(/__WORKSPACE_ROOT__/**)"
+    ]
+  },
+  "sandbox": {
+    "enabled": false
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "python3 \"__PROFILE_DIR__/hooks/block-secret-reads.py\"" }
+        ]
+      }
+    ]
+  }
+}

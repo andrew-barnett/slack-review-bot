@@ -235,6 +235,7 @@ export function selectReviewRunner(
   deps: RunnerDeps = {},
   available: boolean = DUAL_MODE_AVAILABLE
 ): (request: ReviewRequest) => Promise<ReviewOutcome> {
+  if (config.runtime === 'container') return makeContainerReviewRunner(config, deps, available)
   if (!isDualMode(config)) {
     return makeReviewRunner(config, deps.log, runCodexReview, deps.reviews, deps.registry, deps.refreshAuth, deps.engineAuth)
   }
@@ -265,5 +266,42 @@ export function selectReviewRunner(
     log,
     reviews: deps.reviews,
     isShuttingDown: deps.isShuttingDown,
+  })
+}
+
+/**
+ * The container runtime's runner (spec 3.2, D8): always the dual runner, whose engines run in worker
+ * containers through the remote run functions. Single mode is one engine with approvals off; dual
+ * mode stays behind DUAL_MODE_AVAILABLE. The orchestrator holds no engine credential, so engine auth
+ * and the CodeArtifact refresh are refused rather than ignored.
+ */
+export function makeContainerReviewRunner(
+  config: ReviewConfig,
+  deps: RunnerDeps,
+  available: boolean = DUAL_MODE_AVAILABLE
+): (request: ReviewRequest) => Promise<ReviewOutcome> {
+  assertModeAvailable(config, available)
+  const runCodex = deps.engineDeps?.runCodex
+  const runClaude = deps.engineDeps?.runClaude
+  if (!runCodex || !runClaude) throw new Error('RUNTIME=container needs the remote run functions')
+  if (deps.engineAuth || deps.refreshAuth) {
+    throw new Error('RUNTIME=container: the orchestrator holds no engine credential; the launcher mints them for workers')
+  }
+  if (!deps.listChangedFiles) throw new Error('RUNTIME=container needs listChangedFiles through the approver token')
+  if (!deps.gh && !config.approverGhToken) throw new Error('RUNTIME=container requires APPROVER_GH_TOKEN')
+  const log = deps.log ?? (() => {})
+  const engineDeps: EngineDeps = { runCodex, runClaude, log, registry: deps.registry }
+  const makers = { codex: makeCodexEngine, claude: makeClaudeEngine }
+  return makeDualReviewRunner({
+    gh: deps.gh ?? makeApproverGitHub(config.approverGhToken),
+    engines: config.engineOrder.map(name => makers[name](config, engineDeps)),
+    schedule: config.engineSchedule,
+    worktreeRoot: config.worktreeRoot,
+    listChangedFiles: deps.listChangedFiles,
+    runIdFor,
+    log,
+    reviews: deps.reviews,
+    isShuttingDown: deps.isShuttingDown,
+    approvals: isDualMode(config),
   })
 }

@@ -107,7 +107,7 @@ export function renderError(urls: string[], error: unknown): string {
 }
 
 /** Worst first: a mixed request takes the first of these that any PR has (spec 5.9). */
-export const DUAL_SEVERITY: readonly PrOutcome[] = ['error', 'blocked', 'findings', 'headMoved', 'cleanNotCounted', 'approvedPartial', 'approved']
+export const DUAL_SEVERITY: readonly PrOutcome[] = ['error', 'blocked', 'findings', 'headMoved', 'clean', 'cleanNotCounted', 'approvedPartial', 'approved']
 
 /** The worst outcome across a dual request's PRs; `error` for an empty list. */
 export function worstOutcome(outcomes: PrOutcome[]): PrOutcome {
@@ -119,6 +119,7 @@ const DUAL_OUTCOME_TEXT: Record<PrOutcome, string> = {
   approved: '*approved*',
   approvedPartial: '*approved (partial)*',
   cleanNotCounted: '*clean, approval would not count*',
+  clean: '*clean (report-only comment)*',
   findings: '*findings*',
   blocked: '*blocked*',
   error: '*error, not approved*',
@@ -151,5 +152,8 @@ function dualLines(pr: DualPrReport): string[] {
  */
 export function renderDualThread(report: DualReport): string {
   const total = report.prs.length
-  return [`Dual-engine review of ${total} pull request${total === 1 ? '' : 's'}.`, ...report.prs.flatMap(dualLines)].join('\n')
+  const prs = `${total} pull request${total === 1 ? '' : 's'}`
+  const title =
+    report.engines?.length === 1 ? `${ENGINE_LABEL[report.engines[0]]} review (report-only) of ${prs}.` : `Dual-engine review of ${prs}.`
+  return [title, ...report.prs.flatMap(dualLines)].join('\n')
 }

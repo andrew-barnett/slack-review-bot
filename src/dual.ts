@@ -5,8 +5,8 @@
 // `runReview(request)` contract single mode does, so the job, queue and Slack frame are unchanged.
 
 import type { ApproverGitHub, BotReview, PullRequestInfo } from './approver-github'
-import type { EngineSchedule } from './config'
-import { composeReview, decide, type EnginePass, type GateDecision, type PrOutcome } from './dual-gate'
+import type { EngineName, EngineSchedule } from './config'
+import { composeReview, decide, reportOnly, type EnginePass, type GateDecision, type PrOutcome } from './dual-gate'
 import type { Engine, EngineRunOutcome } from './engine'
 import { runEngines } from './engine-schedule'
 import { GhApiError, GH_COMMAND_TIMEOUT_MS } from './gh-api'
@@ -35,6 +35,8 @@ export interface DualPrReport {
 
 export interface DualReport {
   prs: DualPrReport[]
+  /** The configured engines, in order; the thread title names a lone engine. */
+  engines?: EngineName[]
 }
 
 export interface DualDeps {
@@ -58,6 +60,11 @@ export interface DualDeps {
    * so nothing is posted as the role account; the review replays on the next start.
    */
   isShuttingDown?(): boolean
+  /**
+   * False in container single mode (spec D8): the run is report-only, so an approving decision is
+   * posted as a `clean` COMMENT. Defaults to true.
+   */
+  approvals?: boolean
 }
 
 type Prepared =
@@ -207,7 +214,7 @@ export function alreadyReviewedOutcome(
   }
   const warnings =
     decision.event === 'COMMENT' && approvedStands
-      ? [`an earlier approval by the bot at ${short(pinnedSha)} still stands, although this review found ${decision.outcome === 'findings' ? 'blocking findings' : 'that the approval would not count'}`]
+      ? [`an earlier approval by the bot at ${short(pinnedSha)} still stands, although this review found ${decision.outcome === 'findings' ? 'blocking findings' : decision.outcome === 'clean' ? 'the PR clean in report-only mode' : 'that the approval would not count'}`]
       : []
   return { outcome: decision.outcome, reason: stands, warnings }
 }
@@ -233,7 +240,8 @@ export async function finishPr(
     return { ...report, outcome: 'headMoved', reason: `head moved during review (${short(pinnedSha)} → ${short(live)}); re-request` }
   }
 
-  const decision = decide(passes, eligibility)
+  const gate = decide(passes, eligibility, deps.engines.map(e => e.name))
+  const decision = deps.approvals === false ? reportOnly(gate) : gate
   if (!decision.event) return { ...report, outcome: decision.outcome }
   if (deps.isShuttingDown?.()) return { ...report, outcome: 'error', reason: SHUTDOWN_REASON }
 
@@ -312,7 +320,8 @@ export function combineUsage(outcomes: EngineRunOutcome[]): RunUsage {
 
 /** The v1-shaped result, so logs and the CLI keep a familiar summary of a dual run. */
 function legacyResult(report: DualPrReport): PullRequestResult {
-  const passed = report.outcome === 'approved' || report.outcome === 'approvedPartial' || report.outcome === 'cleanNotCounted'
+  const passed =
+    report.outcome === 'approved' || report.outcome === 'approvedPartial' || report.outcome === 'cleanNotCounted' || report.outcome === 'clean'
   return {
     url: report.url,
     status: passed ? 'passed' : report.outcome === 'findings' ? 'findings' : 'blocked',
@@ -391,6 +400,6 @@ export function makeDualReviewRunner(deps: DualDeps): (request: ReviewRequest) =
 
     const prs = prList.map(pr => reports.get(pr.url)!)
     deps.log('dual.done', { runId, outcomes: prs.map(r => `${r.url}=${r.outcome}`) })
-    return { result: { results: prs.map(legacyResult) }, usage: combineUsage(outcomes), dual: { prs } }
+    return { result: { results: prs.map(legacyResult) }, usage: combineUsage(outcomes), dual: { prs, engines: deps.engines.map(e => e.name) } }
   }
 }

@@ -29,6 +29,22 @@ export interface AwsCredentials {
   expiration?: string
 }
 
+/**
+ * The environment an `aws` command runs with when it must act as exactly one session: PATH and HOME,
+ * the session's keys and region, and every profile file switched off, so no profile, config or
+ * credentials file can substitute another identity. Used by the worker doctor and the launcher.
+ */
+export function awsSessionEnv(base: NodeJS.ProcessEnv, creds: AwsCredentials, region: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { PATH: base.PATH, HOME: base.HOME }
+  env.AWS_CONFIG_FILE = '/dev/null'
+  env.AWS_SHARED_CREDENTIALS_FILE = '/dev/null'
+  env.AWS_REGION = region
+  env.AWS_ACCESS_KEY_ID = creds.accessKeyId
+  env.AWS_SECRET_ACCESS_KEY = creds.secretAccessKey
+  if (creds.sessionToken) env.AWS_SESSION_TOKEN = creds.sessionToken
+  return env
+}
+
 /** What one engine attempt needs to reach its model on Bedrock. */
 export interface BedrockAuth {
   region: string

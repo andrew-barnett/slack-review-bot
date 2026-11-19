@@ -17,6 +17,11 @@ export type EngineName = 'codex' | 'claude'
 /** Whether a dual run starts both engines at once or one after the other. */
 export type EngineSchedule = 'parallel' | 'serial'
 /**
+ * Where the bot runs: the launchd daemon (the default), or the orchestrator and one-shot worker
+ * containers (https://github.com/andrew-barnett/slack-review-bot/issues/70).
+ */
+export type Runtime = 'launchd' | 'container'
+/**
  * How the engines reach their models: the operator's own subscriptions (Codex's ChatGPT login and
  * Claude's OAuth token), or AWS Bedrock with short-lived credentials that can only invoke models.
  */
@@ -143,6 +148,14 @@ export interface ReviewConfig {
   claudeBin: string
   /** Dedicated Claude config dir for the engine (Plan 2). */
   claudeConfigDir: string
+  /** RUNTIME: the launchd daemon (default) or the orchestrator and worker containers. */
+  runtime: Runtime
+  /** Container runtime: a worker with no job after this long exits; its ticket lives one minute longer. */
+  workerIdleExitMs: number
+  /** Container runtime, worker side: the orchestrator's job server. */
+  orchestratorUrl: string
+  /** Container runtime, orchestrator side: the job server's port on the internal network. */
+  jobPort: number
   /**
    * How the engines authenticate to their models (issue #69). `subscription` (the default) changes
    * nothing; `bedrock` routes both engines through AWS Bedrock with short-lived credentials.
@@ -366,8 +379,18 @@ export function looksLikeUserId(id: string): boolean {
   return /^[UW][A-Z0-9]{2,}$/.test(id)
 }
 
-/** Parse REVIEW_ENGINES: unset means Codex alone; the only other accepted shape is both engines. */
-export function parseEngines(raw: string | undefined): EngineName[] {
+/** Parse RUNTIME: unset means the launchd daemon. */
+export function parseRuntime(raw: string | undefined): Runtime {
+  if (raw === undefined || raw.trim() === '') return 'launchd'
+  if (raw === 'launchd' || raw === 'container') return raw
+  throw new Error(`RUNTIME must be "launchd" or "container" (got "${raw}")`)
+}
+
+/**
+ * Parse REVIEW_ENGINES: unset means Codex alone; the other accepted shape is both engines. In the
+ * container runtime, single mode may also be Claude alone (spec D8).
+ */
+export function parseEngines(raw: string | undefined, runtime: Runtime = 'launchd'): EngineName[] {
   const list = parseList(raw)
   if (list.length === 0) return ['codex']
   for (const name of list) {
@@ -376,8 +399,13 @@ export function parseEngines(raw: string | undefined): EngineName[] {
     }
   }
   const shape = [...list].sort().join(',')
-  if (list.length !== new Set(list).size || (shape !== 'codex' && shape !== 'claude,codex')) {
-    throw new Error(`REVIEW_ENGINES must be "codex" or "codex,claude" (got "${raw}")`)
+  const shapes = runtime === 'container' ? ['codex', 'claude', 'claude,codex'] : ['codex', 'claude,codex']
+  if (list.length !== new Set(list).size || !shapes.includes(shape)) {
+    throw new Error(
+      runtime === 'container'
+        ? `REVIEW_ENGINES must be "codex", "claude" or "codex,claude" (got "${raw}")`
+        : `REVIEW_ENGINES must be "codex" or "codex,claude" (got "${raw}"); "claude" alone needs RUNTIME=container`
+    )
   }
   return list as EngineName[]
 }
@@ -506,8 +534,12 @@ function loadBedrockConfig(env: NodeJS.ProcessEnv): BedrockConfig {
 
 export function loadReviewConfig(env: NodeJS.ProcessEnv = process.env): ReviewConfig {
   const home = env.HOME || os.homedir()
-  const reviewEngines = parseEngines(env.REVIEW_ENGINES)
+  const runtime = parseRuntime(env.RUNTIME)
+  const reviewEngines = parseEngines(env.REVIEW_ENGINES, runtime)
   const dual = reviewEngines.length > 1
+  // The container runtime posts every review as the role account (spec D8), so the role tokens are
+  // read in single mode too: the orchestrator receives the approver token, a worker the engine token.
+  const container = runtime === 'container'
   const config: ReviewConfig = {
     ackEmoji: env.ACK_EMOJI || 'eyes',
     queuedEmoji: env.QUEUED_EMOJI || 'hourglass_flowing_sand',
@@ -553,10 +585,14 @@ export function loadReviewConfig(env: NodeJS.ProcessEnv = process.env): ReviewCo
     // single-engine install from starting.
     engineSchedule: dual ? parseSchedule(env.ENGINE_SCHEDULE) : lenientSchedule(env.ENGINE_SCHEDULE),
     engineOrder: parseEngineOrder(env.ENGINE_ORDER, reviewEngines),
-    approverGhToken: dual ? env[APPROVER_TOKEN_VAR] ?? '' : '',
-    engineGhToken: dual ? env[ENGINE_TOKEN_VAR] ?? '' : '',
+    approverGhToken: dual || container ? env[APPROVER_TOKEN_VAR] ?? '' : '',
+    engineGhToken: dual || container ? env[ENGINE_TOKEN_VAR] ?? '' : '',
     claudeBin: env.CLAUDE_BIN || 'claude',
     claudeConfigDir: env.CLAUDE_CONFIG_DIR_REVIEW || path.join(home, '.claude-review-bot'),
+    runtime,
+    workerIdleExitMs: parsePositiveInt(env.WORKER_IDLE_EXIT_MS, 10 * 60 * 1000),
+    orchestratorUrl: env.ORCHESTRATOR_URL || 'http://slack-review-bot-orchestrator:8080',
+    jobPort: parsePositiveInt(env.JOB_PORT, 8080),
     ...loadBedrockConfig(env),
   }
   // A non-approval must never wear the approval stamp, in any mode.
@@ -567,7 +603,9 @@ export function loadReviewConfig(env: NodeJS.ProcessEnv = process.env): ReviewCo
   ] as const) {
     if (value === config.passEmoji) throw new Error(`${name} must differ from PASS_EMOJI (got "${value}")`)
   }
-  if (dual) {
+  // In the container runtime no process holds both tokens; the launcher checks they differ (spec 3.2),
+  // the orchestrator requires the approver token and the worker the engine token.
+  if (dual && !container) {
     if (!config.approverGhToken) throw new Error(`${APPROVER_TOKEN_VAR} is required when REVIEW_ENGINES=codex,claude`)
     if (!config.engineGhToken) throw new Error(`${ENGINE_TOKEN_VAR} is required when REVIEW_ENGINES=codex,claude`)
     if (config.approverGhToken === config.engineGhToken) {

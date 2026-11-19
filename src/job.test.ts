@@ -608,3 +608,13 @@ test('runJob does not stamp a clean dual result when a PR was gated', async t =>
   t.ok(rec.threads.some(text => text.startsWith('Dual-engine review')), 'the dual thread is still posted')
   t.end()
 })
+
+// Ruling 2: a report-only clean result counts as a pass in `status` and reacts with the
+// not-counted emoji, never the approval stamp.
+test('runJob reacts to a report-only clean result without the approval stamp', async t => {
+  const rec = dualRecorder(dualReport('clean'))
+  t.equal(await runJob(request, emoji, rec.deps), 'pass')
+  t.deepEqual(rec.added, ['eyes', 'white_circle'])
+  t.notOk(rec.added.includes('approved_stamp'))
+  t.end()
+})

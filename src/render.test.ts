@@ -196,3 +196,17 @@ test('renderThread escapes a summary containing Slack control syntax', t => {
   t.ok(text.includes('<https://github.com/o/r/pull/1|o/r#1>'))
   t.end()
 })
+
+// A one-engine (report-only) thread names its engine and says it is report-only, so nobody reads a
+// clean result as an approval.
+test('renderDualThread titles a single-engine report-only run', t => {
+  const text = renderDualThread({
+    engines: ['claude'],
+    prs: [{ url: 'https://github.com/o/r/pull/1', outcome: 'clean', passes: [], warnings: [] }],
+  })
+  t.ok(text.startsWith('Claude review (report-only) of 1 pull request.'))
+  t.ok(text.includes('*clean (report-only comment)*'))
+  t.equal(worstOutcome(['clean', 'findings']), 'findings')
+  t.equal(worstOutcome(['clean']), 'clean')
+  t.end()
+})

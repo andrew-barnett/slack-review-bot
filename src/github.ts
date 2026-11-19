@@ -47,11 +47,24 @@ export function makeGitHubEffects(
  * listing changed files stays a read with the existing effect.
  */
 export function makeJobGitHubEffects(
-  config: Pick<ReviewConfig, 'reviewEngines'>,
+  config: Pick<ReviewConfig, 'reviewEngines'> & Partial<Pick<ReviewConfig, 'runtime'>>,
   approver: ApproverGitHub | undefined,
   base: Pick<JobDeps, 'listChangedFiles' | 'postPrComment'> = makeGitHubEffects()
 ): Pick<JobDeps, 'listChangedFiles' | 'postPrComment'> {
-  if (!isDualMode(config)) return base
+  // The container runtime posts everything as the role account, in single mode too (spec D8).
+  if (!isDualMode(config) && config.runtime !== 'container') return base
   if (!approver) throw new Error('dual mode needs the role-account client for the human-gate comment')
   return { listChangedFiles: base.listChangedFiles, postPrComment: (pr, body) => approver.postIssueComment(pr, body) }
+}
+
+/**
+ * The two gate effects authenticated as the role account: the approver token reaches each `gh` call
+ * through that call's env only. The orchestrator container has no gh login (spec 3.2), so this is
+ * how it lists changed files and posts the gate comment.
+ */
+export function makeApproverGitHubEffects(
+  token: string,
+  run: GhRunner = defaultRunner('gh')
+): Pick<JobDeps, 'listChangedFiles' | 'postPrComment'> {
+  return makeGitHubEffects('gh', (args, opts = {}) => run(args, { ...opts, env: { ...process.env, ...opts.env, GH_TOKEN: token } }))
 }
