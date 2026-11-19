@@ -386,7 +386,8 @@ test('loadReviewConfig defaults to subscription auth and captures nothing', t =>
   const c = loadReviewConfig({ ...STATIC_KEYS })
   t.equal(c.engineAuth, 'subscription')
   t.equal(c.bedrockRegion, 'us-east-2')
-  t.equal(c.codexBedrockModel, 'us.openai.gpt-5.5')
+  t.equal(c.codexBedrockModel, 'openai.gpt-5.5')
+  t.equal(c.codexBedrockProject, '', 'no default project: it is account-specific')
   t.equal(c.claudeBedrockModel, 'us.anthropic.claude-opus-5-5')
   t.equal(c.engineRoleArn, '')
   t.equal(c.engineAwsProfile, '')
@@ -405,7 +406,7 @@ test('loadReviewConfig rejects an unknown ENGINE_AUTH naming the allowed values'
 // A subscription install with a stale, invalid Bedrock value must still start: validation is
 // bedrock-only, so the default mode's behaviour cannot regress.
 test('loadReviewConfig ignores invalid Bedrock values in subscription mode', t => {
-  t.doesNotThrow(() => loadReviewConfig({ ENGINE_ROLE_ARN: 'nonsense', BEDROCK_REGION: 'us east"', CODEX_BEDROCK_CONTEXT_WINDOW: 'x' }))
+  t.doesNotThrow(() => loadReviewConfig({ ENGINE_ROLE_ARN: 'nonsense', BEDROCK_REGION: 'us east"', CODEX_BEDROCK_CONTEXT_WINDOW: 'x', CODEX_BEDROCK_PROJECT: 'Not A Project' }))
   t.end()
 })
 
@@ -414,10 +415,11 @@ test('loadReviewConfig ignores invalid Bedrock values in subscription mode', t =
 test('loadReviewConfig reads bedrock role mode', t => {
   const c = loadReviewConfig({
     ENGINE_AUTH: 'bedrock',
+    CODEX_BEDROCK_PROJECT: 'proj_testproject123',
     ENGINE_ROLE_ARN: ENGINE_ROLE,
     ENGINE_AWS_PROFILE: 'operator',
     BEDROCK_REGION: 'us-west-2',
-    CODEX_BEDROCK_MODEL: 'us.openai.gpt-5.5-mini',
+    CODEX_BEDROCK_MODEL: 'openai.gpt-5.5-mini',
     CLAUDE_BEDROCK_MODEL: 'us.anthropic.claude-sonnet-5',
     CODEX_BEDROCK_CONTEXT_WINDOW: '272000',
     ...STATIC_KEYS,
@@ -426,7 +428,8 @@ test('loadReviewConfig reads bedrock role mode', t => {
   t.equal(c.engineRoleArn, ENGINE_ROLE)
   t.equal(c.engineAwsProfile, 'operator')
   t.equal(c.bedrockRegion, 'us-west-2')
-  t.equal(c.codexBedrockModel, 'us.openai.gpt-5.5-mini')
+  t.equal(c.codexBedrockModel, 'openai.gpt-5.5-mini')
+  t.equal(c.codexBedrockProject, 'proj_testproject123')
   t.equal(c.claudeBedrockModel, 'us.anthropic.claude-sonnet-5')
   t.equal(c.codexBedrockContextWindow, 272000)
   t.equal(c.engineAwsStatic, undefined, 'role mode does not capture static keys')
@@ -438,7 +441,7 @@ test('loadReviewConfig reads bedrock role mode', t => {
 test('loadReviewConfig rejects a malformed ENGINE_ROLE_ARN without echoing it', t => {
   for (const bad of ['arn:aws:iam::123:role/x', 'arn:aws:iam::123456789012:user/x', 'paste-of-something-secret']) {
     try {
-      loadReviewConfig({ ENGINE_AUTH: 'bedrock', ENGINE_ROLE_ARN: bad })
+      loadReviewConfig({ ENGINE_AUTH: 'bedrock', CODEX_BEDROCK_PROJECT: 'proj_testproject123', ENGINE_ROLE_ARN: bad })
       t.fail(`should reject ${bad}`)
     } catch (error) {
       t.ok(/ENGINE_ROLE_ARN is not an IAM role ARN/.test((error as Error).message))
@@ -451,21 +454,21 @@ test('loadReviewConfig rejects a malformed ENGINE_ROLE_ARN without echoing it', 
 // Static mode (the future container case): with no role, both keys must be present, and an
 // optional session token is captured too.
 test('loadReviewConfig captures static engine credentials when no role is set', t => {
-  const c = loadReviewConfig({ ENGINE_AUTH: 'bedrock', ...STATIC_KEYS, AWS_SESSION_TOKEN: 'fake-session-' + 'abcdef' })
+  const c = loadReviewConfig({ ENGINE_AUTH: 'bedrock', CODEX_BEDROCK_PROJECT: 'proj_testproject123', ...STATIC_KEYS, AWS_SESSION_TOKEN: 'fake-session-' + 'abcdef' })
   t.deepEqual(c.engineAwsStatic, {
     accessKeyId: STATIC_KEYS.AWS_ACCESS_KEY_ID,
     secretAccessKey: STATIC_KEYS.AWS_SECRET_ACCESS_KEY,
     sessionToken: 'fake-session-abcdef',
   })
-  t.throws(() => loadReviewConfig({ ENGINE_AUTH: 'bedrock', AWS_ACCESS_KEY_ID: STATIC_KEYS.AWS_ACCESS_KEY_ID }), /ENGINE_ROLE_ARN, or static/)
-  t.throws(() => loadReviewConfig({ ENGINE_AUTH: 'bedrock' }), /ENGINE_ROLE_ARN, or static/)
+  t.throws(() => loadReviewConfig({ ENGINE_AUTH: 'bedrock', CODEX_BEDROCK_PROJECT: 'proj_testproject123', AWS_ACCESS_KEY_ID: STATIC_KEYS.AWS_ACCESS_KEY_ID }), /ENGINE_ROLE_ARN, or static/)
+  t.throws(() => loadReviewConfig({ ENGINE_AUTH: 'bedrock', CODEX_BEDROCK_PROJECT: 'proj_testproject123' }), /ENGINE_ROLE_ARN, or static/)
   t.end()
 })
 
 // Region and model IDs are spliced into Codex's TOML `-c` overrides; a quote or space would let a
 // config value inject an extra override (for example a sandbox change).
 test('loadReviewConfig rejects region and model IDs unsafe for TOML', t => {
-  const base = { ENGINE_AUTH: 'bedrock', ENGINE_ROLE_ARN: ENGINE_ROLE }
+  const base = { ENGINE_AUTH: 'bedrock', ENGINE_ROLE_ARN: ENGINE_ROLE, CODEX_BEDROCK_PROJECT: 'proj_testproject123' }
   t.throws(() => loadReviewConfig({ ...base, BEDROCK_REGION: 'us-east-2"' }), /BEDROCK_REGION/)
   t.throws(() => loadReviewConfig({ ...base, CODEX_BEDROCK_MODEL: 'x", sandbox_mode="danger' }), /CODEX_BEDROCK_MODEL/)
   t.throws(() => loadReviewConfig({ ...base, CLAUDE_BEDROCK_MODEL: 'a b' }), /CLAUDE_BEDROCK_MODEL/)
@@ -478,15 +481,40 @@ test('loadReviewConfig rejects region and model IDs unsafe for TOML', t => {
 // and the CodeArtifact login (which needs the operator's own profile) would run as the engine role.
 // In every other mode the AWS variables are the operator's and must be left alone.
 test('scrubDaemonSecrets removes static engine keys only when they were captured', t => {
-  const captured = loadReviewConfig({ ENGINE_AUTH: 'bedrock', ...STATIC_KEYS, AWS_SESSION_TOKEN: 'fake-session-' + 'abcdef' })
+  const captured = loadReviewConfig({ ENGINE_AUTH: 'bedrock', CODEX_BEDROCK_PROJECT: 'proj_testproject123', ...STATIC_KEYS, AWS_SESSION_TOKEN: 'fake-session-' + 'abcdef' })
   const env: NodeJS.ProcessEnv = { ...STATIC_KEYS, AWS_SESSION_TOKEN: 'x', AWS_PROFILE: 'operator', PATH: '/bin' }
   scrubDaemonSecrets(env, captured)
   t.deepEqual(env, { AWS_PROFILE: 'operator', PATH: '/bin' }, 'the three key variables are gone')
 
-  for (const config of [loadReviewConfig({}), loadReviewConfig({ ENGINE_AUTH: 'bedrock', ENGINE_ROLE_ARN: ENGINE_ROLE })]) {
+  for (const config of [loadReviewConfig({}), loadReviewConfig({ ENGINE_AUTH: 'bedrock', ENGINE_ROLE_ARN: ENGINE_ROLE, CODEX_BEDROCK_PROJECT: 'proj_testproject123' })]) {
     const kept: NodeJS.ProcessEnv = { ...STATIC_KEYS, PATH: '/bin' }
     scrubDaemonSecrets(kept, config)
     t.deepEqual(kept, { ...STATIC_KEYS, PATH: '/bin' }, `${config.engineAuth}/${config.engineRoleArn ? 'role' : 'none'}: AWS variables untouched`)
   }
+  t.end()
+})
+
+// Without the Mantle project, Codex would send no OpenAI-Project header and fall to the account
+// default, whose retention mode rejects OpenAI models; startup must fail naming the variable.
+test('loadReviewConfig requires CODEX_BEDROCK_PROJECT in bedrock mode', t => {
+  t.throws(() => loadReviewConfig({ ENGINE_AUTH: 'bedrock', ENGINE_ROLE_ARN: ENGINE_ROLE }), /CODEX_BEDROCK_PROJECT is required/)
+  t.end()
+})
+
+// The project ID is spliced into a TOML header override; a malformed value (quote, space, wrong
+// prefix, uppercase) must be rejected rather than injecting an extra override.
+test('loadReviewConfig rejects a malformed CODEX_BEDROCK_PROJECT in bedrock mode', t => {
+  const base = { ENGINE_AUTH: 'bedrock', ENGINE_ROLE_ARN: ENGINE_ROLE }
+  for (const bad of ['e5ihwmxmoce7neqplby3', 'proj_', 'proj_ABC', 'proj_a"b', 'proj_a b', 'proj_x"}, sandbox_mode="danger']) {
+    t.throws(() => loadReviewConfig({ ...base, CODEX_BEDROCK_PROJECT: bad }), /CODEX_BEDROCK_PROJECT must look like/, bad)
+  }
+  t.end()
+})
+
+// Subscription mode never validates Bedrock settings, so a stale bad project cannot stop a
+// subscription install from starting.
+test('loadReviewConfig ignores a bad CODEX_BEDROCK_PROJECT in subscription mode', t => {
+  const c = loadReviewConfig({ CODEX_BEDROCK_PROJECT: 'garbage"' })
+  t.equal(c.engineAuth, 'subscription')
   t.end()
 })

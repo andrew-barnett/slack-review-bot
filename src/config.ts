@@ -163,8 +163,14 @@ export interface ReviewConfig {
   engineAuth: EngineAuth
   /** Bedrock mode: the AWS region both engines call Bedrock in. */
   bedrockRegion: string
-  /** Bedrock mode: the model ID Codex uses (a cross-region inference profile). */
+  /** Bedrock mode: the model ID Codex uses on the Bedrock Mantle endpoint (e.g. `openai.gpt-5.5`). */
   codexBedrockModel: string
+  /**
+   * Bedrock mode: the Mantle project Codex calls through, sent as the `OpenAI-Project` header. The
+   * account's bedrock-runtime data-retention mode is `none`, which OpenAI models reject; this project
+   * carries `default`. Account-specific, so there is no default; required in bedrock mode.
+   */
+  codexBedrockProject: string
   /** Bedrock mode: the model ID Claude Code uses (a cross-region inference profile). */
   claudeBedrockModel: string
   /**
@@ -478,11 +484,15 @@ export function scrubDaemonSecrets(env: NodeJS.ProcessEnv, config?: Pick<ReviewC
   }
 }
 
+/** A Bedrock Mantle project ID, as sent in the `OpenAI-Project` header. */
+const BEDROCK_PROJECT_ID = /^proj_[a-z0-9]+$/
+
 type BedrockConfig = Pick<
   ReviewConfig,
   | 'engineAuth'
   | 'bedrockRegion'
   | 'codexBedrockModel'
+  | 'codexBedrockProject'
   | 'claudeBedrockModel'
   | 'codexBedrockContextWindow'
   | 'engineRoleArn'
@@ -498,7 +508,8 @@ function loadBedrockConfig(env: NodeJS.ProcessEnv): BedrockConfig {
   const out: BedrockConfig = {
     engineAuth: parseEngineAuth(env.ENGINE_AUTH),
     bedrockRegion: env.BEDROCK_REGION || 'us-east-2',
-    codexBedrockModel: env.CODEX_BEDROCK_MODEL || 'us.openai.gpt-5.5',
+    codexBedrockModel: env.CODEX_BEDROCK_MODEL || 'openai.gpt-5.5',
+    codexBedrockProject: env.CODEX_BEDROCK_PROJECT ?? '',
     claudeBedrockModel: env.CLAUDE_BEDROCK_MODEL || 'us.anthropic.claude-opus-5-5',
     engineRoleArn: env.ENGINE_ROLE_ARN ?? '',
     engineAwsProfile: env.ENGINE_AWS_PROFILE ?? '',
@@ -510,6 +521,13 @@ function loadBedrockConfig(env: NodeJS.ProcessEnv): BedrockConfig {
     ['CLAUDE_BEDROCK_MODEL', out.claudeBedrockModel],
   ] as const) {
     if (!TOML_SAFE_ID.test(value)) throw new Error(`${name} may contain only letters, digits and . _ : - (got "${value}")`)
+  }
+  // The project ID is not secret, so it is echoed; it is spliced into a TOML override, hence the strict shape.
+  if (!out.codexBedrockProject) {
+    throw new Error('CODEX_BEDROCK_PROJECT is required when ENGINE_AUTH=bedrock (the Bedrock Mantle project ID, proj_...)')
+  }
+  if (!BEDROCK_PROJECT_ID.test(out.codexBedrockProject)) {
+    throw new Error(`CODEX_BEDROCK_PROJECT must look like proj_<lowercase letters and digits> (got "${out.codexBedrockProject}")`)
   }
   const window = parseContextWindow(env.CODEX_BEDROCK_CONTEXT_WINDOW)
   if (window !== undefined) out.codexBedrockContextWindow = window

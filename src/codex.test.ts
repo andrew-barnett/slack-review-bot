@@ -88,7 +88,8 @@ test('runCodexReview applies Bedrock env and overrides only when bedrock is set'
   }) as unknown as Spawner
   const bedrock = {
     region: 'us-east-2',
-    model: 'us.openai.gpt-5.5',
+    model: 'openai.gpt-5.5',
+    project: 'proj_testproject123',
     credentials: { accessKeyId: 'ASIA' + 'TESTTESTTESTTEST', secretAccessKey: 'fake-secret-' + 'xyzxyzxyzxyz', sessionToken: 'fake-session-' + 'xyzxyzxyz' },
   }
   await runCodexReview({ ...runOptions(), bedrock }, spawner, fakeClock().deps).catch(() => undefined)
@@ -99,7 +100,7 @@ test('runCodexReview applies Bedrock env and overrides only when bedrock is set'
   t.equal(withBedrock.env.AWS_SESSION_TOKEN, bedrock.credentials.sessionToken)
   t.equal(withBedrock.env.AWS_REGION, 'us-east-2')
   t.notOk('AWS_PROFILE' in withBedrock.env, 'no profile')
-  t.ok(withBedrock.args.includes('model_provider="amazon-bedrock-runtime"'), 'provider override')
+  t.ok(withBedrock.args.includes('model_provider="amazon-bedrock"'), 'provider override')
   t.ok(withBedrock.args.includes('shell_environment_policy.exclude=["AWS_*"]'), 'the shell exclude is present')
   t.notOk(Object.keys(plain.env).some(k => k.startsWith('AWS_')), 'subscription run has no AWS variables')
   t.notOk(plain.args.includes('-c'), 'subscription run has no overrides')

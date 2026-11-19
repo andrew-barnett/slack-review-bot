@@ -26,6 +26,7 @@ test('orchestratorConfig drops engine credentials from what config sees', t => {
     HOME: '/home/bot',
     ENGINE_GH_TOKEN: 'engine-placeholder',
     ENGINE_AUTH: 'bedrock',
+    CODEX_BEDROCK_PROJECT: 'proj_testproject123',
     AWS_ACCESS_KEY_ID: 'id-placeholder',
     AWS_SECRET_ACCESS_KEY: 'secret-placeholder',
   }

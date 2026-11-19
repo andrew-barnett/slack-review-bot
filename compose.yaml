@@ -65,6 +65,7 @@ services:
       - npm_config_userconfig=/home/bot/.npmrc-worker
       - BEDROCK_REGION
       - CODEX_BEDROCK_MODEL
+      - CODEX_BEDROCK_PROJECT
       - CLAUDE_BEDROCK_MODEL
       - CODEX_BEDROCK_CONTEXT_WINDOW
       - RUN_TIMEOUT_MS

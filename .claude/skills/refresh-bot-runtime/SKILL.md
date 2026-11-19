@@ -10,7 +10,7 @@ The container image is fixed at build time. Four things in it go stale and are r
 | What | Pinned in | Consumed by |
 |---|---|---|
 | `review-pr` skill + `block-secret-reads.py` hook | `docker/aqua-skills.ref` (one 40-char aqua-skills SHA) | `scripts/build-image.sh` → Dockerfile `COPY --from=aqua` → `/opt/aqua-skills/` |
-| Bedrock model IDs | defaults in `src/config.ts` (`codexBedrockModel`, `claudeBedrockModel`); overridable per install via `CODEX_BEDROCK_MODEL` / `CLAUDE_BEDROCK_MODEL` / `CODEX_BEDROCK_CONTEXT_WINDOW` in `launcher.conf` | `src/bedrock-auth.ts` (`ANTHROPIC_MODEL` for Claude; `-c model=...` for Codex) |
+| Bedrock model IDs | defaults in `src/config.ts` (`codexBedrockModel`, `claudeBedrockModel`); overridable per install via `CODEX_BEDROCK_MODEL` / `CODEX_BEDROCK_PROJECT` / `CLAUDE_BEDROCK_MODEL` / `CODEX_BEDROCK_CONTEXT_WINDOW` in `launcher.conf` | `src/bedrock-auth.ts` (`ANTHROPIC_MODEL` for Claude; `-c model=...` for Codex) |
 | CLI versions | `Dockerfile` `ARG GH_VERSION`, `AWSCLI_VERSION`, `CODEX_VERSION`, `CLAUDE_CODE_VERSION` | the image |
 | Base image | `Dockerfile` `FROM node:22-bookworm-slim` (both stages) | the image |
 
@@ -36,17 +36,18 @@ Do only the sections the request needs, but always finish with **Verify** and **
 
 ## 2. Bedrock models
 
-The engine role (`SlackReviewBotEngineRole`, policy `iam/policies/SlackReviewBotBedrockInvoke.ts` in trade-platform/pulumi) may invoke only `anthropic.*` and `openai.*` foundation models and `us.anthropic.*` / `us.openai.*` inference profiles in us-east-1/us-east-2/us-west-2, plus Codex's `project/default`. A model outside those patterns needs a pulumi PR first (another person approves the deploy); say so and stop.
+The engine role (`SlackReviewBotEngineRole`, policy `iam/policies/SlackReviewBotBedrockInvoke.ts` in trade-platform/pulumi) may invoke only `anthropic.*` foundation models and `us.anthropic.*` inference profiles in us-east-1/us-east-2/us-west-2 on bedrock-runtime (Claude). Codex needs `bedrock-mantle:CreateInference` on the bot's Mantle project (`CODEX_BEDROCK_PROJECT`), conditioned on `bedrock-mantle:Model` = `openai.gpt-*`. A model outside those patterns needs a pulumi PR first (another person approves the deploy); say so and stop.
 
 1. List what is available (operator profile, metadata only):
    ```sh
    aws bedrock list-inference-profiles --region us-east-2 --profile staging --type-equals SYSTEM_DEFINED \
-     --query "inferenceProfileSummaries[?starts_with(inferenceProfileId,'us.anthropic.') || starts_with(inferenceProfileId,'us.openai.')].[inferenceProfileId,status]" --output table
+     --query "inferenceProfileSummaries[?starts_with(inferenceProfileId,'us.anthropic.')].[inferenceProfileId,status]" --output table
    aws bedrock list-foundation-models --region us-east-2 --profile staging \
-     --query "modelSummaries[?(providerName=='Anthropic' || providerName=='OpenAI') && modelLifecycle.status=='ACTIVE'].[modelId,modelName]" --output table
+     --query "modelSummaries[?providerName=='Anthropic' && modelLifecycle.status=='ACTIVE'].[modelId,modelName]" --output table
    ```
+   Those are the Claude candidates. Codex candidates are Bedrock Mantle model IDs (`openai.*`, no `us.` prefix), listed by the Mantle `GET /v1/models` API on `https://bedrock-mantle.<region>.api.aws`. A plain `aws` CLI call cannot do that: the operator lists them with a SigV4-signed request or in the Bedrock console and gives you the IDs.
 2. "Best" means **the cheapest model that is private and good enough at code review**. Apply the gates in this order; a candidate that fails a gate is out, however cheap or smart it is.
-   - **Gate A, available:** a `us.` inference profile exists with status `ACTIVE`, the foundation model's lifecycle is `ACTIVE` (never `LEGACY`), and it is in the engine role's IAM scope (above). Never pick a model from memory or a blog post: it must appear in step 1's output.
+   - **Gate A, available:** for Claude, a `us.` inference profile exists with status `ACTIVE`, the foundation model's lifecycle is `ACTIVE` (never `LEGACY`); for Codex, the `openai.*` ID appears in the operator's Mantle model list. Either must be in the engine role's IAM scope (above). Never pick a model from memory or a blog post: it must appear in step 1's output.
    - **Gate B, private (prompts and code are not logged by or sent to an outside company):**
      - The model must be served by Bedrock itself (first-party serverless inference in AWS), not a Marketplace or partner endpoint run by the vendor. Confirm on the model's AWS model card / Bedrock data-protection documentation, and quote the line you relied on in the PR. If the documentation is ambiguous for a model, it fails the gate; ask the user.
      - Use only `us.` cross-region profiles, so inference stays in US regions.
@@ -64,8 +65,9 @@ The engine role (`SlackReviewBotEngineRole`, policy `iam/policies/SlackReviewBot
      ANTHROPIC_MODEL=<claude-candidate> claude -p "say ok" < /dev/null
    # Codex: expect a final message containing "ok"
    CODEX_HOME="$SCRATCH/codex" AWS_PROFILE=srb-engine codex exec --skip-git-repo-check \
-     -c 'model_provider="amazon-bedrock-runtime"' -c 'model="<codex-candidate>"' \
-     -c 'model_providers.amazon-bedrock-runtime.aws.region="us-east-2"' "say ok" < /dev/null
+     -c 'model_provider="amazon-bedrock"' -c 'model="<codex-candidate>"' \
+     -c 'model_providers.amazon-bedrock.aws.region="us-east-2"' \
+     -c 'model_providers.amazon-bedrock.http_headers={"OpenAI-Project"="<CODEX_BEDROCK_PROJECT>"}' "say ok" < /dev/null
    ```
    Known failures: `AccessDeniedException` naming `aws-marketplace:Subscribe` or a model subscription → the model needs a Marketplace subscription by an account admin; stop and tell the user. `AccessDenied` on `bedrock:InvokeModel` → outside the IAM scope above (pulumi PR). A data-retention/`store` error from Codex → stop and report; don't work around it.
 4. Apply the choice. Either:
@@ -82,7 +84,7 @@ The engine role (`SlackReviewBotEngineRole`, policy `iam/policies/SlackReviewBot
    gh api repos/aws/aws-cli/tags --jq '.[0].name'    # AWS CLI v2 tags are 2.x.y
    ```
 2. Read the release notes between the pinned and the new version of each CLI the bot drives, looking for changes to what the bot depends on:
-   - **codex:** `exec`, `--output-last-message`, `-c` overrides, the `amazon-bedrock-runtime` provider and its `aws.region` key, `shell_environment_policy`, `sandbox_mode`, skills under `~/.codex/skills`.
+   - **codex:** `exec`, `--output-last-message`, `-c` overrides, the `amazon-bedrock` (Mantle) provider, its `aws.region` key and its `http_headers` table, `shell_environment_policy`, `sandbox_mode`, skills under `~/.codex/skills`.
    - **claude:** `-p`, `--output-format stream-json`, `CLAUDE_CODE_USE_BEDROCK` / `ANTHROPIC_MODEL`, settings `permissions`/`sandbox`, hooks registration (checked by `scripts/check-claude-profile.js`).
    - **gh / aws:** only the commands the bot runs (`gh auth status`, `gh api`, `aws sts`, `aws codeartifact get-authorization-token`).
    If any of those changed, update the code that builds those arguments (`src/bedrock-auth.ts`, `src/codex.ts`, `src/claude.ts`, `scripts/claude-profile-lib.js`) with tests, in the same PR.
