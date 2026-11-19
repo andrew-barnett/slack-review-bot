@@ -4,7 +4,7 @@
   "private": true,
   "description": "Slack bot that watches a channel for GitHub PR URLs and runs the Codex $review-pr skill on them, reporting the outcome back as reactions and a thread.",
   "scripts": {
-    "build": "esbuild src/app.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/app.js --sourcemap",
+    "build": "esbuild app=src/app.ts worker=src/worker-main.ts --bundle --platform=node --target=node22 --format=cjs --outdir=dist --sourcemap",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
     "start": "node dist/app.js",
     "dev": "ts-node --compiler-options '{\"module\":\"commonjs\"}' --transpile-only src/app.ts",
