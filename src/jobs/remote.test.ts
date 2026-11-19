@@ -105,3 +105,31 @@ test('a remote stall makes the Codex engine retry with a new job', async t => {
   t.equal(outcome.error, undefined)
   t.end()
 })
+
+// Spec 6 wire: the worker's codexUsage reaches the engine, clamped like Claude's usage. Regression
+// caught: the orchestrator dropping codexUsage, so the ledger could only ever record noUsage for Codex.
+test('remote runCodex returns the worker\'s Codex usage, clamped', async t => {
+  const broker = fakeBroker([
+    { result: clean, tokensUsed: 10, activeMs: 20, codexUsage: { inputTokens: 7, cachedInputTokens: -3, cacheWriteTokens: 0, outputTokens: 3, reasoningTokens: 'x' } },
+  ])
+  const out = await makeRemoteRunners(broker).runCodex(codexOptions)
+  t.deepEqual(out.codexUsage, { inputTokens: 7, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 3, reasoningTokens: 0 })
+  const none = await makeRemoteRunners(fakeBroker([{ result: clean, activeMs: 1 }])).runCodex(codexOptions)
+  t.equal(none.codexUsage, undefined, 'a worker that sent none reports none, not zeros')
+  t.end()
+})
+
+// An unusable result is an output error that still carries what the run claimed to cost. Regression
+// caught: a bad-output failure from a worker reporting no Codex spend.
+test('remote runCodex keeps Codex usage on an unusable result', async t => {
+  const usage = { inputTokens: 5, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, reasoningTokens: 0 }
+  const broker = fakeBroker([{ result: 'not a result', activeMs: 1, codexUsage: usage }])
+  try {
+    await makeRemoteRunners(broker).runCodex(codexOptions)
+    t.fail('an unusable result must throw')
+  } catch (error) {
+    t.ok(error instanceof CodexOutputError)
+    if (error instanceof CodexOutputError) t.deepEqual(error.codexUsage, usage)
+  }
+  t.end()
+})

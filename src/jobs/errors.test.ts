@@ -77,3 +77,29 @@ test('deserializeRunError tolerates hostile shapes', t => {
   t.equal(deserializeRunError({ class: 'Error', message: 'x'.repeat(20_000) }).message.length, 8000, 'messages are capped')
   t.end()
 })
+
+const codexUsage = { inputTokens: 10, cachedInputTokens: 4, cacheWriteTokens: 1, outputTokens: 3, reasoningTokens: 2 }
+
+// Spec 6: every Codex failure carries the turns it completed, across the worker wire too. Regression
+// caught: a stall or timeout in a worker arriving at the orchestrator with no usage, so the ledger
+// records a costly run as free.
+test('Codex errors carry their Codex usage across the wire', t => {
+  t.deepEqual((wire(new CodexStalledError('s', 1, snapshot, codexUsage)) as CodexStalledError).codexUsage, codexUsage)
+  t.deepEqual((wire(new CodexTimeoutError('t', snapshot, codexUsage)) as CodexTimeoutError).codexUsage, codexUsage)
+  t.deepEqual((wire(new CodexOutputError('o', 20, 5, codexUsage)) as CodexOutputError).codexUsage, codexUsage)
+  t.equal((wire(new CodexStalledError('s', 1, snapshot)) as CodexStalledError).codexUsage, undefined, 'no usage stays unknown, not zero')
+  t.end()
+})
+
+// Malformed or buggy worker output: negative or non-numeric fields become 0, never NaN or a negative
+// that would lower recorded spend. Regression caught: an unvalidated field flowing into the ledger.
+test('deserializeRunError clamps malformed Codex usage', t => {
+  const back = deserializeRunError({
+    class: 'CodexOutputError',
+    message: 'm',
+    activeMs: 1,
+    codexUsage: { inputTokens: -1, cachedInputTokens: 'x', outputTokens: 5 },
+  }) as CodexOutputError
+  t.deepEqual(back.codexUsage, { inputTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 5, reasoningTokens: 0 })
+  t.end()
+})

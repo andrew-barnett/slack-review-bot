@@ -21,7 +21,7 @@ import type { PullRequestRef } from './parse-message'
 import type { ActiveReviews } from './progress'
 import { buildPrompt } from './prompt'
 import { reconcileResults } from './schema'
-import { ReviewFailedError, type ReviewOutcome } from './usage'
+import { addCodexUsage, codexTotalTokens, ReviewFailedError, type CodexUsageDetail, type ReviewOutcome } from './usage'
 
 /** Stable id for a run's log file: one per triggering message. */
 export function runIdFor(request: ReviewRequest): string {
@@ -76,6 +76,11 @@ export function makeReviewRunner(
     // for real before it was killed, so a stall-then-success or a give-up must report the sum —
     // reporting only the winning (or final) attempt would understate what the review cost.
     let chargedActiveMs = 0
+    // Codex usage and tokens summed over every attempt, like active time: the spend ledger prices
+    // them (ruling 2). A killed attempt's tokens come from its usage (it printed no total).
+    let codex: CodexUsageDetail | undefined
+    let tokens: number | undefined
+    const withCodex = () => (codex ? { codex } : {})
 
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       // undefined when the schedule is empty, which disables stall detection in the run.
@@ -102,7 +107,7 @@ export function makeReviewRunner(
       } catch (error) {
         log?.('review.auth-failed', { runId: baseRunId, attempt: attempt + 1 })
         throw new ReviewFailedError(
-          { activeMs: chargedActiveMs > 0 ? chargedActiveMs : undefined, attempts: attempt + 1 },
+          { activeMs: chargedActiveMs > 0 ? chargedActiveMs : undefined, attempts: attempt + 1, ...withCodex() },
           new Error(redactSecrets(error instanceof Error ? error.message : String(error)))
         )
       }
@@ -128,12 +133,15 @@ export function makeReviewRunner(
         })
         // Never trust the run to have covered everything it was asked to cover.
         chargedActiveMs += outcome.activeMs
+        codex = addCodexUsage(codex, outcome.codexUsage)
+        if (outcome.tokensUsed !== undefined) tokens = (tokens ?? 0) + outcome.tokensUsed
         return {
           result: reconcileResults(urls, outcome.result),
           usage: {
-            tokensUsed: outcome.tokensUsed,
+            tokensUsed: tokens,
             activeMs: chargedActiveMs,
             attempts: attempt + 1,
+            ...withCodex(),
           },
         }
       } catch (error) {
@@ -143,6 +151,8 @@ export function makeReviewRunner(
           // Charge this attempt's active time whether or not we retry — a stalled attempt that is
           // then retried still cost the time it ran before the kill.
           chargedActiveMs += error.snapshot.activeMs
+          codex = addCodexUsage(codex, error.codexUsage)
+          if (error.codexUsage) tokens = (tokens ?? 0) + codexTotalTokens(error.codexUsage)
           if (!isLast) {
             log?.('review.retry', {
               runId: baseRunId,
@@ -159,7 +169,7 @@ export function makeReviewRunner(
           // carry the sum so the failure thread and the status totals can account for it. A killed
           // run printed no token total, so tokensUsed stays undefined.
           throw new ReviewFailedError(
-            { activeMs: chargedActiveMs, attempts },
+            { activeMs: chargedActiveMs, attempts, ...withCodex() },
             new Error(`Codex stalled on every attempt (${attempts}) and was killed for good — ${error.message}`)
           )
         }
@@ -167,21 +177,23 @@ export function makeReviewRunner(
         // charge it (plus any earlier stalled attempts) rather than reporting no time at all.
         if (error instanceof CodexTimeoutError) {
           chargedActiveMs += error.snapshot.activeMs
-          throw new ReviewFailedError({ activeMs: chargedActiveMs, attempts: attempt + 1 }, error)
+          codex = addCodexUsage(codex, error.codexUsage)
+          throw new ReviewFailedError({ activeMs: chargedActiveMs, attempts: attempt + 1, ...withCodex() }, error)
         }
         // The run completed but its output is unusable. It still printed a token total and spent
         // active time — carry both so a bad-output failure is accounted for, not reported as free.
         if (error instanceof CodexOutputError) {
           chargedActiveMs += error.activeMs
+          codex = addCodexUsage(codex, error.codexUsage)
           throw new ReviewFailedError(
-            { tokensUsed: error.tokensUsed, activeMs: chargedActiveMs, attempts: attempt + 1 },
+            { tokensUsed: error.tokensUsed, activeMs: chargedActiveMs, attempts: attempt + 1, ...withCodex() },
             error
           )
         }
         // A crash has no snapshot for this attempt, but any earlier stalled attempts still ran;
         // report their accumulated time when there is some, and undefined when there is none.
         throw new ReviewFailedError(
-          { activeMs: chargedActiveMs > 0 ? chargedActiveMs : undefined, attempts: attempt + 1 },
+          { activeMs: chargedActiveMs > 0 ? chargedActiveMs : undefined, attempts: attempt + 1, ...withCodex() },
           error
         )
       }

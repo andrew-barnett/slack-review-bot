@@ -470,3 +470,14 @@ test('worker redacts held secret values from every string of the posted result',
   t.notOk(JSON.stringify(g.calls.results[0]).includes(held), 'no held value in an error result')
   t.end()
 })
+
+// Spec 6 wire: the worker sends codexUsage beside tokensUsed. Regression caught: the usage summed from
+// --json staying inside the worker container, invisible to the orchestrator's ledger.
+test('worker sends the Codex usage with the codex outcome', async t => {
+  const h = harness()
+  const codexUsage = { inputTokens: 9, cachedInputTokens: 2, cacheWriteTokens: 0, outputTokens: 4, reasoningTokens: 1 }
+  h.deps.runCodex = async () => ({ result: clean, rawFinalMessage: 'raw', tokensUsed: 16, activeMs: 4, codexUsage })
+  t.equal(await runWorker(h.deps), 'done')
+  t.deepEqual(h.calls.results, [{ ok: true, outcome: { result: clean, tokensUsed: 16, activeMs: 4, codexUsage } }])
+  t.end()
+})

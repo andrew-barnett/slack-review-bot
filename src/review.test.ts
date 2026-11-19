@@ -576,3 +576,41 @@ test('serialized runs concurrent calls one at a time', async t => {
   t.equal(maxRunning, 1)
   t.end()
 })
+
+// Ruling 2: the launchd runner (single mode, no engines list) must carry Codex usage, summed over a
+// stalled attempt and the success, or a bedrock launchd install's ledger records only noUsage. The
+// success tokensUsed is the sum across attempts too (spec 6), matching the summed usage. Regression
+// caught: usage or tokens from the stalled first attempt dropped, or only the last attempt reported.
+test('makeReviewRunner carries Codex usage summed across a stall and the success', async t => {
+  const first = { inputTokens: 100, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 10, reasoningTokens: 0 }
+  const second = { inputTokens: 30, cachedInputTokens: 5, cacheWriteTokens: 0, outputTokens: 3, reasoningTokens: 1 }
+  let calls = 0
+  const fakeRun: typeof runCodexReview = async opts => {
+    calls += 1
+    if (calls === 1) throw new CodexStalledError('stalled', opts.stallTimeoutMs ?? 0, { activeMs: 5000, wallMs: 5000, frozenMs: 0 }, first)
+    return { ...passed(), tokensUsed: 39, codexUsage: second }
+  }
+  const outcome = await makeReviewRunner(config([1000, 2000]), undefined, fakeRun)(request)
+  t.deepEqual(outcome.usage.codex, { inputTokens: 130, cachedInputTokens: 5, cacheWriteTokens: 0, outputTokens: 13, reasoningTokens: 1 })
+  t.equal(outcome.usage.tokensUsed, 110 + 39, 'tokensUsed sums both attempts, matching the summed codex usage')
+  t.end()
+})
+
+// The give-up path must carry every attempt's Codex usage too: a review that stalled twice still spent.
+// Regression caught: a give-up reported as free.
+test('makeReviewRunner keeps Codex usage on a give-up', async t => {
+  const each = { inputTokens: 20, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 2, reasoningTokens: 0 }
+  const fakeRun: typeof runCodexReview = async opts => {
+    throw new CodexStalledError('stalled', opts.stallTimeoutMs ?? 0, { activeMs: 5000, wallMs: 5000, frozenMs: 0 }, each)
+  }
+  try {
+    await makeReviewRunner(config([1000, 2000]), undefined, fakeRun)(request)
+    t.fail('a run that stalls on every attempt must reject')
+  } catch (error) {
+    t.ok(error instanceof ReviewFailedError)
+    if (error instanceof ReviewFailedError) {
+      t.deepEqual(error.usage.codex, { inputTokens: 40, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 4, reasoningTokens: 0 })
+    }
+  }
+  t.end()
+})

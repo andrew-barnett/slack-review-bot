@@ -76,6 +76,8 @@ export interface RunUsage {
   attempts: number
   /** Claude's own figures, when this usage is a Claude engine's. */
   claude?: ClaudeUsageDetail
+  /** Codex's --json figures summed over every attempt, when this usage is a Codex run's (spec 6). */
+  codex?: CodexUsageDetail
   /** Dual mode: each engine's usage. The top-level figures are then the sums across engines. */
   engines?: { engine: EngineName; usage: RunUsage }[]
 }
