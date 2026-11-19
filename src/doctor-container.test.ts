@@ -69,6 +69,9 @@ test('checkGhLoggedOut fails when gh has a stored login', async t => {
   t.notOk(p.envs[0] && 'GH_TOKEN' in p.envs[0], 'GH_TOKEN is not passed to gh')
   t.notOk(p.envs[0] && 'GITHUB_TOKEN' in p.envs[0], 'GITHUB_TOKEN is not passed to gh')
   t.equal(status(await checkGhLoggedOut(probe({}, { 'gh auth': { code: 0, output: 'Logged in to github.com' } }))), 'fail')
+  // A probe that could not run is unknown, never "logged out".
+  t.equal(status(await checkGhLoggedOut(probe({}, { 'gh auth': { code: -1, output: 'Error: spawn gh ENOENT' } }))), 'fail', 'gh missing')
+  t.equal(status(await checkGhLoggedOut(probe({}, { 'gh auth': { code: 1, output: 'failed to read configuration' } }))), 'fail', 'gh failing for another reason')
   t.end()
 })
 

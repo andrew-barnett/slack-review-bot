@@ -69,9 +69,10 @@ export async function checkDaemonSecretsAbsent(probe: ContainerProbe): Promise<C
 export async function checkGhLoggedOut(probe: ContainerProbe): Promise<CheckResult> {
   const name = 'gh logged out'
   const { code, output } = await probe.runCommand('gh', ['auth', 'status'], ghEnvAs(probe.env))
-  return code !== 0
-    ? { name, status: 'ok', detail: 'gh has no stored login (tokens reach gh per call only)' }
-    : { name, status: 'fail', detail: `gh has a stored login: ${firstLine(output)}` }
+  if (code === 1 && /not logged in/i.test(output)) return { name, status: 'ok', detail: 'gh has no stored login (tokens reach gh per call only)' }
+  if (code === 0) return { name, status: 'fail', detail: `gh has a stored login: ${firstLine(output)}` }
+  // gh missing, timed out or failing otherwise: unknown, never clean.
+  return { name, status: 'fail', detail: `gh auth status did not answer (exit ${code}): ${firstLine(output)}` }
 }
 
 export async function checkEngineRole(probe: ContainerProbe, awsEnv: NodeJS.ProcessEnv): Promise<CheckResult> {

@@ -775,6 +775,10 @@ function liveProbe(base: NodeJS.ProcessEnv): ContainerProbe {
 
 /** `doctor --role worker` (spec 3.7): the bundle arrives on stdin exactly as for a real worker. */
 async function workerDoctor(): Promise<CheckResult[]> {
+  // Check the environment the container started with, before the bundle is merged and before
+  // scrubDaemonSecrets deletes APPROVER_GH_TOKEN: scrubbing first would hide exactly the leak this
+  // check exists to catch (a daemon token handed to the container that runs PR code).
+  const daemonSecrets = await checkDaemonSecretsAbsent(liveProbe({ ...process.env }))
   const { WORKER_TICKET: _ticket, ...exported } = await readSecretBundle(process.stdin, WORKER_DOCTOR_BUNDLE)
   Object.assign(process.env, exported)
   const config = loadReviewConfig(process.env)
@@ -785,7 +789,7 @@ async function workerDoctor(): Promise<CheckResult[]> {
   // The worker's profile files live under the image's HOME; these flags select the container checks.
   const claudeArgs = ['--container', '--npmrc', process.env.npm_config_userconfig || '/home/bot/.npmrc-worker']
   return [
-    await checkDaemonSecretsAbsent(probe),
+    daemonSecrets,
     await checkGhLoggedOut(probe),
     await checkEngineRole(probe, awsEnv),
     await checkSecretsDenied(probe, awsEnv, config.bedrockRegion),
