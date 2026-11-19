@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TEMPLATE: scripts/install-launcher.sh substitutes __LABEL__, __LAUNCHER__, __DIR__, __LOG_DIR__,
+  __CONF__ and __PATH_PREFIX__. The conf file holds NON-SECRET settings only (the installer refuses
+  one naming a secret variable); every secret comes from Secrets Manager at start.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>export PATH="__PATH_PREFIX__:$PATH"; export SLACK_REVIEW_BOT_LAUNCHER_CONF="__CONF__"; exec "__LAUNCHER__"</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__DIR__</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- The launcher exits 1 when the orchestrator dies; restart the whole stack with fresh secrets. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!-- Drain (SHUTDOWN_DRAIN_MS) + grace + 30 s hard bound + 30 s for workers, with margin;
+         computed by scripts/install-launcher.sh from the settings file. -->
+    <key>ExitTimeOut</key>
+    <integer>__EXIT_TIMEOUT__</integer>
+
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/slack-review-bot-launcher.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/slack-review-bot-launcher.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

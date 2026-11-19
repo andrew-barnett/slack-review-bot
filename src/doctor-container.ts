@@ -2,7 +2,7 @@
 // deliberate-failure test without a live container. The worker checks are the acceptance criteria
 // of https://github.com/andrew-barnett/slack-review-bot/issues/64.
 
-import type { AwsCredentials } from './bedrock-auth'
+import { awsSessionEnv } from './bedrock-auth'
 import { ghEnvAs, type LoginLookup } from './doctor-dual'
 import type { CheckResult, CommandRunner } from './doctor'
 import { redactSecrets } from './redact'
@@ -37,20 +37,8 @@ export function parseDoctorRole(argv: string[]): 'orchestrator' | 'worker' | und
   return undefined
 }
 
-/**
- * The environment every worker `aws` probe runs with: the engine session only. No profile, config
- * or credentials file can substitute another identity.
- */
-export function engineAwsEnv(base: NodeJS.ProcessEnv, creds: AwsCredentials, region: string): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { PATH: base.PATH, HOME: base.HOME }
-  env.AWS_CONFIG_FILE = '/dev/null'
-  env.AWS_SHARED_CREDENTIALS_FILE = '/dev/null'
-  env.AWS_REGION = region
-  env.AWS_ACCESS_KEY_ID = creds.accessKeyId
-  env.AWS_SECRET_ACCESS_KEY = creds.secretAccessKey
-  if (creds.sessionToken) env.AWS_SESSION_TOKEN = creds.sessionToken
-  return env
-}
+/** The environment every worker `aws` probe runs with: the engine session only. */
+export const engineAwsEnv = awsSessionEnv
 
 export async function checkDaemonSecretsAbsent(probe: ContainerProbe): Promise<CheckResult> {
   const name = 'daemon secrets absent'
