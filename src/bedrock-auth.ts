@@ -50,6 +50,8 @@ export interface BedrockAuth {
   region: string
   model: string
   credentials: AwsCredentials
+  /** Codex only: the Bedrock Mantle project ID (CODEX_BEDROCK_PROJECT), sent as `OpenAI-Project`. */
+  project?: string
   /** Codex only: CODEX_BEDROCK_CONTEXT_WINDOW, when configured. */
   contextWindow?: number
 }
@@ -66,6 +68,8 @@ const MAX_SESSION_NAME = 64
 const ASSUME_FAILED = 'could not assume the engine role'
 /** Region and model IDs are interpolated into TOML overrides; only this charset is safe. */
 const TOML_SAFE_ID = /^[A-Za-z0-9._:-]+$/
+/** A Bedrock Mantle project ID; interpolated into a TOML header override, so strictly shaped. */
+const MANTLE_PROJECT_ID = /^proj_[a-z0-9]+$/
 /** The variables the engine credentials travel in. */
 const AWS_KEY_VARS = ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN'] as const
 
@@ -178,19 +182,27 @@ export function withBedrockCodexEnv(env: NodeJS.ProcessEnv, auth: BedrockAuth): 
 }
 
 /**
- * The `codex exec` config overrides for Bedrock (verified with codex-cli 0.169.0): the provider, the
- * model, the region, and an `AWS_*` exclude on the shell environment policy. The exclude is the
+ * The `codex exec` config overrides for Bedrock (verified with codex-cli 0.170.0): the `amazon-bedrock`
+ * provider (the bedrock-mantle endpoint), the model, the region, the `OpenAI-Project` header, and an `AWS_*` exclude on the shell environment policy. The exclude is the
  * security-relevant one: the Codex process still signs with the credentials, but model-directed
  * shell commands and untrusted PR test code never see them.
+ *
+ * Mantle rather than bedrock-runtime because the account's bedrock-runtime data-retention mode is
+ * `none`, which every OpenAI model rejects; the dedicated Mantle project (selected by the header)
+ * has retention `default`. Mantle model IDs have no `us.` prefix.
  */
 export function bedrockCodexArgs(auth: BedrockAuth): string[] {
   // Second guard behind config validation: the values are spliced into TOML strings.
   if (!TOML_SAFE_ID.test(auth.model)) throw new Error('Bedrock model ID contains characters unsafe for a Codex override')
   if (!TOML_SAFE_ID.test(auth.region)) throw new Error('Bedrock region contains characters unsafe for a Codex override')
+  if (!auth.project || !MANTLE_PROJECT_ID.test(auth.project)) {
+    throw new Error('Bedrock Mantle project ID is missing or malformed for a Codex override (want proj_...)')
+  }
   const args = [
-    '-c', 'model_provider="amazon-bedrock-runtime"',
+    '-c', 'model_provider="amazon-bedrock"',
     '-c', `model="${auth.model}"`,
-    '-c', `model_providers.amazon-bedrock-runtime.aws.region="${auth.region}"`,
+    '-c', `model_providers.amazon-bedrock.aws.region="${auth.region}"`,
+    '-c', `model_providers.amazon-bedrock.http_headers={"OpenAI-Project"="${auth.project}"}`,
     '-c', 'shell_environment_policy.exclude=["AWS_*"]',
   ]
   if (auth.contextWindow !== undefined) {
@@ -260,6 +272,7 @@ export async function resolveBedrockAuth(
     region: config.bedrockRegion,
     model: codex ? config.codexBedrockModel : config.claudeBedrockModel,
     credentials,
+    ...(codex ? { project: config.codexBedrockProject } : {}),
     ...(codex && config.codexBedrockContextWindow !== undefined ? { contextWindow: config.codexBedrockContextWindow } : {}),
   }
 }

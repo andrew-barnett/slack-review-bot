@@ -23,6 +23,7 @@ const config = loadReviewConfig({
   HOME: '/home/bot',
   RUNTIME: 'container',
   ENGINE_AUTH: 'bedrock',
+  CODEX_BEDROCK_PROJECT: 'proj_testproject123',
   AWS_ACCESS_KEY_ID: 'id-placeholder-value',
   AWS_SECRET_ACCESS_KEY: 'secret-placeholder-value',
   AWS_SESSION_TOKEN: 'session-placeholder-value',
@@ -33,7 +34,7 @@ const config = loadReviewConfig({
   CLAUDE_BIN: '/usr/local/bin/claude',
   CLAUDE_CONFIG_DIR_REVIEW: '/home/bot/.claude-review-bot',
 })
-const auth: BedrockAuth = { region: 'us-east-2', model: 'us.openai.gpt-5.5', credentials: { accessKeyId: 'a', secretAccessKey: 's', sessionToken: 't' } }
+const auth: BedrockAuth = { region: 'us-east-2', model: 'openai.gpt-5.5', project: 'proj_testproject123', credentials: { accessKeyId: 'a', secretAccessKey: 's', sessionToken: 't' } }
 const SHA = 'd'.repeat(40)
 const clean = { results: [{ url: 'https://github.com/o/r/pull/1', reviewedSha: SHA, verdict: 'clean' as const, findings: [], summary: '', environmentProblems: [] }] }
 const codexJob: ClaimReply = {

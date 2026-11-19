@@ -9,10 +9,11 @@ const SECRET = 'fake-secret-' + 'value-0123456789'
 const SESSION = 'fake-session-' + 'token-0123456789'
 const ROLE = 'arn:aws:iam::123456789012:role/SlackReviewBotEngineRole'
 
-const roleConfig = loadReviewConfig({ HOME: '/home/u', ENGINE_AUTH: 'bedrock', ENGINE_ROLE_ARN: ROLE })
+const roleConfig = loadReviewConfig({ HOME: '/home/u', ENGINE_AUTH: 'bedrock', ENGINE_ROLE_ARN: ROLE, CODEX_BEDROCK_PROJECT: 'proj_testproject123' })
 const staticConfig = loadReviewConfig({
   HOME: '/home/u',
   ENGINE_AUTH: 'bedrock',
+  CODEX_BEDROCK_PROJECT: 'proj_testproject123',
   AWS_ACCESS_KEY_ID: KEY_ID,
   AWS_SECRET_ACCESS_KEY: SECRET,
 })

@@ -57,6 +57,8 @@ function stsExec(result: { stdout?: string; fail?: { code: number; stderr: strin
   return { exec, calls }
 }
 
+const PROJECT = 'proj_testproject123'
+
 const AUTH: BedrockAuth = {
   region: 'us-east-2',
   model: 'us.anthropic.claude-opus-5-5',
@@ -64,7 +66,7 @@ const AUTH: BedrockAuth = {
 }
 
 function bedrockConfig(extra: Record<string, string> = {}): ReviewConfig {
-  return loadReviewConfig({ HOME: '/home/test', ENGINE_AUTH: 'bedrock', ENGINE_ROLE_ARN: ROLE, ...extra })
+  return loadReviewConfig({ HOME: '/home/test', ENGINE_AUTH: 'bedrock', ENGINE_ROLE_ARN: ROLE, CODEX_BEDROCK_PROJECT: PROJECT, ...extra })
 }
 
 // The session must outlive the run it serves (a credential expiring mid-review fails the review) but
@@ -216,18 +218,21 @@ test('withBedrockCodexEnv sets the AWS variables and removes the profile', t => 
   t.end()
 })
 
-// The overrides are exactly what the codex-cli 0.169.0 spike verified, including the AWS_* shell
-// exclude, without which every model-directed command and PR test would see the engine keys.
-test('bedrockCodexArgs returns the provider, model, region and AWS_* exclude overrides', t => {
-  const args = bedrockCodexArgs({ ...AUTH, model: 'us.openai.gpt-5.5' })
+// The overrides are exactly what the codex-cli 0.170.0 spike verified (Mantle provider plus the
+// OpenAI-Project header), including the AWS_* shell exclude, without which every model-directed
+// command and PR test would see the engine keys. Regression caught: falling back to
+// bedrock-runtime, where OpenAI models fail on the account's `none` retention mode.
+test('bedrockCodexArgs returns the provider, model, region, project header and AWS_* exclude overrides', t => {
+  const args = bedrockCodexArgs({ ...AUTH, model: 'openai.gpt-5.5', project: PROJECT })
   t.deepEqual(args, [
-    '-c', 'model_provider="amazon-bedrock-runtime"',
-    '-c', 'model="us.openai.gpt-5.5"',
-    '-c', 'model_providers.amazon-bedrock-runtime.aws.region="us-east-2"',
+    '-c', 'model_provider="amazon-bedrock"',
+    '-c', 'model="openai.gpt-5.5"',
+    '-c', 'model_providers.amazon-bedrock.aws.region="us-east-2"',
+    '-c', 'model_providers.amazon-bedrock.http_headers={"OpenAI-Project"="proj_testproject123"}',
     '-c', 'shell_environment_policy.exclude=["AWS_*"]',
   ])
   t.deepEqual(
-    bedrockCodexArgs({ ...AUTH, contextWindow: 272000 }).slice(-2),
+    bedrockCodexArgs({ ...AUTH, project: PROJECT, contextWindow: 272000 }).slice(-2),
     ['-c', 'model_context_window=272000'],
     'the context-window override is appended when configured'
   )
@@ -237,8 +242,18 @@ test('bedrockCodexArgs returns the provider, model, region and AWS_* exclude ove
 // The values are interpolated into TOML; config validates them, and this is the second guard, so a
 // quote in a model ID can never inject an extra override.
 test('bedrockCodexArgs refuses a value that is not TOML-safe', t => {
-  t.throws(() => bedrockCodexArgs({ ...AUTH, model: 'x" , sandbox_mode="danger' }), /model/)
-  t.throws(() => bedrockCodexArgs({ ...AUTH, region: 'us-east-2"' }), /region/)
+  t.throws(() => bedrockCodexArgs({ ...AUTH, project: PROJECT, model: 'x" , sandbox_mode="danger' }), /model/)
+  t.throws(() => bedrockCodexArgs({ ...AUTH, project: PROJECT, region: 'us-east-2"' }), /region/)
+  t.end()
+})
+
+// The project ID is spliced into an inline TOML table; a missing project would send no header (and
+// hit the retention-`none` default), and a quote would inject an extra override. Both must throw.
+test('bedrockCodexArgs refuses a missing or malformed Mantle project', t => {
+  t.throws(() => bedrockCodexArgs({ ...AUTH }), /project/)
+  t.throws(() => bedrockCodexArgs({ ...AUTH, project: '' }), /project/)
+  t.throws(() => bedrockCodexArgs({ ...AUTH, project: 'proj_a"}, sandbox_mode="danger' }), /project/)
+  t.throws(() => bedrockCodexArgs({ ...AUTH, project: 'PROJ_ABC' }), /project/)
   t.end()
 })
 
@@ -253,7 +268,9 @@ test('resolveBedrockAuth mints role credentials per engine and registers them fo
   t.equal(claude.credentials.secretAccessKey, SECRET)
   t.equal(claude.contextWindow, undefined, 'the Codex context window is not applied to Claude')
   const codex = await resolveBedrockAuth(config, 'codex', 'C1-170.codex', exec)
-  t.equal(codex.model, 'us.openai.gpt-5.5')
+  t.equal(codex.model, 'openai.gpt-5.5')
+  t.equal(codex.project, PROJECT)
+  t.equal(claude.project, undefined, 'the Mantle project is not applied to Claude')
   t.equal(codex.contextWindow, 400000)
   t.equal(calls.length, 2, 'one mint per call, so each attempt gets a fresh session')
   const duration = calls[0].args[calls[0].args.indexOf('--duration-seconds') + 1]
@@ -269,6 +286,7 @@ test('resolveBedrockAuth uses static credentials without calling sts', async t =
   const config = loadReviewConfig({
     HOME: '/home/test',
     ENGINE_AUTH: 'bedrock',
+    CODEX_BEDROCK_PROJECT: PROJECT,
     AWS_ACCESS_KEY_ID: KEY_ID,
     AWS_SECRET_ACCESS_KEY: SECRET,
   })
@@ -285,7 +303,7 @@ test('makeEngineAuth resolves nothing in subscription mode and mints in bedrock 
   t.equal(await makeEngineAuth(loadReviewConfig({ HOME: '/home/test' }), exec)('codex', 'run'), undefined)
   t.equal(calls.length, 0, 'subscription mode never calls sts')
   const auth = await makeEngineAuth(bedrockConfig(), exec)('codex', 'run')
-  t.equal(auth?.model, 'us.openai.gpt-5.5')
+  t.equal(auth?.model, 'openai.gpt-5.5')
   t.equal(calls.length, 1)
   t.end()
 })
