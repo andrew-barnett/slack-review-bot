@@ -400,7 +400,7 @@ test('loadReviewConfig defaults to subscription auth and captures nothing', t =>
 // spend price table holds only short-context rates, so an uncapped window would let requests bill
 // at long-context rates (up to 2x) while the cap counted them at the short rate.
 test('loadReviewConfig defaults the Codex context window to 272000 in bedrock mode', t => {
-  const c = loadReviewConfig({ ENGINE_AUTH: 'bedrock', ...STATIC_KEYS })
+  const c = loadReviewConfig({ ENGINE_AUTH: 'bedrock', CODEX_BEDROCK_PROJECT: 'proj_testproject123', ...STATIC_KEYS })
   t.equal(c.codexBedrockContextWindow, 272000)
   t.end()
 })

@@ -311,7 +311,7 @@ test('spendCapActive: container always, launchd only under bedrock auth', t => {
   const credentials = { SLACK_BOT_TOKEN: 'placeholder', SLACK_APP_TOKEN: 'placeholder', HOME: '/home/u' }
   t.equal(spendCapActive(loadConfig(credentials)), false, 'launchd subscription')
   t.equal(
-    spendCapActive(loadConfig({ ...credentials, ENGINE_AUTH: 'bedrock', ENGINE_ROLE_ARN: 'arn:aws:iam::123456789012:role/Example' })),
+    spendCapActive(loadConfig({ ...credentials, ENGINE_AUTH: 'bedrock', CODEX_BEDROCK_PROJECT: 'proj_testproject123', ENGINE_ROLE_ARN: 'arn:aws:iam::123456789012:role/Example' })),
     true,
     'launchd bedrock'
   )
