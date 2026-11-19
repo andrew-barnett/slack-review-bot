@@ -805,6 +805,74 @@ and `AWS_SHARED_CREDENTIALS_FILE` set to `/dev/null`. In role mode the returned 
 `:assumed-role/<role name>/`. In static mode the ARN is reported. The credentials are never
 printed.
 
+## Container runtime (`RUNTIME=container`)
+
+The container runtime splits the bot in two (https://github.com/andrew-barnett/slack-review-bot/issues/70):
+
+- **Orchestrator** (one long-lived container): the Slack daemon. It holds the Slack tokens and the approver token, never runs PR code, and serves jobs to workers on an internal network.
+- **Workers** (one-shot containers): each claims one engine attempt, runs it with a read-only GitHub token, a short-lived Bedrock-only AWS session and an npm read token, reports the result and exits.
+
+A **launcher** on the laptop (`scripts/launcher`, run by launchd) is the only process holding the operator's AWS login. It reads the bot's secrets from Secrets Manager (`/slack-review-bot/SLACK_BOT_TOKEN`, `/slack-review-bot/SLACK_APP_TOKEN`, `/slack-review-bot/APPROVER_GH_TOKEN`, `/slack-review-bot/ENGINE_GH_TOKEN`) through `SlackReviewBotSecretsReaderRole`, mints a fresh `SlackReviewBotEngineRole` session and CodeArtifact token per worker, and writes each container's secrets to its stdin. No secret is in the image, `compose.yaml`, `docker inspect`, or any file.
+
+**Behaviour change (spec D8).** In the container runtime every review is report-only, single mode included: the orchestrator posts one COMMENT review per PR as the role account. A clean result reacts with `APPROVAL_NOT_COUNTED_EMOJI` (never the approval stamp) and counts as a pass in `status`. Regression tests are not pushed to the PR branch; they come back as suggested tests in the findings. The launchd runtime is unchanged.
+
+### Settings
+
+Non-secret settings live in `~/.config/slack-review-bot/launcher.conf` (override the path with `SLACK_REVIEW_BOT_LAUNCHER_CONF`). `scripts/install-launcher.sh` refuses a file that sets any variable whose name contains `TOKEN` or `SECRET`, or `LAUNCH_KEY`, `WORKER_TICKET`, `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `REVIEW_ENGINES` | `codex` | `codex`, `claude` (container runtime only) or `codex,claude` (still behind `DUAL_MODE_AVAILABLE`). |
+| `SLACK_CHANNEL_IDS` | (required) | As for the launchd runtime. |
+| `CONCURRENCY` | `1` | Reviews at once. |
+| `WORKER_SLOTS` | `2 × CONCURRENCY` | Workers kept warm, so a parallel dual run gets one per engine. |
+| `WORKER_IDLE_EXIT_MS` | `600000` | A worker with no job after this long exits, and the launcher starts a fresh one with fresh credentials. |
+| `WORKER_MEMORY` | `6g` | Worker memory limit. An out-of-memory kill shows up as "worker lost". |
+| `ROLE_GH_LOGIN` | (required for doctor) | The role account's GitHub login; each container's doctor checks its token is this account. |
+| `OPERATOR_GH_LOGIN` | (required for doctor) | Your own GitHub login; each doctor checks its token is not this account. |
+| `LAUNCHER_AWS_PROFILE` | `staging` | The operator profile the launcher assumes both roles from (an IAM user, never a role, so nothing is chained). |
+| `LAUNCHER_REGION` | `us-east-2` | Region for STS and Secrets Manager. |
+| `LAUNCHER_READER_ROLE_ARN` | `arn:aws:iam::153538148884:role/SlackReviewBotSecretsReaderRole` | Reads `/slack-review-bot/*`. |
+| `LAUNCHER_ENGINE_ROLE_ARN` | `arn:aws:iam::153538148884:role/SlackReviewBotEngineRole` | Invokes Bedrock models only. |
+| `SHUTDOWN_DRAIN_MS` | `5000` | The orchestrator's drain deadline; the launcher's hard bound is this plus `SHUTDOWN_GRACE_MS` (10 s) plus 30 s. |
+| `SRB_IMAGE` | `slack-review-bot:local` | Image tag for build and run. |
+
+Example `launcher.conf`:
+
+```sh
+REVIEW_ENGINES=codex
+SLACK_CHANNEL_IDS=C0123456789
+CONCURRENCY=1
+ROLE_GH_LOGIN=example-role-bot
+OPERATOR_GH_LOGIN=example-operator
+```
+
+### Build, doctor and smoke
+
+1. Pin the skill and hook: `git -C ~/src/aqua-skills fetch origin && git -C ~/src/aqua-skills rev-parse origin/main > docker/aqua-skills.ref`, then commit `docker/aqua-skills.ref`.
+2. Build: `npm ci && npm run build && scripts/build-image.sh`. The image is built from the committed tree (`git archive HEAD`); uncommitted edits are not in it.
+3. Doctor, with real credentials from the launcher: `scripts/launcher doctor worker` and `scripts/launcher doctor orchestrator`. Both must end with `All checks passed.` The worker checks are the acceptance criteria of https://github.com/andrew-barnett/slack-review-bot/issues/64.
+4. Smoke, with dummy secrets and a stub engine: `scripts/compose-smoke.sh` must end with `compose smoke passed`.
+
+### Shutdown
+
+On SIGTERM the launcher stops starting workers and signals the orchestrator only. The orchestrator drains as in "Shutting down" above; a forced drain cancels its jobs, so their workers exit on their own. Only after the orchestrator has exited does the launcher SIGTERM the remaining workers (SIGKILL after 30 s). A second SIGTERM is ignored. The launcher's only escalation is to `docker kill` the orchestrator after the hard bound. If the orchestrator exits on its own, the launcher stops the workers and exits 1, and launchd restarts the whole stack.
+
+### Cutover from the launchd daemon
+
+1. Build the image, then run the worker doctor and the smoke (above).
+2. Wait until `@bot status` in Slack shows no active review.
+3. Copy the cursor file into the orchestrator's volume:
+   `docker compose -f compose.yaml -p slack-review-bot run --rm -T --entrypoint sh orchestrator -c 'cat > /var/lib/slack-review-bot/state/cursors.json' < ~/.local/state/slack-review-bot/cursors.json`
+4. Stop the daemon: `scripts/install-service.sh --uninstall`.
+5. Write `~/.config/slack-review-bot/launcher.conf` with `REVIEW_ENGINES=codex` for the first reviews, then `scripts/install-launcher.sh --check` and `scripts/install-launcher.sh`.
+6. Run `scripts/launcher doctor orchestrator`.
+7. First reviews: request reviews of low-risk PRs. Each must get exactly one COMMENT review from the role account and no APPROVE.
+
+**Rollback:** `scripts/install-launcher.sh --uninstall`, then `docker compose -f compose.yaml -p slack-review-bot down` (keep the volumes). If reviews ran in the container runtime, copy the cursor back first:
+`docker compose -f compose.yaml -p slack-review-bot run --rm -T --entrypoint cat orchestrator /var/lib/slack-review-bot/state/cursors.json > ~/.local/state/slack-review-bot/cursors.json`.
+Then `scripts/install-service.sh`.
+
 ## Swapping the review model
 
 The review engine is Codex, run as a subprocess, and switching to Claude or another model is
