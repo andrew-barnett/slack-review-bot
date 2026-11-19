@@ -30,8 +30,13 @@ fi
 CTX="$(mktemp -d)"
 trap 'rm -rf "${CTX}"' EXIT
 mkdir -p "${CTX}/app" "${CTX}/aqua"
-git -C "${REPO}" archive HEAD | tar -x -C "${CTX}/app"
-git -C "${AQUA_DIR}" archive "${REF}" skills/review-pr security/block-secret-reads.py | tar -x -C "${CTX}/aqua"
+# Archive to files, not a pipe: bsdtar (macOS) stops reading at the end-of-archive marker, so
+# `git archive` dies of SIGPIPE writing its trailing padding and pipefail fails the build (exit 141).
+git -C "${REPO}" archive --output "${CTX}/app.tar" HEAD
+tar -x -f "${CTX}/app.tar" -C "${CTX}/app"
+git -C "${AQUA_DIR}" archive --output "${CTX}/aqua.tar" "${REF}" skills/review-pr security/block-secret-reads.py
+tar -x -f "${CTX}/aqua.tar" -C "${CTX}/aqua"
+rm -f "${CTX}/app.tar" "${CTX}/aqua.tar"
 
 docker buildx build \
     --platform "${PLATFORM}" \
