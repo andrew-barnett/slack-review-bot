@@ -46,7 +46,8 @@ test('parsePriceTable rejects a missing model, naming the model and the file', t
 })
 
 // Spec 5: the placeholder zeros can never ship. Zero input or output is rejected; a zero cache price is a
-// real possibility (a model with no cache-write charge) and is allowed.
+// real possibility (a model with no cache-write charge) and is allowed. Regression caught: a placeholder-zero
+// table would price spend at $0, so the cap would never trip.
 test('parsePriceTable rejects a zero input or output price and allows a zero cache price', t => {
   for (const bad of [{ ...codexPrice, input: 0 }, { ...codexPrice, output: 0 }]) {
     t.throws(() => parsePriceTable(table({ models: { [CODEX]: bad, [CLAUDE]: claudePrice } }), 'p.json', [CODEX, CLAUDE]), /model "us\.openai\.gpt-5\.5" needs "input" and "output" above zero/)
@@ -56,7 +57,8 @@ test('parsePriceTable rejects a zero input or output price and allows a zero cac
   t.end()
 })
 
-// Negative, missing or non-numeric prices are as wrong as zero, and must not reach the arithmetic.
+// Negative, missing or non-numeric prices are as wrong as zero, and must not reach the arithmetic. Regression caught:
+// a malformed price loads as NaN or a negative number and corrupts every cost.
 test('parsePriceTable rejects negative, missing and non-numeric prices', t => {
   const cases = [{ ...codexPrice, cachedInput: -1 }, { input: 1, output: 8 }, { ...codexPrice, output: '8' }]
   for (const bad of cases) {
@@ -73,21 +75,24 @@ test('parsePriceTable rejects bad JSON naming the file', t => {
 })
 
 // Spec 5: `source` records the URL and the date checked. The spec's own example date "2026-11-XX" is a
-// placeholder and must not load.
+// placeholder and must not load. Regression caught: an undated or placeholder source loads, so nobody can tell
+// how stale the prices are.
 test('parsePriceTable requires a dated source', t => {
   t.throws(() => parsePriceTable(table({ source: 'https://aws.amazon.com/bedrock/pricing/ checked 2026-11-XX' }), 'p.json', [CODEX]), /"source" must name the pricing page and the date/)
   t.throws(() => parsePriceTable(table({ source: undefined }), 'p.json', [CODEX]), /"source"/)
   t.end()
 })
 
-// Ruling 15: the two Codex flags are required booleans, so the reading in use is always a decision.
+// Ruling 15: the two Codex flags are required booleans, so the reading in use is always a decision. Regression caught:
+// a missing or non-boolean flag is silently read as one of the two readings.
 test('parsePriceTable requires both codexTokenSemantics flags', t => {
   t.throws(() => parsePriceTable(table({ codexTokenSemantics: { cachedIsSubsetOfInput: false } }), 'p.json', [CODEX]), /codexTokenSemantics/)
   t.throws(() => parsePriceTable(table({ codexTokenSemantics: { cachedIsSubsetOfInput: 'no', reasoningInOutput: false } }), 'p.json', [CODEX]), /codexTokenSemantics/)
   t.end()
 })
 
-// A missing or unreadable file fails with the path, so the operator knows which setting to fix.
+// A missing or unreadable file fails with the path, so the operator knows which setting to fix. Regression caught:
+// an unreadable file surfaces as a bare ENOENT that does not name BEDROCK_PRICES_FILE.
 test('loadPriceTable reads a file and names it when it cannot', t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'prices-'))
   const file = path.join(dir, 'bedrock-prices.json')
