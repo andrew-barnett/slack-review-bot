@@ -4,7 +4,7 @@
 
 **Goal:** Give the bot a hard monthly cap on its own AWS Bedrock spend, priced from token usage and a repo price table, with percentage-only Slack alerts, a percent-of-cap status line, and refusal of new review requests once the cap is reached.
 
-**Architecture:** Codex runs with `--json`, and its `turn.completed.usage` events become a `CodexUsageDetail` that travels beside Claude's existing `ClaudeUsageDetail` through the engines, the launchd runner and the worker wire. The daemon's existing `recordUsage` hook hands each settled request's usage to a spend cap, which prices every engine run from `pricing/bedrock-prices.json` into a month-to-date ledger (`spend.json` beside the cursor file) and posts the threshold alerts. Admission and the queue slot ask the cap whether new reviews are refused. Every user-facing string comes from one module and shows percentages only.
+**Architecture:** Codex runs with `--json`, and its `turn.completed.usage` events become a `CodexUsageDetail` that travels beside Claude's existing `ClaudeUsageDetail` through the engines, the launchd runner and the worker wire. The daemon's existing `recordUsage` hook hands each settled request's usage to a spend cap, which prices every engine run from `pricing/bedrock-prices.json` into a month-to-date ledger (an append-only `spend-YYYY-MM.jsonl` journal per UTC month, beside the cursor file) and posts the threshold alerts. Admission and the queue slot ask the cap whether new reviews are refused. Every user-facing string comes from one module and shows percentages only.
 
 **Tech Stack:** TypeScript 5.9 (CommonJS via ts-node for tests, esbuild bundles for `dist/`), Node 22 (`fs`, `Intl`), `tape` tests, `@slack/web-api` 7.19, codex-cli 0.169.0 (`exec --json`), Docker Compose for the local smoke.
 
@@ -16,11 +16,11 @@
 2. **Usage with no `engines` list.** The launchd single-mode runner (`makeReviewRunner`) returns a `RunUsage` without `engines`. The ledger reads such a usage as one Codex engine run, so a bedrock launchd install is capped too.
 3. **Where the price table is read.** `loadConfig` parses the five settings (spec section 4). The price file is read and validated, and the ledger opened, by `openSpendCap` in `runDaemon`, before the first Slack call, and only when the cap is active. A subscription launchd install never reads the file.
 4. **Which prices are required.** When the cap is active, both `CODEX_BEDROCK_MODEL` and `CLAUDE_BEDROCK_MODEL` must have a complete entry, whatever `REVIEW_ENGINES` says.
-5. **One message at the cap.** When a record takes the percent to 100 or more and `capAnnounced` is false, only the cap-reached message is sent; every crossed threshold is marked alerted without its own message.
+5. **One message at the cap.** When a record takes the percent to 100 or more and the cap is not yet announced for the configured cap (no `cap` line with `capUsd` at or above it), only the cap-reached message is sent; every crossed threshold is marked alerted without its own message. A `cap` line records the cap it was sent for, so raising the cap re-arms the message with no other state.
 6. **`SPEND_ALERT_HERE_PERCENTS` default.** Unset means whichever of `75` and `90` appear in `SPEND_ALERT_PERCENTS` (so a custom alert list without 75 does not fail startup). Set to the empty string, it means no threshold alert carries `@here`. The cap-reached message always does.
 7. **No alert channel.** With `SPEND_ALERT_CHANNEL` unset and `SLACK_CHANNEL_IDS` empty, alerts are logged as `spend.alert_skipped` and not posted. The cap is still enforced.
-8. **Unreadable ledger.** The fresh ledger carries `"locked": true`, and the percent reads as at least 100 while it is set. Raising the cap does not clear it. Repairing or deleting `spend.json` and restarting does, and so does the next UTC month.
-9. **Ledger path.** `spend.json` sits in the directory of `CURSOR_FILE`. An empty `CURSOR_FILE` (cursor disabled) falls back to `~/.local/state/slack-review-bot/`, so the cap never switches off with the cursor.
+8. **Unreadable or unwritable ledger.** A journal line that does not parse, has an unknown `type` or has invalid fields, and a partial last line (no trailing newline, as a crash mid-append leaves), makes the month `locked`: `spend.unreadable` is logged with the file and line number, and the percent reads as at least 100. It stays locked while that line exists; raising the cap does not clear it. Fixing or removing the line and restarting does, and so does the next UTC month (a new file). The first append after a partial line starts with a newline, so the partial line stays on its own and removing it loses nothing else. Storage that cannot be written (the probe on open, or any append, throws) also locks the month, logged as `spend.write_failed`; every `state()` retries the probe, so that lock clears on its own once a probe or append succeeds (`spend.write_recovered`).
+9. **Ledger path.** The `spend-YYYY-MM.jsonl` journals sit in the directory of `CURSOR_FILE` (`Config.spendDir`). An empty `CURSOR_FILE` (cursor disabled) falls back to `~/.local/state/slack-review-bot/`, so the cap never switches off with the cursor.
 10. **Codex progress lines.** `item.started` and `item.completed` events show an `agent_message`'s `text` or a `command_execution`'s `command`. Every other event is dropped from progress. A line that is not JSON (a stderr diagnostic) is shown as before. A line that starts with `{` but does not parse is never shown.
 11. **Codex `tokensUsed`.** The sum of the five `CodexUsageDetail` fields, as the spec says, so the displayed token count includes cached and reasoning tokens. The `tokens used` transcript footer is no longer read for Codex.
 12. **Slot refusal outcome.** A request refused at its slot settles as `skipped` in the `status` counts.
@@ -28,6 +28,8 @@
 14. **The CLI is not capped.** `npm run review` runs outside the daemon and its `recordUsage` hook, so its runs are not recorded in the ledger.
 15. **Price-table flags live under `codexTokenSemantics`.** The two spec flags are `codexTokenSemantics.cachedIsSubsetOfInput` and `codexTokenSemantics.reasoningInOutput`. Both `false` is the conservative reading.
 16. **Status line placement and text.** The spend line is the spec's text verbatim, with no `*bold*` label, placed right after the `*Tokens*` line.
+17. **A failed run append loses at most that run, after a restart.** When appending a `run` line throws, the run's cost is still added to the in-memory total (this process stays capped and counts it) and the process reads as locked. If storage is still unwritable at the next start, the probe locks the month. If storage has recovered by then, that one run's cost is lost. That is the accepted residual: at most the reviews running at that moment, and the AWS Budget backstop (spec section 10) covers it.
+18. **No shared atomic-write helper.** The ledger only appends, so it needs no write-then-rename. The `writeJsonAtomic` extraction from the cursor store existed only to share it with the ledger, so it is dropped: `src/cursor.ts` is not touched by this plan.
 
 ## Global Constraints
 
@@ -43,7 +45,7 @@
 - Price table units: USD per million tokens, keyed by the exact configured model value. The loader rejects a zero `input` or `output` price. `source` records the URL and the date checked. **No price number is invented anywhere in this plan; test fixtures are synthetic and say so.**
 - Until confirmed, the conservative Codex reading applies: cached tokens are not subtracted from input, and reasoning tokens are added to output.
 - Claude's `costUsd` is never used for spend.
-- Ledger: `spend.json` beside `CURSOR_FILE` (container: `/var/lib/slack-review-bot/state/spend.json` on the `orchestrator-state` volume; launchd: `~/.local/state/slack-review-bot/spend.json`). Writes use the shared `writeJsonAtomic(file, value)` (write `file.tmp`, then rename), which the cursor store uses too.
+- Ledger: one append-only JSON Lines journal per UTC month, `spend-YYYY-MM.jsonl` beside `CURSOR_FILE` (container: `/var/lib/slack-review-bot/state/spend-2026-11.jsonl` on the `orchestrator-state` volume; launchd: `~/.local/state/slack-review-bot/spend-2026-11.jsonl`). Each line is a `run`, `alert` or `cap` record, written with one `fs.appendFileSync` per call. The bot never rewrites, renames or deletes a journal; a new month is a new file.
 - Months are UTC calendar months. Messages give reset times in America/New_York.
 - Percent is `floor(spentUsd / cap × 100)`.
 - Refusal reply, verbatim: `This bot's monthly Bedrock spend cap has been reached, so it isn't starting new reviews. Reviews resume on <Mon D> at <h:mm a> ET (the start of the next UTC month), or sooner if the cap is raised.`
@@ -66,6 +68,7 @@
 3. **A `turn.completed` line split across two stdout reads, or pushed out of the 64 KiB transcript tail by a long run.** Reading usage from the bounded transcript, or per chunk, would drop turns and under-count spend. The usage reader reads raw stdout line by line. Pinned in Task 1 (`the usage reader joins an event split across chunks`).
 4. **One very expensive review that takes spend from under 25% to over 100%.** A person expects one cap-reached message, not a threshold alert and then a cap alert. Pinned in Task 6 (`a jump past the cap sends only the cap message and caps`).
 5. **A custom `SPEND_ALERT_PERCENTS` without 75.** With the literal `75,90` default for `@here`, startup would fail on a setting the operator never touched. Pinned in Task 5 (`parseHerePercents must be a subset of the alert percents, and its default follows them`).
+6. **A cap raise after the cap was announced, then one record that crosses the new cap.** A person expects the cap-reached message again. A boolean "announced" flag reset only by a record below 100% stays set when no such record comes, and the message is silently skipped. Pinned in Task 6 (`after a cap raise, the first record that crosses the new cap announces it`).
 
 ---
 
@@ -78,10 +81,8 @@
 | `src/codex.ts` (modify) | `--json`; usage from events; usage on every Codex error |
 | `src/engine.ts`, `src/review.ts` (modify) | Carry Codex usage across attempts in the engines and the launchd runner |
 | `src/worker.ts`, `src/jobs/remote.ts`, `src/jobs/errors.ts` (modify) | `codexUsage` on the worker wire, validated like Claude's usage |
-| `src/atomic-file.ts` (create) | `writeJsonAtomic` |
-| `src/cursor.ts` (modify) | Persist through `writeJsonAtomic` |
 | `src/pricing.ts` (create) | Price table types, loader, validation, and the token-to-dollars arithmetic |
-| `src/spend-ledger.ts` (create) | `spend.json`: open, rollover, unreadable handling, append, alert state |
+| `src/spend-ledger.ts` (create) | The monthly `spend-YYYY-MM.jsonl` journals: read, month switch, bad-line and unwritable locking, append runs, alerts and cap announcements |
 | `src/config.ts` (modify) | The five settings and the ledger path |
 | `compose.yaml` (modify) | Orchestrator gets the settings and the model IDs |
 | `src/spend-messages.ts` (create) | Every user-facing spend string, and the ET reset time |
@@ -1757,17 +1758,15 @@ Run: `git add src/usage.ts src/engine.ts src/review.ts src/worker.ts src/jobs/re
 
 ---
 
-### Task 3: Atomic JSON writes and the price table loader (`src/atomic-file.ts`, `src/pricing.ts`)
+### Task 3: The price table loader (`src/pricing.ts`)
 
 **Files:**
-- Create: `src/atomic-file.ts`, `src/pricing.ts`
-- Test: `src/atomic-file.test.ts`, `src/pricing.test.ts`
-- Modify: `src/cursor.ts`
+- Create: `src/pricing.ts`
+- Test: `src/pricing.test.ts`
 
 **Interfaces:**
 - Consumes: Task 1 `CodexUsageDetail`; `ClaudeUsageDetail` (src/usage.ts).
 - Produces:
-  - `writeJsonAtomic(file: string, value: unknown): void` (src/atomic-file.ts): creates the parent directory, writes `<file>.tmp`, renames it over `file`; throws on failure.
   - src/pricing.ts:
     - `interface ModelPrice { input: number; cachedInput: number; cacheWrite: number; output: number }` (USD per million tokens)
     - `interface CodexTokenSemantics { cachedIsSubsetOfInput: boolean; reasoningInOutput: boolean }`
@@ -1781,43 +1780,6 @@ Run: `git add src/usage.ts src/engine.ts src/review.ts src/worker.ts src/jobs/re
     - `priceClaude(usage: ClaudeUsageDetail, price: ModelPrice): PricedRun`
 
 - [ ] **Step 1: Write the failing tests**
-
-Create `src/atomic-file.test.ts`:
-
-```ts
-import * as fs from 'fs'
-import * as os from 'os'
-import * as path from 'path'
-import test from 'tape'
-import { writeJsonAtomic } from './atomic-file'
-
-// Spec 7/9: the ledger and the cursor are rewritten often, and a crash mid-write must leave the previous
-// file whole. Regression caught: a truncating write that leaves an empty spend.json, which the next
-// start would read as unreadable and open the month capped.
-test('writeJsonAtomic leaves the old file intact when the write fails', t => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atomic-'))
-  const file = path.join(dir, 'spend.json')
-  writeJsonAtomic(file, { month: '2026-11', spentUsd: 1 })
-  // A directory where the temp file must go makes the write itself fail, as a full disk would.
-  fs.mkdirSync(`${file}.tmp`)
-  t.throws(() => writeJsonAtomic(file, { month: '2026-11', spentUsd: 2 }))
-  t.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { month: '2026-11', spentUsd: 1 }, 'the previous contents survive')
-  fs.rmSync(dir, { recursive: true, force: true })
-  t.end()
-})
-
-// The first write on a fresh volume must create the state directory, and no temp file may be left
-// behind to confuse an operator reading the directory.
-test('writeJsonAtomic creates the directory and leaves no temp file', t => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atomic-'))
-  const file = path.join(dir, 'nested', 'state', 'spend.json')
-  writeJsonAtomic(file, { a: 1 })
-  t.equal(fs.readFileSync(file, 'utf8'), '{\n  "a": 1\n}\n', 'pretty JSON with a trailing newline, as the cursor file was')
-  t.notOk(fs.existsSync(`${file}.tmp`))
-  fs.rmSync(dir, { recursive: true, force: true })
-  t.end()
-})
-```
 
 Create `src/pricing.test.ts`:
 
@@ -1948,90 +1910,12 @@ test('priceClaude prices each field and ignores the notional costUsd', t => {
 })
 ```
 
-Append to `src/cursor.test.ts`:
-
-```ts
-// The cursor store now persists through the shared writeJsonAtomic (spec 7). Regression caught: the
-// extraction changing the on-disk format, which an existing cursors.json must still round-trip through.
-test('openCursorStore writes the same pretty JSON through writeJsonAtomic', t => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-test-'))
-  const file = path.join(dir, 'cursors.json')
-  openCursorStore(file, silent, () => 0).record('C1', '102.000000')
-  const text = fs.readFileSync(file, 'utf8')
-  t.ok(text.startsWith('{\n  "version": 1,'), 'pretty-printed, version first')
-  t.ok(text.endsWith('}\n'), 'with a trailing newline')
-  fs.rmSync(dir, { recursive: true, force: true })
-  t.end()
-})
-```
-
-(`src/cursor.test.ts` already imports `fs`, `os`, `path`, `openCursorStore` and defines `silent`.)
-
 - [ ] **Step 2: Run the tests to verify they fail**
-
-Run: `npx ts-node --compiler-options '{"module":"commonjs"}' --transpile-only src/atomic-file.test.ts`
-Expected: FAIL with `Cannot find module './atomic-file'`.
 
 Run: `npx ts-node --compiler-options '{"module":"commonjs"}' --transpile-only src/pricing.test.ts`
 Expected: FAIL with `Cannot find module './pricing'`.
 
-- [ ] **Step 3: Write `writeJsonAtomic` and use it in the cursor store**
-
-Create `src/atomic-file.ts`:
-
-```ts
-// One way to rewrite a small JSON state file safely, shared by the cursor store and the spend ledger
-// (spec section 7). Write a temp file beside the target, then rename it over the target: a rename is
-// atomic on one filesystem, so a crash or a failed write leaves the previous file whole, and a reader
-// never sees half a file.
-
-import * as fs from 'fs'
-import * as path from 'path'
-
-/** Write `value` as pretty JSON to `file` via `<file>.tmp` and a rename. Throws on failure. */
-export function writeJsonAtomic(file: string, value: unknown): void {
-  fs.mkdirSync(path.dirname(file), { recursive: true })
-  const tmp = `${file}.tmp`
-  fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`)
-  fs.renameSync(tmp, file)
-}
-```
-
-In `src/cursor.ts`, replace:
-
-```ts
-import * as fs from 'fs'
-import * as path from 'path'
-```
-
-with:
-
-```ts
-import * as fs from 'fs'
-import { writeJsonAtomic } from './atomic-file'
-```
-
-In the same file, replace:
-
-```ts
-  const persist = (state: CursorFile): void => {
-    fs.mkdirSync(path.dirname(file), { recursive: true })
-    const tmp = `${file}.tmp`
-    fs.writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`)
-    fs.renameSync(tmp, file)
-  }
-```
-
-with:
-
-```ts
-  const persist = (state: CursorFile): void => writeJsonAtomic(file, state)
-```
-
-Run: `grep -n "path\." src/cursor.ts`
-Expected: no output (the `path` import is no longer used anywhere in the file).
-
-- [ ] **Step 4: Write the price table loader and arithmetic**
+- [ ] **Step 3: Write the price table loader and arithmetic**
 
 Create `src/pricing.ts`:
 
@@ -2190,50 +2074,53 @@ export function priceClaude(usage: ClaudeUsageDetail, price: ModelPrice): Priced
 }
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `for f in src/atomic-file.test.ts src/pricing.test.ts src/cursor.test.ts; do npx ts-node --compiler-options '{"module":"commonjs"}' --transpile-only "$f" 2>&1 | tail -2; done`
-Expected: each ends with `# ok`.
+Run: `npx ts-node --compiler-options '{"module":"commonjs"}' --transpile-only src/pricing.test.ts`
+Expected: PASS (all ten tests).
 
 Run: `npm test 2>&1 | tail -4 && npm run typecheck`
 Expected: `# ok`, then `tsc` exits 0.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 Write `/tmp/srb-commit-msg.txt` with the editor tool:
 
 ```text
-feat(spend): add atomic JSON writes and the Bedrock price table loader (refs andrew-barnett/slack-review-bot#76)
+feat(spend): add the Bedrock price table loader (refs andrew-barnett/slack-review-bot#76)
 
-The spend ledger needs the cursor store's write-then-rename, so it moves
-into a shared writeJsonAtomic. The price table loader refuses a missing
-model, a zero input or output price, bad JSON and an undated source, so
-spend is never priced at an unknown rate; the arithmetic applies the
-conservative Codex reading until the flags say otherwise.
+The price table loader refuses a missing model, a zero input or output
+price, bad JSON and an undated source, so spend is never priced at an
+unknown rate; the arithmetic applies the conservative Codex reading until
+the flags say otherwise.
 
 [cc](https://claude.com/claude-code)
 ```
 
-Run: `git add src/atomic-file.ts src/atomic-file.test.ts src/pricing.ts src/pricing.test.ts src/cursor.ts src/cursor.test.ts && git commit -F /tmp/srb-commit-msg.txt`
+Run: `git add src/pricing.ts src/pricing.test.ts && git commit -F /tmp/srb-commit-msg.txt`
 
 ---
 
-### Task 4: The month-to-date spend ledger (`src/spend-ledger.ts`)
+### Task 4: The month-to-date spend ledger, an append-only monthly journal (`src/spend-ledger.ts`)
 
 **Files:**
 - Create: `src/spend-ledger.ts`
 - Test: `src/spend-ledger.test.ts`
 
 **Interfaces:**
-- Consumes: Task 3 `writeJsonAtomic`, `LedgerTokens`; `EngineName` (src/config.ts).
+- Consumes: Task 3 `LedgerTokens`; `EngineName` (src/config.ts).
 - Produces:
-  - `SPEND_LEDGER_VERSION = 1`
-  - `interface SpendEntry { at: string; runId: string; engine: EngineName; model: string; tokens: LedgerTokens; costUsd: number; noUsage?: true }`
-  - `interface SpendFile { version: 1; month: string; spentUsd: number; alerted: number[]; capAnnounced: boolean; locked?: true; entries: SpendEntry[] }`
+  - `interface SpendRun { at: string; runId: string; engine: EngineName; model: string; tokens: LedgerTokens; costUsd: number; noUsage?: true }`
+  - `interface SpendState { month: string; spentUsd: number; alerted: number[]; capAnnouncedFor?: number; locked: boolean; entries: SpendRun[] }`
+  - `interface SpendLedger { state(nowMs: number): Readonly<SpendState>; recordRuns(runs: SpendRun[], nowMs: number): void; recordAlert(percent: number, nowMs: number): void; recordCapAnnounced(capUsd: number, nowMs: number): void }`
   - `utcMonth(ms: number): string` (`YYYY-MM`), `nextMonthStart(ms: number): number` (00:00 UTC on the 1st of the next month)
-  - `interface SpendLedger { state(nowMs: number): Readonly<SpendFile>; append(entries: SpendEntry[], nowMs: number): void; update(change: { alerted?: number[]; capAnnounced?: boolean }, nowMs: number): void }`
-  - `openSpendLedger(file: string, log: (event: string, fields: Record<string, unknown>) => void, nowMs?: number): SpendLedger`
-  - Log events: `spend.unreadable`, `spend.corrupt_keep_failed`, `spend.rollover`, `spend.write_failed`.
+  - `spendFileFor(dir: string, month: string): string` (`<dir>/spend-YYYY-MM.jsonl`)
+  - `openSpendLedger(dir: string, log: (event: string, fields: Record<string, unknown>) => void, nowMs?: number): SpendLedger` (`dir` is Task 5's `spendDir`)
+  - Log events: `spend.unreadable`, `spend.write_failed`, `spend.write_recovered`, `spend.month_started`.
+- Journal format (one JSON object per line, one file per UTC month, never rewritten, renamed or deleted by the bot):
+  - `{"type":"run","at":ISO,"runId":…,"engine":"codex"|"claude","model":…,"tokens":{…},"costUsd":…,"noUsage"?:true}`: one priced engine run.
+  - `{"type":"alert","at":ISO,"percent":N}`: the threshold alert for `N` was decided (written before posting).
+  - `{"type":"cap","at":ISO,"capUsd":N}`: the cap-reached message was decided for a cap of `N` dollars (written before posting).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2244,15 +2131,19 @@ import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
 import test from 'tape'
-import { nextMonthStart, openSpendLedger, utcMonth, type SpendEntry } from './spend-ledger'
+import { nextMonthStart, openSpendLedger, spendFileFor, utcMonth, type SpendRun } from './spend-ledger'
 
 const NOV_20 = Date.UTC(2026, 10, 20, 14, 3, 11)
 /** 02:00 UTC on Dec 1 is 21:00 on Nov 30 in New York: a new month by UTC, still November in ET. */
 const DEC_1_0200Z = Date.UTC(2026, 11, 1, 2, 0)
+/** Permission tests mean nothing as root, which ignores file modes. */
+const ROOT = process.getuid?.() === 0
 
-function scratch(): { dir: string; file: string } {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spend-ledger-'))
-  return { dir, file: path.join(dir, 'state', 'spend.json') }
+/** A fresh state directory that does not exist yet, as on a new volume. */
+function scratch(): { base: string; dir: string; nov: string; dec: string } {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'spend-ledger-'))
+  const dir = path.join(base, 'state')
+  return { base, dir, nov: spendFileFor(dir, '2026-11'), dec: spendFileFor(dir, '2026-12') }
 }
 
 function logger() {
@@ -2260,15 +2151,18 @@ function logger() {
   return { events, log: (event: string, fields: Record<string, unknown>) => void events.push({ event, fields }) }
 }
 
-/** A synthetic entry costing `costUsd`. */
-const entry = (costUsd: number): SpendEntry => ({
+/** A synthetic engine run costing `costUsd`. */
+const run = (costUsd: number, runId = 'C1-11'): SpendRun => ({
   at: new Date(NOV_20).toISOString(),
-  runId: 'C1-11',
+  runId,
   engine: 'codex',
   model: 'us.openai.gpt-5.5',
   tokens: { input: 1, cachedInput: 0, cacheWrite: 0, output: 1, reasoning: 0 },
   costUsd,
 })
+
+/** A well-formed `run` journal line. */
+const runLine = (costUsd: number): string => JSON.stringify({ type: 'run', ...run(costUsd) })
 
 // D5: months are UTC calendar months. The reset is 00:00 UTC on the 1st, including across a year end.
 test('utcMonth and nextMonthStart follow the UTC calendar', t => {
@@ -2279,174 +2173,202 @@ test('utcMonth and nextMonthStart follow the UTC calendar', t => {
   t.end()
 })
 
-// A first start has no ledger: the month opens at zero, and what is appended survives a restart.
-test('a new ledger starts the month at zero and round-trips through a restart', t => {
-  const { dir, file } = scratch()
-  const first = openSpendLedger(file, logger().log, NOV_20)
-  t.equal(first.state(NOV_20).spentUsd, 0)
+// A first start has no journal: the month opens at zero, and what is recorded survives a restart. Each
+// record is one JSON line with its type first. Regression caught: a run counted only in memory, so a
+// restart reopened a reached cap at zero.
+test('a new month starts at zero and its runs round-trip through a restart', t => {
+  const { base, dir, nov } = scratch()
+  const first = openSpendLedger(dir, logger().log, NOV_20)
   t.equal(first.state(NOV_20).month, '2026-11')
-  first.append([entry(2.5), entry(1)], NOV_20)
-  const second = openSpendLedger(file, logger().log, NOV_20)
+  t.equal(first.state(NOV_20).spentUsd, 0)
+  t.equal(first.state(NOV_20).locked, false)
+  first.recordRuns([run(2.5, 'C1-1'), run(1, 'C1-2')], NOV_20)
+  const lines = fs.readFileSync(nov, 'utf8').split('\n')
+  t.equal(lines.length, 3, 'two lines, each ending in a newline')
+  t.ok(lines[0].startsWith('{"type":"run","at":'), lines[0])
+  const second = openSpendLedger(dir, logger().log, NOV_20)
   t.equal(second.state(NOV_20).spentUsd, 3.5)
-  t.equal(second.state(NOV_20).entries.length, 2)
-  t.notOk(second.state(NOV_20).locked)
-  fs.rmSync(dir, { recursive: true, force: true })
+  t.deepEqual(second.state(NOV_20).entries.map(e => e.runId), ['C1-1', 'C1-2'])
+  t.equal(second.state(NOV_20).locked, false)
+  fs.rmSync(base, { recursive: true, force: true })
   t.end()
 })
 
-// PR review findings (andrew-barnett/slack-review-bot#78): a failed snapshot write must not let spend
-// escape the cap, in this process or after a restart. The temp file is blocked by a directory, so the
-// write-then-rename fails while appends still work. Regression caught: keeping the lost charge only in
-// memory, so a restart reopened a reached cap at the snapshot's lower total.
-test('a failed write keeps the charge across a restart and locks until the snapshot is written', t => {
-  const { dir, file } = scratch()
-  const ledger = openSpendLedger(file, logger().log, NOV_20)
-  ledger.append([entry(90)], NOV_20)
-  fs.mkdirSync(`${file}.tmp`)
-  ledger.append([entry(20)], NOV_20)
-  t.equal(ledger.state(NOV_20).locked, true, 'reads as capped while the write is failing')
-  const restarted = openSpendLedger(file, logger().log, NOV_20)
-  t.equal(restarted.state(NOV_20).spentUsd, 110, 'a restart while still failing keeps the full total')
-  t.equal(restarted.state(NOV_20).locked, true, 'and stays capped')
-  fs.rmdirSync(`${file}.tmp`)
-  t.notOk(restarted.state(NOV_20).locked, 'the retry wrote the snapshot, so the month reopens on its own figures')
-  t.notOk(fs.existsSync(`${file}.pending`), 'the pending entries were folded in and removed')
-  t.equal(openSpendLedger(file, logger().log, NOV_20).state(NOV_20).spentUsd, 110, 'a later restart sees the full total once')
-  fs.rmSync(dir, { recursive: true, force: true })
+// Spec 7 / D5: a run at 02:00 UTC on Dec 1 (still Nov 30 in New York) is December's. Regression caught:
+// switching months on the ET calendar, which would charge five hours of December spend to November's cap,
+// or touching November's journal when December starts.
+test('a run just after 00:00 UTC lands in the new month and leaves the old journal untouched', t => {
+  const { base, dir, nov, dec } = scratch()
+  openSpendLedger(dir, logger().log, NOV_20).recordRuns([run(7)], NOV_20)
+  const november = fs.readFileSync(nov, 'utf8')
+  const ledger = openSpendLedger(dir, logger().log, DEC_1_0200Z)
+  ledger.recordRuns([{ ...run(3), at: new Date(DEC_1_0200Z).toISOString() }], DEC_1_0200Z)
+  t.equal(ledger.state(DEC_1_0200Z).month, '2026-12')
+  t.equal(ledger.state(DEC_1_0200Z).spentUsd, 3, 'November is not counted')
+  t.equal(fs.readFileSync(dec, 'utf8').split('\n').length, 2, 'one line in spend-2026-12.jsonl')
+  t.equal(fs.readFileSync(nov, 'utf8'), november, 'spend-2026-11.jsonl is byte for byte unchanged')
+  fs.rmSync(base, { recursive: true, force: true })
   t.end()
 })
 
-// When nothing in the state directory can be written, opening the ledger must already read as capped:
-// the probe write on open fails. Regression caught: a restart onto read-only storage admitting reviews
-// whose spend could never be recorded.
-test('opening the ledger on unwritable storage starts capped', t => {
-  const { dir, file } = scratch()
-  openSpendLedger(file, logger().log, NOV_20).append([entry(5)], NOV_20)
-  const stateDir = path.dirname(file)
-  fs.chmodSync(stateDir, 0o500)
-  try {
-    const ledger = openSpendLedger(file, logger().log, NOV_20)
-    t.equal(ledger.state(NOV_20).spentUsd, 5)
-    t.equal(ledger.state(NOV_20).locked, true)
-  } finally {
-    fs.chmodSync(stateDir, 0o700)
-  }
-  fs.rmSync(dir, { recursive: true, force: true })
-  t.end()
-})
-
-// Spec 9: rollover at a UTC boundary that is still the previous month in ET. The old month is archived as
-// spend-YYYY-MM.json and the new one starts at zero. Regression caught: rolling over on the ET calendar,
-// which would carry five hours of December spend into November's cap.
-test('the ledger rolls over at 00:00 UTC even while it is still the previous month in ET', t => {
-  const { dir, file } = scratch()
+// Spec 7 / ruling 8: a line that does not parse makes the month untrustworthy, so it reads as capped, and
+// the log names the line. Removing the line and restarting unlocks it with the good lines still counted.
+// Regression caught: skipping a bad line, which silently drops a charge and reopens spending.
+test('a bad line locks the month until it is removed', t => {
+  const { base, dir, nov } = scratch()
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(nov, `${runLine(4)}\n{"type":"run","costUsd":\n${runLine(6)}\n`)
   const { events, log } = logger()
-  const ledger = openSpendLedger(file, log, NOV_20)
-  ledger.append([entry(5)], NOV_20)
-  ledger.update({ alerted: [25], capAnnounced: true }, NOV_20)
+  const ledger = openSpendLedger(dir, log, NOV_20)
+  t.equal(ledger.state(NOV_20).locked, true)
+  t.equal(ledger.state(NOV_20).spentUsd, 10, 'the good lines still count')
+  const unreadable = events.filter(e => e.event === 'spend.unreadable')
+  t.equal(unreadable.length, 1)
+  t.equal(unreadable[0].fields.line, 2, 'the log names the bad line')
+  t.equal(unreadable[0].fields.file, nov)
+  fs.writeFileSync(nov, `${runLine(4)}\n${runLine(6)}\n`)
+  const repaired = openSpendLedger(dir, logger().log, NOV_20)
+  t.equal(repaired.state(NOV_20).locked, false, 'removing the line and restarting unlocks the month')
+  t.equal(repaired.state(NOV_20).spentUsd, 10)
+  fs.rmSync(base, { recursive: true, force: true })
+  t.end()
+})
+
+// A crash mid-append leaves a last line with no newline. It is treated as unreadable (the conservative
+// choice), and the next append starts on a fresh line, so removing the partial line loses nothing else.
+// Regression caught: the next record glued onto the partial line, making both unrecoverable.
+test('a partial last line locks the month, and later records start on their own line', t => {
+  const { base, dir, nov } = scratch()
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(nov, `${runLine(4)}\n{"type":"ru`)
+  const { events, log } = logger()
+  const ledger = openSpendLedger(dir, log, NOV_20)
+  t.equal(ledger.state(NOV_20).locked, true)
+  t.equal(events.find(e => e.event === 'spend.unreadable')?.fields.line, 2)
+  ledger.recordRuns([run(5)], NOV_20)
+  t.equal(fs.readFileSync(nov, 'utf8'), `${runLine(4)}\n{"type":"ru\n${runLine(5)}\n`, 'the new record is on its own line')
+  fs.writeFileSync(nov, `${runLine(4)}\n${runLine(5)}\n`)
+  t.equal(openSpendLedger(dir, logger().log, NOV_20).state(NOV_20).spentUsd, 9, 'removing the partial line keeps the later record')
+  fs.rmSync(base, { recursive: true, force: true })
+  t.end()
+})
+
+// A line in a shape this code does not know (another type, a hand edit, a negative cost) is as
+// untrustworthy as bad JSON, and gets the same treatment.
+test('a line with an unknown type or invalid fields locks the month', t => {
+  const at = new Date(NOV_20).toISOString()
+  for (const bad of [
+    { type: 'refund', at, costUsd: 1 },
+    { ...JSON.parse(runLine(1)), costUsd: -1 },
+    { ...JSON.parse(runLine(1)), engine: 'gemini' },
+    { ...JSON.parse(runLine(1)), tokens: { input: 1 } },
+    { type: 'alert', at, percent: 25.5 },
+    { type: 'cap', at, capUsd: 0 },
+    { type: 'cap', capUsd: 100 },
+    [1, 2],
+  ]) {
+    const { base, dir, nov } = scratch()
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(nov, `${JSON.stringify(bad)}\n`)
+    t.equal(openSpendLedger(dir, logger().log, NOV_20).state(NOV_20).locked, true, JSON.stringify(bad))
+    fs.rmSync(base, { recursive: true, force: true })
+  }
+  t.end()
+})
+
+// When the state directory cannot be written, opening the ledger already reads as capped: the probe on
+// open fails. Every state() retries the probe, so the month reopens on its own once storage recovers.
+// Regression caught: a restart onto read-only storage admitting reviews whose spend can never be
+// recorded, or a lock that only a restart clears.
+test('unwritable storage on open starts locked and unlocks once it is writable again', { skip: ROOT }, t => {
+  const { base, dir } = scratch()
+  openSpendLedger(dir, logger().log, NOV_20).recordRuns([run(5)], NOV_20)
+  fs.chmodSync(dir, 0o500)
+  try {
+    const { events, log } = logger()
+    const ledger = openSpendLedger(dir, log, NOV_20)
+    t.equal(ledger.state(NOV_20).spentUsd, 5, 'the journal is still read')
+    t.equal(ledger.state(NOV_20).locked, true)
+    t.ok(events.some(e => e.event === 'spend.write_failed'))
+    fs.chmodSync(dir, 0o700)
+    t.equal(ledger.state(NOV_20).locked, false, 'the next state() probes again and unlocks')
+    t.ok(events.some(e => e.event === 'spend.write_recovered'))
+  } finally {
+    fs.chmodSync(dir, 0o700)
+  }
+  fs.rmSync(base, { recursive: true, force: true })
+  t.end()
+})
+
+// Ruling 17: a run whose append fails still counts in this process (so it stays capped and counting),
+// and the process is locked until an append or probe succeeds. Once storage recovers the lock clears.
+// Only the failed run's cost is lost to a later restart: the accepted residual, which the AWS Budget
+// backstop covers. Regression caught: dropping the failed run from the in-memory total, or never clearing
+// the lock after storage recovers.
+test('a failed run append is counted in memory and locks until storage recovers', { skip: ROOT }, t => {
+  const { base, dir, nov } = scratch()
+  const { events, log } = logger()
+  const ledger = openSpendLedger(dir, log, NOV_20)
+  ledger.recordRuns([run(90, 'C1-1')], NOV_20)
+  fs.chmodSync(nov, 0o400)
+  ledger.recordRuns([run(20, 'C1-2')], NOV_20)
+  t.equal(ledger.state(NOV_20).spentUsd, 110, 'the failed run still counts in this process')
+  t.equal(ledger.state(NOV_20).locked, true, 'and the process reads as capped')
+  t.ok(events.some(e => e.event === 'spend.write_failed'))
+  t.equal(openSpendLedger(dir, logger().log, NOV_20).state(NOV_20).locked, true, 'a restart while storage still fails starts locked')
+  fs.chmodSync(nov, 0o600)
+  ledger.recordRuns([run(1, 'C1-3')], NOV_20)
+  t.equal(ledger.state(NOV_20).locked, false, 'the next successful append clears the lock')
+  t.equal(ledger.state(NOV_20).spentUsd, 111)
+  t.deepEqual(
+    openSpendLedger(dir, logger().log, NOV_20).state(NOV_20).entries.map(e => e.runId),
+    ['C1-1', 'C1-3'],
+    'after a restart only the failed run is missing (the accepted residual)'
+  )
+  fs.rmSync(base, { recursive: true, force: true })
+  t.end()
+})
+
+// Spec 8: alert and cap decisions are journaled before posting, so a restart never re-sends them. The cap
+// line records the cap it was sent for; a higher configured cap is not covered by it, which is how a cap
+// raise re-arms the message with no extra state. Regression caught: a boolean "announced" flag that a cap
+// raise never reset, so reaching the new cap was silent.
+test('alerts and the cap announcement persist across a restart, and the highest cap wins', t => {
+  const { base, dir } = scratch()
+  const ledger = openSpendLedger(dir, logger().log, NOV_20)
+  ledger.recordAlert(50, NOV_20)
+  ledger.recordAlert(25, NOV_20)
+  ledger.recordCapAnnounced(100, NOV_20)
+  const restarted = openSpendLedger(dir, logger().log, NOV_20)
+  t.deepEqual(restarted.state(NOV_20).alerted, [25, 50], 'ascending')
+  t.equal(restarted.state(NOV_20).capAnnouncedFor, 100)
+  t.ok(restarted.state(NOV_20).capAnnouncedFor! < 150, 'a cap raised to 150 is not yet announced')
+  restarted.recordCapAnnounced(150, NOV_20)
+  restarted.recordCapAnnounced(120, NOV_20)
+  t.equal(openSpendLedger(dir, logger().log, NOV_20).state(NOV_20).capAnnouncedFor, 150, 'the highest cap announced')
+  t.equal(openSpendLedger(dir, logger().log, DEC_1_0200Z).state(DEC_1_0200Z).capAnnouncedFor, undefined, 'a new month starts unannounced')
+  fs.rmSync(base, { recursive: true, force: true })
+  t.end()
+})
+
+// The bot runs across a month end. The first call in the new UTC month switches to the new journal and
+// starts at zero, and nothing is renamed or deleted. Regression caught: last month's spend or alerts
+// counting against this month, or the old journal being moved away.
+test('a month change mid-process switches journals without renaming or deleting anything', t => {
+  const { base, dir, nov, dec } = scratch()
+  const { events, log } = logger()
+  const ledger = openSpendLedger(dir, log, NOV_20)
+  ledger.recordRuns([run(5)], NOV_20)
+  ledger.recordAlert(25, NOV_20)
+  const november = fs.readFileSync(nov, 'utf8')
   const december = ledger.state(DEC_1_0200Z)
   t.equal(december.month, '2026-12')
   t.equal(december.spentUsd, 0)
   t.deepEqual(december.alerted, [], 'alerts start over each month')
-  t.equal(december.capAnnounced, false)
-  const archive = JSON.parse(fs.readFileSync(path.join(path.dirname(file), 'spend-2026-11.json'), 'utf8'))
-  t.equal(archive.month, '2026-11')
-  t.equal(archive.spentUsd, 5, 'the November ledger is kept for auditing')
-  t.equal(JSON.parse(fs.readFileSync(file, 'utf8')).month, '2026-12', 'spend.json is the new month')
-  t.ok(events.some(e => e.event === 'spend.rollover'))
-  fs.rmSync(dir, { recursive: true, force: true })
-  t.end()
-})
-
-// The bot can be stopped across a month end. A stale ledger found at startup rolls over on open, so last
-// month's spend never counts against this month's cap.
-test('a ledger from a past month rolls over when it is opened', t => {
-  const { dir, file } = scratch()
-  openSpendLedger(file, logger().log, NOV_20).append([entry(9)], NOV_20)
-  const reopened = openSpendLedger(file, logger().log, Date.UTC(2027, 0, 3))
-  t.equal(reopened.state(Date.UTC(2027, 0, 3)).month, '2027-01')
-  t.equal(reopened.state(Date.UTC(2027, 0, 3)).spentUsd, 0)
-  t.ok(fs.existsSync(path.join(path.dirname(file), 'spend-2026-11.json')))
-  fs.rmSync(dir, { recursive: true, force: true })
-  t.end()
-})
-
-// Spec 7/9: an unreadable ledger keeps the bad file as spend.json.corrupt-<ts> and starts the month capped
-// (locked), never at 0. A restart must not clear it (the fresh file is itself locked); deleting the file
-// and restarting does. Regression caught: a lost ledger silently reopening spending.
-test('an unreadable ledger is kept aside and the month starts capped until the file is cleared', t => {
-  const { dir, file } = scratch()
-  fs.mkdirSync(path.dirname(file), { recursive: true })
-  fs.writeFileSync(file, '{"version":1,"month":"2026-11","spentUsd":')
-  const { events, log } = logger()
-  const ledger = openSpendLedger(file, log, NOV_20)
-  t.equal(ledger.state(NOV_20).locked, true)
-  t.equal(ledger.state(NOV_20).spentUsd, 0)
-  const kept = fs.readdirSync(path.dirname(file)).filter(name => name.startsWith('spend.json.corrupt-'))
-  t.equal(kept.length, 1, 'the bad file is kept')
-  t.equal(fs.readFileSync(path.join(path.dirname(file), kept[0]), 'utf8'), '{"version":1,"month":"2026-11","spentUsd":', 'byte for byte')
-  t.ok(events.some(e => e.event === 'spend.unreadable'))
-  t.equal(openSpendLedger(file, logger().log, NOV_20).state(NOV_20).locked, true, 'a plain restart keeps it locked')
-  fs.rmSync(file)
-  t.notOk(openSpendLedger(file, logger().log, NOV_20).state(NOV_20).locked, 'deleting spend.json and restarting clears it')
-  fs.rmSync(dir, { recursive: true, force: true })
-  t.end()
-})
-
-// A ledger in a shape this code does not know (another version, a hand edit) is as untrustworthy as bad
-// JSON, and gets the same treatment.
-test('a ledger with the wrong version or shape is treated as unreadable', t => {
-  for (const bad of [
-    { version: 2, month: '2026-11', spentUsd: 1, alerted: [], capAnnounced: false, entries: [] },
-    { version: 1, month: '2026-13', spentUsd: 1, alerted: [], capAnnounced: false, entries: [] },
-    { version: 1, month: '2026-11', spentUsd: -1, alerted: [], capAnnounced: false, entries: [] },
-    { version: 1, month: '2026-11', spentUsd: 1, alerted: [25.5], capAnnounced: false, entries: [] },
-  ]) {
-    const { dir, file } = scratch()
-    fs.mkdirSync(path.dirname(file), { recursive: true })
-    fs.writeFileSync(file, JSON.stringify(bad))
-    t.equal(openSpendLedger(file, logger().log, NOV_20).state(NOV_20).locked, true, JSON.stringify(bad))
-    fs.rmSync(dir, { recursive: true, force: true })
-  }
-  t.end()
-})
-
-// An unreadable ledger locks only its own month: the next UTC month starts clean.
-test('a locked month unlocks at the next UTC month', t => {
-  const { dir, file } = scratch()
-  fs.mkdirSync(path.dirname(file), { recursive: true })
-  fs.writeFileSync(file, 'not json')
-  const ledger = openSpendLedger(file, logger().log, NOV_20)
-  t.equal(ledger.state(NOV_20).locked, true)
-  t.notOk(ledger.state(DEC_1_0200Z).locked)
-  fs.rmSync(dir, { recursive: true, force: true })
-  t.end()
-})
-
-// Alert state is persisted (spec 8: "persisted before posting"), deduplicated and kept in order.
-test('update persists alerted thresholds and capAnnounced', t => {
-  const { dir, file } = scratch()
-  const ledger = openSpendLedger(file, logger().log, NOV_20)
-  ledger.update({ alerted: [50, 25, 50] }, NOV_20)
-  ledger.update({ capAnnounced: true }, NOV_20)
-  const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'))
-  t.deepEqual(onDisk.alerted, [25, 50])
-  t.equal(onDisk.capAnnounced, true)
-  fs.rmSync(dir, { recursive: true, force: true })
-  t.end()
-})
-
-// A ledger that cannot be written must not take a review down: the failure is logged and the in-memory
-// month keeps counting, so the cap still applies for the life of the process.
-test('a failed write is logged and the in-memory ledger keeps counting', t => {
-  const { dir, file } = scratch()
-  const { events, log } = logger()
-  const ledger = openSpendLedger(file, log, NOV_20)
-  fs.mkdirSync(`${file}.tmp`)
-  ledger.append([entry(4)], NOV_20)
-  t.equal(ledger.state(NOV_20).spentUsd, 4)
-  t.ok(events.some(e => e.event === 'spend.write_failed'))
-  fs.rmSync(dir, { recursive: true, force: true })
+  t.ok(events.some(e => e.event === 'spend.month_started'))
+  t.deepEqual(fs.readdirSync(dir).sort(), [path.basename(nov), path.basename(dec)], 'both journals, nothing else')
+  t.equal(fs.readFileSync(nov, 'utf8'), november, 'November is untouched')
+  fs.rmSync(base, { recursive: true, force: true })
   t.end()
 })
 ```
@@ -2461,19 +2383,19 @@ Expected: FAIL with `Cannot find module './spend-ledger'`.
 Create `src/spend-ledger.ts`:
 
 ```ts
-// The month-to-date Bedrock spend ledger (spec section 7): spend.json beside the cursor file. It holds
-// what the bot has priced this UTC month and which alerts it has sent. `spentUsd` never leaves the
+// The month-to-date Bedrock spend ledger (spec section 7): one append-only JSON Lines journal per UTC
+// month, spend-YYYY-MM.jsonl in the cursor file's directory. Each line is a priced engine run, a decided
+// threshold alert, or a decided cap-reached message. The bot never rewrites, renames or deletes a
+// journal: a new month is a new file name, and old months stay for audit. `spentUsd` never leaves the
 // process: user-facing text shows percentages only (spec section 1).
 
 import * as fs from 'fs'
 import * as path from 'path'
-import { writeJsonAtomic } from './atomic-file'
 import type { EngineName } from './config'
 import type { LedgerTokens } from './pricing'
 
-export const SPEND_LEDGER_VERSION = 1
-
-export interface SpendEntry {
+/** One priced engine run: a `run` line without its `type`. */
+export interface SpendRun {
   at: string
   runId: string
   engine: EngineName
@@ -2484,27 +2406,31 @@ export interface SpendEntry {
   noUsage?: true
 }
 
-export interface SpendFile {
-  version: typeof SPEND_LEDGER_VERSION
+/** What the current month's journal adds up to. */
+export interface SpendState {
   /** The UTC month, `YYYY-MM`. */
   month: string
+  /** The sum of the month's run costs. */
   spentUsd: number
-  /** Alert thresholds already announced this month. */
+  /** Alert thresholds already decided this month, ascending. */
   alerted: number[]
-  /** The cap-reached message has been sent; reset when the percent drops below 100 (spec section 8). */
-  capAnnounced: boolean
-  /** The previous ledger was unreadable: this month counts as capped until an operator clears it (ruling 8). */
-  locked?: true
-  entries: SpendEntry[]
+  /** The highest cap a cap-reached message was decided for this month; absent when none was. */
+  capAnnouncedFor?: number
+  /** The journal has a bad line, or storage cannot be written: the month reads as capped (ruling 8). */
+  locked: boolean
+  /** The month's runs, in journal order. */
+  entries: SpendRun[]
 }
 
 export interface SpendLedger {
-  /** This month's ledger, rolled over first if the UTC month has changed. */
-  state(nowMs: number): Readonly<SpendFile>
-  /** Add priced entries and their cost, then persist. */
-  append(entries: SpendEntry[], nowMs: number): void
-  /** Replace the alert state, then persist. */
-  update(change: { alerted?: number[]; capAnnounced?: boolean }, nowMs: number): void
+  /** This month's state, switching to the new month's journal first if the UTC month has changed. */
+  state(nowMs: number): Readonly<SpendState>
+  /** Count the runs, then append them in one write. Never throws. */
+  recordRuns(runs: SpendRun[], nowMs: number): void
+  /** Mark the threshold alerted, then append it. Called before posting. Never throws. */
+  recordAlert(percent: number, nowMs: number): void
+  /** Mark the cap-reached message decided for `capUsd`, then append it. Called before posting. Never throws. */
+  recordCapAnnounced(capUsd: number, nowMs: number): void
 }
 
 type Log = (event: string, fields: Record<string, unknown>) => void
@@ -2521,179 +2447,215 @@ export function nextMonthStart(ms: number): number {
   return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1)
 }
 
-function fresh(month: string, locked = false): SpendFile {
-  return {
-    version: SPEND_LEDGER_VERSION,
-    month,
-    spentUsd: 0,
-    alerted: [],
-    capAnnounced: false,
-    ...(locked ? { locked: true as const } : {}),
-    entries: [],
-  }
+/** The journal for `month` (`YYYY-MM`) in the state directory `dir`. */
+export function spendFileFor(dir: string, month: string): string {
+  return path.join(dir, `spend-${month}.jsonl`)
 }
 
-/** The ledger in `raw`, or the reason it cannot be trusted. Entries are kept as written (audit only). */
-function parseLedger(raw: string): SpendFile | string {
+const UNREADABLE_HINT = 'this month reads as capped; fix or remove the bad line and restart'
+const WRITE_HINT = 'new reviews are refused until the spend journal can be written'
+
+const isObject = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+const nonNegative = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0
+const TOKEN_FIELDS = ['input', 'cachedInput', 'cacheWrite', 'output', 'reasoning'] as const
+
+type JournalLine = { type: 'run'; run: SpendRun } | { type: 'alert'; percent: number } | { type: 'cap'; capUsd: number }
+
+/** One journal line, or the reason it cannot be trusted. */
+function parseLine(text: string): JournalLine | string {
   let value: unknown
   try {
-    value = JSON.parse(raw)
+    value = JSON.parse(text)
   } catch (error) {
     return `not JSON: ${String(error)}`
   }
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return 'not a JSON object'
-  const v = value as Record<string, unknown>
-  if (v.version !== SPEND_LEDGER_VERSION) return `unknown version ${String(v.version)}`
-  if (typeof v.month !== 'string' || !/^\d{4}-(0[1-9]|1[0-2])$/.test(v.month)) return 'bad month'
-  if (typeof v.spentUsd !== 'number' || !Number.isFinite(v.spentUsd) || v.spentUsd < 0) return 'bad spentUsd'
-  if (!Array.isArray(v.alerted) || !v.alerted.every(p => Number.isInteger(p))) return 'bad alerted'
-  if (typeof v.capAnnounced !== 'boolean') return 'bad capAnnounced'
-  if (v.locked !== undefined && v.locked !== true) return 'bad locked'
-  if (!Array.isArray(v.entries)) return 'bad entries'
-  return {
-    version: SPEND_LEDGER_VERSION,
-    month: v.month,
-    spentUsd: v.spentUsd,
-    alerted: [...(v.alerted as number[])],
-    capAnnounced: v.capAnnounced,
-    ...(v.locked ? { locked: true as const } : {}),
-    entries: v.entries as SpendEntry[],
+  if (!isObject(value)) return 'not a JSON object'
+  const at = value.at
+  if (typeof at !== 'string' || Number.isNaN(Date.parse(at))) return 'bad "at"'
+  if (value.type === 'run') {
+    const { runId, engine, model, tokens, costUsd, noUsage } = value
+    if (typeof runId !== 'string' || typeof model !== 'string') return 'bad run: runId and model must be strings'
+    if (engine !== 'codex' && engine !== 'claude') return 'bad run: unknown engine'
+    if (!isObject(tokens) || !TOKEN_FIELDS.every(field => nonNegative(tokens[field]))) return 'bad run: tokens'
+    if (!nonNegative(costUsd)) return 'bad run: costUsd'
+    if (noUsage !== undefined && noUsage !== true) return 'bad run: noUsage'
+    const counts = tokens as Record<(typeof TOKEN_FIELDS)[number], number>
+    return {
+      type: 'run',
+      run: {
+        at,
+        runId,
+        engine,
+        model,
+        tokens: {
+          input: counts.input,
+          cachedInput: counts.cachedInput,
+          cacheWrite: counts.cacheWrite,
+          output: counts.output,
+          reasoning: counts.reasoning,
+        },
+        costUsd,
+        ...(noUsage ? { noUsage: true as const } : {}),
+      },
+    }
+  }
+  if (value.type === 'alert') {
+    const percent = value.percent
+    return typeof percent === 'number' && Number.isInteger(percent) && percent >= 1 && percent <= 99
+      ? { type: 'alert', percent }
+      : 'bad alert: percent must be an integer from 1 to 99'
+  }
+  if (value.type === 'cap') {
+    const capUsd = value.capUsd
+    return typeof capUsd === 'number' && Number.isFinite(capUsd) && capUsd > 0 ? { type: 'cap', capUsd } : 'bad cap: capUsd must be above zero'
+  }
+  return `unknown type ${JSON.stringify(value.type)}`
+}
+
+/** One month's journal, as read and as recorded since. */
+interface Month {
+  month: string
+  file: string
+  spentUsd: number
+  alerted: Set<number>
+  capAnnouncedFor?: number
+  /** A line could not be trusted: the month stays locked until the line is fixed and the bot restarts. */
+  unreadable: boolean
+  /** The file ends without a newline (a crash mid-append): the next append starts a fresh line first. */
+  partialTail: boolean
+  entries: SpendRun[]
+}
+
+function applyLine(m: Month, line: JournalLine): void {
+  if (line.type === 'run') {
+    m.entries.push(line.run)
+    m.spentUsd += line.run.costUsd
+  } else if (line.type === 'alert') {
+    m.alerted.add(line.percent)
+  } else {
+    m.capAnnouncedFor = Math.max(m.capAnnouncedFor ?? 0, line.capUsd)
   }
 }
 
-export function openSpendLedger(file: string, log: Log, nowMs: number = Date.now()): SpendLedger {
-  // Entries whose snapshot write failed are appended here, one JSON line each. An append goes through a
-  // different path from the snapshot's write-then-rename, so it usually survives what broke the snapshot
-  // (a blocked temp file, a full rename target). Opening the ledger merges these entries back in, so a
-  // restart never reopens spending at the snapshot's lower total. A crash between a successful snapshot
-  // and deleting this file counts those entries twice: an overcount, the safe direction for a cap.
-  const pendingFile = `${file}.pending`
-  // True while the last snapshot write failed: the month reads as capped (no new review starts) until a
-  // write of the full in-memory state succeeds. Every read retries the write.
-  let writeFailing = false
-  const persist = (state: SpendFile): void => {
-    try {
-      writeJsonAtomic(file, state)
-      fs.rmSync(pendingFile, { force: true })
-      if (writeFailing) log('spend.write_recovered', { file })
-      writeFailing = false
-    } catch (error) {
-      // Never throw: a ledger that cannot be written must not take a review down.
-      writeFailing = true
-      log('spend.write_failed', { file, error: String(error), hint: 'new reviews are refused until spend.json can be written' })
-    }
-  }
-  const keepPending = (entries: SpendEntry[]): void => {
-    try {
-      fs.appendFileSync(pendingFile, entries.map(e => `${JSON.stringify(e)}\n`).join(''))
-    } catch (error) {
-      // Nothing on disk can be written. This process still refuses new reviews; the unrecorded spend is
-      // at most the reviews already running, and the AWS Budget backstop covers it.
-      log('spend.pending_failed', { file: pendingFile, error: String(error) })
-    }
-  }
-
-  let raw: string | undefined
-  let problem: string | undefined
+/** Read `month`'s journal. A missing file is an empty month; any line that cannot be trusted locks it. */
+function readMonth(dir: string, month: string, log: Log): Month {
+  const file = spendFileFor(dir, month)
+  const m: Month = { month, file, spentUsd: 0, alerted: new Set(), unreadable: false, partialTail: false, entries: [] }
+  let raw: string
   try {
     raw = fs.readFileSync(file, 'utf8')
   } catch (error) {
-    // Absent is a first start. Present but unreadable is as untrustworthy as corrupt.
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') problem = `unreadable: ${String(error)}`
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return m
+    log('spend.unreadable', { file, reason: `cannot read: ${String(error)}`, hint: UNREADABLE_HINT })
+    m.unreadable = true
+    return m
   }
-  const parsed = raw === undefined ? undefined : parseLedger(raw)
-  if (typeof parsed === 'string') problem = parsed
+  const bad = (line: number, reason: string): void => {
+    m.unreadable = true
+    log('spend.unreadable', { file, line, reason, hint: UNREADABLE_HINT })
+  }
+  const lines = raw.split('\n')
+  // What follows the last newline: empty for a whole journal, a partial line after a crash mid-append.
+  const tail = lines.pop() ?? ''
+  lines.forEach((text, index) => {
+    if (text.trim() === '') return
+    const parsed = parseLine(text)
+    if (typeof parsed === 'string') bad(index + 1, parsed)
+    else applyLine(m, parsed)
+  })
+  if (tail !== '') {
+    // Conservative: even a tail that would parse is treated as a write that may not have finished.
+    bad(lines.length + 1, 'partial last line (no trailing newline)')
+    m.partialTail = true
+  }
+  return m
+}
 
-  let current: SpendFile
-  if (problem !== undefined) {
-    const kept = `${file}.corrupt-${new Date(nowMs).toISOString().replace(/[:.]/g, '-')}`
+/**
+ * Open the journal for the current UTC month in `dir` (Task 5's `spendDir`). Reading never throws: an
+ * untrustworthy journal, or storage that cannot be written, makes the month read as capped instead.
+ */
+export function openSpendLedger(dir: string, log: Log, nowMs: number = Date.now()): SpendLedger {
+  // True while the last append or probe failed. The month reads as capped until one succeeds, and every
+  // state() retries the probe, so the lock clears on its own once storage recovers.
+  let writeFailing = false
+  const succeeded = (file: string): void => {
+    if (writeFailing) log('spend.write_recovered', { file })
+    writeFailing = false
+  }
+  const failed = (file: string, error: unknown): void => {
+    writeFailing = true
+    log('spend.write_failed', { file, error: String(error), hint: WRITE_HINT })
+  }
+  /** Can the journal be appended to? A zero-byte append creates a missing file and writes nothing. */
+  const probe = (m: Month): void => {
     try {
-      fs.renameSync(file, kept)
+      fs.mkdirSync(dir, { recursive: true })
+      fs.accessSync(dir, fs.constants.W_OK)
+      fs.appendFileSync(m.file, '')
+      succeeded(m.file)
     } catch (error) {
-      log('spend.corrupt_keep_failed', { file, kept, error: String(error) })
+      failed(m.file, error)
     }
-    // A lost ledger must never reopen spending silently (spec section 7): this month starts capped.
-    log('spend.unreadable', {
-      file,
-      kept,
-      reason: problem,
-      hint: 'starting this month capped; repair or delete spend.json and restart to clear it',
-    })
-    current = fresh(utcMonth(nowMs), true)
-    persist(current)
-  } else if (parsed !== undefined && typeof parsed !== 'string') {
-    current = parsed
-  } else {
-    current = fresh(utcMonth(nowMs))
-    persist(current)
+  }
+  /** One append per call. Never throws: a ledger that cannot be written must not take a review down. */
+  const append = (m: Month, records: object[]): void => {
+    const text = `${m.partialTail ? '\n' : ''}${records.map(record => `${JSON.stringify(record)}\n`).join('')}`
+    try {
+      fs.mkdirSync(dir, { recursive: true })
+      fs.appendFileSync(m.file, text)
+      m.partialTail = false
+      succeeded(m.file)
+    } catch (error) {
+      failed(m.file, error)
+    }
   }
 
-  /** On the first read or write in a new UTC month, archive the old month and start a fresh one. */
-  const roll = (now: number): void => {
+  let current = readMonth(dir, utcMonth(nowMs), log)
+  probe(current)
+
+  /** The month for `now`: on the first call in a new UTC month, read (and probe) that month's journal. */
+  const monthAt = (now: number): Month => {
     const month = utcMonth(now)
-    if (month === current.month) return
-    const archive = path.join(path.dirname(file), `spend-${current.month}.json`)
-    try {
-      if (fs.existsSync(file)) fs.renameSync(file, archive)
-    } catch (error) {
-      log('spend.write_failed', { file: archive, error: String(error) })
+    if (month !== current.month) {
+      log('spend.month_started', { from: current.month, to: month, file: spendFileFor(dir, month) })
+      current = readMonth(dir, month, log)
+      probe(current)
     }
-    log('spend.rollover', { from: current.month, to: month, archive })
-    current = fresh(month)
-    persist(current)
+    return current
   }
-  roll(nowMs)
-
-  // Merge entries a failed snapshot left behind (see pendingFile). A line that does not parse makes the
-  // month untrustworthy, so it starts locked, as for an unreadable spend.json.
-  let pendingRaw: string | undefined
-  try {
-    pendingRaw = fs.readFileSync(pendingFile, 'utf8')
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      log('spend.unreadable', { file: pendingFile, reason: `unreadable: ${String(error)}`, hint: 'starting this month capped' })
-      current = { ...current, locked: true }
-    }
-  }
-  if (pendingRaw !== undefined) {
-    const lines = pendingRaw.split('\n').filter(line => line.trim() !== '')
-    for (const line of lines) {
-      try {
-        const e = JSON.parse(line) as SpendEntry
-        if (typeof e.costUsd !== 'number' || !Number.isFinite(e.costUsd) || e.costUsd < 0) throw new Error('bad costUsd')
-        current.entries.push(e)
-        current.spentUsd += e.costUsd
-      } catch (error) {
-        log('spend.unreadable', { file: pendingFile, reason: String(error), hint: 'starting this month capped' })
-        current = { ...current, locked: true }
-      }
-    }
-    log('spend.pending_merged', { file: pendingFile, entries: lines.length })
-  }
-  // Always write once on open: it folds merged entries into spend.json, and it probes the storage. If the
-  // write still fails, the month reads as capped from the first request, not only after a later failure.
-  persist(current)
 
   return {
     state(now) {
-      roll(now)
-      if (writeFailing) persist(current)
-      // A failing write is reported as a locked month (read as at least 100%) without persisting the flag:
-      // once the write succeeds, the full total is on disk and the month reopens on its own figures.
-      return writeFailing && !current.locked ? { ...current, locked: true } : current
+      const m = monthAt(now)
+      if (writeFailing) probe(m)
+      return {
+        month: m.month,
+        spentUsd: m.spentUsd,
+        alerted: [...m.alerted].sort((a, b) => a - b),
+        ...(m.capAnnouncedFor !== undefined ? { capAnnouncedFor: m.capAnnouncedFor } : {}),
+        locked: m.unreadable || writeFailing,
+        entries: m.entries,
+      }
     },
-    append(entries, now) {
-      roll(now)
-      current.entries.push(...entries)
-      current.spentUsd += entries.reduce((sum, e) => sum + e.costUsd, 0)
-      persist(current)
-      if (writeFailing) keepPending(entries)
+    recordRuns(runs, now) {
+      if (runs.length === 0) return
+      const m = monthAt(now)
+      // Counted before the append: if it fails, this process still counts the run and stays capped
+      // (ruling 17).
+      for (const run of runs) applyLine(m, { type: 'run', run })
+      append(m, runs.map(run => ({ type: 'run', ...run })))
     },
-    update(change, now) {
-      roll(now)
-      if (change.alerted) current.alerted = [...new Set(change.alerted)].sort((a, b) => a - b)
-      if (change.capAnnounced !== undefined) current.capAnnounced = change.capAnnounced
-      persist(current)
+    recordAlert(percent, now) {
+      const m = monthAt(now)
+      applyLine(m, { type: 'alert', percent })
+      append(m, [{ type: 'alert', at: new Date(now).toISOString(), percent }])
+    },
+    recordCapAnnounced(capUsd, now) {
+      const m = monthAt(now)
+      applyLine(m, { type: 'cap', capUsd })
+      append(m, [{ type: 'cap', at: new Date(now).toISOString(), capUsd }])
     },
   }
 }
@@ -2702,7 +2664,7 @@ export function openSpendLedger(file: string, log: Log, nowMs: number = Date.now
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `npx ts-node --compiler-options '{"module":"commonjs"}' --transpile-only src/spend-ledger.test.ts`
-Expected: PASS (all eleven tests).
+Expected: PASS (all ten tests). Run as root, the two permission tests are skipped.
 
 Run: `npm test 2>&1 | tail -4 && npm run typecheck`
 Expected: `# ok`, then `tsc` exits 0.
@@ -2714,10 +2676,10 @@ Write `/tmp/srb-commit-msg.txt` with the editor tool:
 ```text
 feat(spend): add the month-to-date Bedrock spend ledger (refs andrew-barnett/slack-review-bot#76)
 
-spend.json holds this UTC month's priced spend and alert state. A new
-month archives the old file as spend-YYYY-MM.json; an unreadable file is
-kept aside and the month starts capped, so a lost ledger never reopens
-spending silently.
+Each UTC month is an append-only spend-YYYY-MM.jsonl journal of priced
+runs and decided alerts, so nothing is ever rewritten, renamed or
+deleted. A bad or partial line, or storage that cannot be written, makes
+the month read as capped, so a lost record never reopens spending.
 
 [cc](https://claude.com/claude-code)
 ```
@@ -2735,7 +2697,7 @@ Run: `git add src/spend-ledger.ts src/spend-ledger.test.ts && git commit -F /tmp
 **Interfaces:**
 - Consumes: Task 3 `defaultPricesFile()`.
 - Produces (src/config.ts, daemon-only `Config` fields, all filled by `loadConfig`):
-  - `spendCapUsd: number`, `spendAlertPercents: number[]`, `spendAlertHerePercents: number[]`, `spendAlertChannel: string` (empty when there is none, ruling 7), `bedrockPricesFile: string`, `spendFile: string`
+  - `spendCapUsd: number`, `spendAlertPercents: number[]`, `spendAlertHerePercents: number[]`, `spendAlertChannel: string` (empty when there is none, ruling 7), `bedrockPricesFile: string`, `spendDir: string` (the directory of the monthly `spend-YYYY-MM.jsonl` journals)
   - `parseCapUsd(raw: string | undefined): number`
   - `parseAlertPercents(raw: string | undefined): number[]`
   - `parseHerePercents(raw: string | undefined, alertPercents: number[]): number[]`
@@ -2762,17 +2724,17 @@ test('the spend settings default as the spec says', t => {
   t.deepEqual(c.spendAlertHerePercents, [75, 90])
   t.equal(c.spendAlertChannel, 'C0123456789', 'the first allowlisted channel')
   t.ok(c.bedrockPricesFile.endsWith(path.join('pricing', 'bedrock-prices.json')), c.bedrockPricesFile)
-  t.equal(c.spendFile, '/home/u/.local/state/slack-review-bot/spend.json')
+  t.equal(c.spendDir, '/home/u/.local/state/slack-review-bot')
   t.end()
 })
 
-// Spec 7 / ruling 9: spend.json sits beside CURSOR_FILE (the container's state volume), and an empty
-// CURSOR_FILE, which disables the cursor, must not disable the ledger with it.
-test('spend.json sits beside CURSOR_FILE, and an empty CURSOR_FILE never disables it', t => {
+// Spec 7 / ruling 9: the monthly journals sit beside CURSOR_FILE (the container's state volume), and an
+// empty CURSOR_FILE, which disables the cursor, must not disable the ledger with it.
+test('the spend journals sit beside CURSOR_FILE, and an empty CURSOR_FILE never disables them', t => {
   const container = loadConfig({ ...credentials, HOME: '/home/bot', CURSOR_FILE: '/var/lib/slack-review-bot/state/cursors.json' })
-  t.equal(container.spendFile, '/var/lib/slack-review-bot/state/spend.json')
+  t.equal(container.spendDir, '/var/lib/slack-review-bot/state')
   const noCursor = loadConfig({ ...credentials, HOME: '/home/u', CURSOR_FILE: '' })
-  t.equal(noCursor.spendFile, '/home/u/.local/state/slack-review-bot/spend.json')
+  t.equal(noCursor.spendDir, '/home/u/.local/state/slack-review-bot')
   t.end()
 })
 
@@ -2901,8 +2863,8 @@ with:
   spendAlertChannel: string
   /** BEDROCK_PRICES_FILE: the price table spend is computed from. */
   bedrockPricesFile: string
-  /** The month-to-date ledger, spend.json in the cursor file's directory (spec section 7). */
-  spendFile: string
+  /** Where the month-to-date ledger's spend-YYYY-MM.jsonl journals live: the cursor file's directory (spec section 7). */
+  spendDir: string
 }
 ```
 
@@ -3022,7 +2984,7 @@ with:
     bedrockPricesFile: env.BEDROCK_PRICES_FILE || defaultPricesFile(),
     // Beside the cursor file (on the orchestrator state volume in the container). An empty CURSOR_FILE
     // disables the cursor, never the ledger (ruling 9).
-    spendFile: path.join(cursorFile ? path.dirname(cursorFile) : stateDir, 'spend.json'),
+    spendDir: cursorFile ? path.dirname(cursorFile) : stateDir,
   }
 }
 ```
@@ -3072,8 +3034,8 @@ Write `/tmp/srb-commit-msg.txt` with the editor tool:
 feat(config): read the Bedrock spend cap settings (refs andrew-barnett/slack-review-bot#76)
 
 BEDROCK_MONTHLY_CAP_USD, the alert percents and channel, and the price
-file path are parsed and validated at startup; spend.json lives beside
-the cursor file. The orchestrator gets the settings and the model IDs it
+file path are parsed and validated at startup; the monthly spend
+journals live beside the cursor file. The orchestrator gets the settings and the model IDs it
 prices by through compose.yaml.
 
 [cc](https://claude.com/claude-code)
@@ -3091,7 +3053,7 @@ Run: `git add src/config.ts src/config-spend.test.ts compose.yaml src/container-
 - Test: `src/spend-messages.test.ts`, `src/spend-cap.test.ts` (create), `src/status.test.ts` (append)
 
 **Interfaces:**
-- Consumes: Task 3 `loadPriceTable`, `priceCodex`, `priceClaude`, `PriceTable`, `LedgerTokens`; Task 4 `openSpendLedger`, `nextMonthStart`, `SpendLedger`, `SpendFile`, `SpendEntry`; Task 5 `Config` spend fields; Task 2 `RunUsage.codex`.
+- Consumes: Task 3 `loadPriceTable`, `priceCodex`, `priceClaude`, `PriceTable`, `LedgerTokens`; Task 4 `openSpendLedger`, `nextMonthStart`, `SpendLedger`, `SpendState`, `SpendRun`; Task 5 `Config` spend fields; Task 2 `RunUsage.codex`.
 - Produces:
   - src/spend-messages.ts:
     - `type SpendStatus = { active: false } | { active: true; percent: number; resetsAt: number }`
@@ -3101,7 +3063,7 @@ Run: `git add src/config.ts src/config-spend.test.ts compose.yaml src/container-
     - `interface SpendCapSettings { capUsd: number; alertPercents: number[]; herePercents: number[]; alertChannel: string }`
     - `interface SpendCap { readonly active: boolean; capped(nowMs: number): boolean; record(usage: RunUsage, runId: string, nowMs: number): Promise<void>; status(nowMs: number): SpendStatus }`
     - `spendCapActive(config: Pick<Config, 'runtime' | 'engineAuth'>): boolean`
-    - `spendPercent(state: Pick<SpendFile, 'spentUsd' | 'locked'>, capUsd: number): number`
+    - `spendPercent(state: Pick<SpendState, 'spentUsd' | 'locked'>, capUsd: number): number`
     - `inactiveSpendCap(): SpendCap`
     - `createSpendCap(deps: SpendCapDeps): SpendCap`
     - `type SpendCapConfig` (the `Config` fields `openSpendCap` reads)
@@ -3245,7 +3207,7 @@ import { loadConfig } from './config'
 import { orchestratorConfig } from './orchestrator'
 import type { PriceTable } from './pricing'
 import { createSpendCap, inactiveSpendCap, spendCapActive, spendPercent, type SpendCapSettings } from './spend-cap'
-import { openSpendLedger, type SpendLedger } from './spend-ledger'
+import { openSpendLedger, spendFileFor, type SpendLedger } from './spend-ledger'
 import { renderCapReachedAlert, renderCapRefusal, renderSpendStatusLine, renderThresholdAlert } from './spend-messages'
 import type { ClaudeUsageDetail, CodexUsageDetail, RunUsage } from './usage'
 
@@ -3280,7 +3242,7 @@ function harness(settings: Partial<SpendCapSettings> = {}, dir: string = fs.mkdt
   const events: Array<{ event: string; fields: Record<string, unknown> }> = []
   const log = (event: string, fields: Record<string, unknown>) => void events.push({ event, fields })
   let failPosts = false
-  const ledger = openSpendLedger(path.join(dir, 'spend.json'), log, NOW)
+  const ledger = openSpendLedger(dir, log, NOW)
   const cap = createSpendCap({
     ledger,
     prices,
@@ -3338,7 +3300,7 @@ test('a jump past the cap sends only the cap message and caps', async t => {
   await h.cap.record(codexRun(130), 'C1-2', NOW)
   t.deepEqual(h.posts.map(p => p.text), [renderCapReachedAlert(DEC_1)], 'nothing under 25%, then only the cap message')
   t.deepEqual(h.ledger.state(NOW).alerted, [25, 50, 75, 90])
-  t.equal(h.ledger.state(NOW).capAnnounced, true)
+  t.equal(h.ledger.state(NOW).capAnnouncedFor, 100, 'announced for the 100-dollar cap')
   t.ok(h.cap.capped(NOW))
   t.deepEqual(h.cap.status(NOW), { active: true, percent: 150, resetsAt: DEC_1 })
   await h.cap.record(codexRun(5), 'C1-3', NOW)
@@ -3369,10 +3331,29 @@ test('raising the cap mid-month lifts the refusal and re-arms the cap message', 
   const raised = harness({ capUsd: 200 }, first.dir)
   t.notOk(raised.cap.capped(NOW), '100 of 200 is 50%')
   await raised.cap.record(codexRun(1), 'C1-2', NOW)
-  t.equal(raised.ledger.state(NOW).capAnnounced, false, 'dropping under 100% re-arms the cap message')
   t.equal(raised.posts.length, 0, 'thresholds already announced stay quiet')
+  t.equal(raised.ledger.state(NOW).capAnnouncedFor, 100, 'the announcement covers the old cap only')
   await raised.cap.record(codexRun(99), 'C1-3', NOW)
   t.deepEqual(raised.posts.map(p => p.text), [renderCapReachedAlert(DEC_1)], 'reaching the new cap announces again')
+  t.equal(raised.ledger.state(NOW).capAnnouncedFor, 200)
+  fs.rmSync(first.dir, { recursive: true, force: true })
+  t.end()
+})
+
+// PR review finding (andrew-barnett/slack-review-bot#78), round 3: after a cap raise, the very first
+// record can cross the new cap with no record below 100% in between. The cap message must still go out,
+// because the announcement on file was for the lower cap. Regression caught: a boolean "announced" flag
+// that only a below-cap record reset, so this record was silently not announced.
+test('after a cap raise, the first record that crosses the new cap announces it', async t => {
+  const first = harness()
+  await first.cap.record(codexRun(100), 'C1-1', NOW)
+  t.deepEqual(first.posts.map(p => p.text), [renderCapReachedAlert(DEC_1)])
+  const raised = harness({ capUsd: 200 }, first.dir)
+  await raised.cap.record(codexRun(150), 'C1-2', NOW)
+  t.deepEqual(raised.posts.map(p => p.text), [renderCapReachedAlert(DEC_1)], 'one cap message for the new cap, no threshold alert')
+  t.ok(raised.cap.capped(NOW))
+  await raised.cap.record(codexRun(1), 'C1-3', NOW)
+  t.equal(raised.posts.length, 1, 'and only once')
   fs.rmSync(first.dir, { recursive: true, force: true })
   t.end()
 })
@@ -3448,7 +3429,7 @@ test('record never throws; a failure is logged', async t => {
   const fail = (): never => {
     throw new Error('synthetic ledger failure')
   }
-  const broken: SpendLedger = { state: fail, append: fail, update: fail }
+  const broken: SpendLedger = { state: fail, recordRuns: fail, recordAlert: fail, recordCapAnnounced: fail }
   const cap = createSpendCap({
     ledger: broken,
     prices,
@@ -3462,14 +3443,14 @@ test('record never throws; a failure is logged', async t => {
   t.end()
 })
 
-// Ruling 8: a locked month (unreadable ledger) reads as at least 100%, so it refuses and says so.
+// Ruling 8: a locked month (a bad journal line) reads as at least 100%, so it refuses and says so.
 test('a locked ledger refuses and reports the cap reached', t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spend-cap-'))
-  fs.writeFileSync(path.join(dir, 'spend.json'), 'not json')
+  fs.writeFileSync(spendFileFor(dir, '2026-11'), 'not json\n')
   const h = harness({}, dir)
   t.ok(h.cap.capped(NOW))
   t.equal(spendPercent({ spentUsd: 0, locked: true }, 100), 100)
-  t.equal(spendPercent({ spentUsd: 41.9 }, 100), 41, 'percent is floored')
+  t.equal(spendPercent({ spentUsd: 41.9, locked: false }, 100), 41, 'percent is floored')
   t.equal(renderSpendStatusLine(h.cap.status(NOW)), 'Bedrock spend this month: cap reached · resets Nov 30, 7:00 PM ET')
   fs.rmSync(dir, { recursive: true, force: true })
   t.end()
@@ -3531,7 +3512,7 @@ Create `src/spend-cap.ts`:
 
 import type { Config, EngineName } from './config'
 import { loadPriceTable, priceClaude, priceCodex, type LedgerTokens, type PriceTable } from './pricing'
-import { nextMonthStart, openSpendLedger, type SpendEntry, type SpendFile, type SpendLedger } from './spend-ledger'
+import { nextMonthStart, openSpendLedger, type SpendLedger, type SpendRun, type SpendState } from './spend-ledger'
 import { renderCapReachedAlert, renderThresholdAlert, type SpendStatus } from './spend-messages'
 import type { RunUsage } from './usage'
 
@@ -3578,7 +3559,7 @@ export type SpendCapConfig = Pick<
   | 'spendAlertHerePercents'
   | 'spendAlertChannel'
   | 'bedrockPricesFile'
-  | 'spendFile'
+  | 'spendDir'
 >
 
 /** Ruling 1: the container runtime always runs on Bedrock; launchd only under ENGINE_AUTH=bedrock. */
@@ -3587,7 +3568,7 @@ export function spendCapActive(config: Pick<Config, 'runtime' | 'engineAuth'>): 
 }
 
 /** floor(spent / cap × 100); a locked month (ruling 8) reads as at least 100. */
-export function spendPercent(state: Pick<SpendFile, 'spentUsd' | 'locked'>, capUsd: number): number {
+export function spendPercent(state: Pick<SpendState, 'spentUsd' | 'locked'>, capUsd: number): number {
   const percent = Math.floor((state.spentUsd / capUsd) * 100)
   return state.locked ? Math.max(100, percent) : percent
 }
@@ -3607,7 +3588,7 @@ const NO_TOKENS: LedgerTokens = { input: 0, cachedInput: 0, cacheWrite: 0, outpu
 export function createSpendCap(deps: SpendCapDeps): SpendCap {
   const { ledger, prices, models, settings, postChannelMessage, log } = deps
 
-  const entryFor = (engine: EngineName, usage: RunUsage, runId: string, at: string): SpendEntry => {
+  const entryFor = (engine: EngineName, usage: RunUsage, runId: string, at: string): SpendRun => {
     const model = models[engine]
     const price = Object.hasOwn(prices.models, model) ? prices.models[model] : undefined
     const base = { at, runId, engine, model }
@@ -3641,26 +3622,21 @@ export function createSpendCap(deps: SpendCapDeps): SpendCap {
     }
   }
 
-  /** Spec section 8 and ruling 5. State is persisted before anything is posted. */
+  /** Spec section 8 and ruling 5. Every decision is journaled before anything is posted. */
   const announce = async (nowMs: number): Promise<void> => {
     const state = ledger.state(nowMs)
     const percent = spendPercent(state, settings.capUsd)
-    const alreadyAlerted = [...state.alerted]
-    const due = settings.alertPercents.filter(p => p <= percent && !alreadyAlerted.includes(p))
+    const due = settings.alertPercents.filter(p => p <= percent && !state.alerted.includes(p))
+    for (const threshold of due) ledger.recordAlert(threshold, nowMs)
     if (percent >= 100) {
-      if (state.capAnnounced) {
-        if (due.length) ledger.update({ alerted: [...alreadyAlerted, ...due] }, nowMs)
-        return
-      }
-      ledger.update({ alerted: [...alreadyAlerted, ...due], capAnnounced: true }, nowMs)
+      // Announced only for a cap at or above the configured one, so raising the cap re-arms the message.
+      if (state.capAnnouncedFor !== undefined && state.capAnnouncedFor >= settings.capUsd) return
+      ledger.recordCapAnnounced(settings.capUsd, nowMs)
       await send(renderCapReachedAlert(nextMonthStart(nowMs)), { kind: 'cap', percent })
       return
     }
-    // Under 100% (the cap was raised): the cap message may be sent again if the new cap is reached.
-    if (state.capAnnounced) ledger.update({ capAnnounced: false }, nowMs)
     if (!due.length) return
     const highest = due[due.length - 1]
-    ledger.update({ alerted: [...alreadyAlerted, ...due] }, nowMs)
     await send(renderThresholdAlert(percent, settings.herePercents.includes(highest)), { kind: 'threshold', threshold: highest, percent })
   }
 
@@ -3672,7 +3648,7 @@ export function createSpendCap(deps: SpendCapDeps): SpendCap {
         const at = new Date(nowMs).toISOString()
         // Ruling 2: a usage with no engines list is the launchd single-mode runner's: one Codex run.
         const runs = usage.engines ?? [{ engine: 'codex' as const, usage }]
-        ledger.append(runs.map(run => entryFor(run.engine, run.usage, runId, at)), nowMs)
+        ledger.recordRuns(runs.map(run => entryFor(run.engine, run.usage, runId, at)), nowMs)
         await announce(nowMs)
       } catch (error) {
         log('spend.record_failed', { runId, error: String(error) })
@@ -3701,7 +3677,7 @@ export function openSpendCap(
     return inactiveSpendCap()
   }
   const prices = loadPriceTable(config.bedrockPricesFile, [config.codexBedrockModel, config.claudeBedrockModel])
-  const ledger = openSpendLedger(config.spendFile, log, nowMs)
+  const ledger = openSpendLedger(config.spendDir, log, nowMs)
   const settings: SpendCapSettings = {
     capUsd: config.spendCapUsd,
     alertPercents: config.spendAlertPercents,
@@ -3711,7 +3687,7 @@ export function openSpendCap(
   log('spend.cap_active', {
     pricesFile: config.bedrockPricesFile,
     priceSource: prices.source,
-    spendFile: config.spendFile,
+    spendDir: config.spendDir,
     percent: spendPercent(ledger.state(nowMs), settings.capUsd),
     alertChannel: settings.alertChannel || 'none',
   })
@@ -4569,7 +4545,7 @@ Run: `git add pricing/bedrock-prices.json Dockerfile src/pricing-file.test.ts &&
 
 **Interfaces:**
 - Consumes: Task 6 `SpendCap`, `openSpendCap`; Task 2 `CodexRunOutcome.codexUsage`; Task 1 `scripts/smoke/stub-codex.js` usage events; Task 8 price table.
-- Produces: `smokeJob(config: ReviewConfig, spend?: Pick<SpendCap, 'record'>)`; the compose smoke checks `spend.json`.
+- Produces: `smokeJob(config: ReviewConfig, spend?: Pick<SpendCap, 'record'>)`; the compose smoke checks that a `spend-YYYY-MM.jsonl` journal gained the smoke's Codex `run` line.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -4658,7 +4634,7 @@ with:
 ```ts
       onProgress: line => void lines.push(line),
     })
-    // Recorded like a review's engine run, so the compose smoke proves Codex usage reaches spend.json.
+    // Recorded like a review's engine run, so the compose smoke proves Codex usage reaches the spend journal.
     await spend?.record(
       {
         attempts: 1,
@@ -4718,13 +4694,19 @@ with:
 
 ```ts
     if (!log.includes('stub-codex: reviewing')) throw new Error('the run log was not shipped to the orchestrator')
-    // Spec 6/7: the stub's --json usage crossed the worker wire and was priced into the ledger.
-    const ledger = JSON.parse(
-      inOrchestrator("process.stdout.write(require('fs').readFileSync('/var/lib/slack-review-bot/state/spend.json', 'utf8'))")
-    ) as { entries?: Array<{ runId?: string; engine?: string; noUsage?: boolean; tokens?: { input?: number } }> }
-    const entry = ledger.entries?.find(e => e.runId === reply.runId)
-    if (!entry || entry.engine !== 'codex' || entry.noUsage || !(Number(entry.tokens?.input) > 0)) {
-      throw new Error(`the smoke's Codex usage never reached spend.json: ${JSON.stringify(entry)}`)
+    // Spec 6/7: the stub's --json usage crossed the worker wire and was priced into the month's journal.
+    // Every spend-YYYY-MM.jsonl is read, so a smoke that straddles 00:00 UTC on the 1st still finds it.
+    const journal = inOrchestrator(
+      "const fs = require('fs'); const dir = '/var/lib/slack-review-bot/state'; " +
+        "for (const name of fs.readdirSync(dir).filter(n => /^spend-\\d{4}-\\d{2}\\.jsonl$/.test(n))) process.stdout.write(fs.readFileSync(dir + '/' + name, 'utf8'))"
+    )
+    const runLine = journal
+      .split('\n')
+      .filter(line => line.trim() !== '')
+      .map(line => JSON.parse(line) as { type?: string; runId?: string; engine?: string; noUsage?: boolean; tokens?: { input?: number } })
+      .find(line => line.type === 'run' && line.runId === reply.runId)
+    if (!runLine || runLine.engine !== 'codex' || runLine.noUsage || !(Number(runLine.tokens?.input) > 0)) {
+      throw new Error(`the smoke's Codex usage never reached the spend journal: ${JSON.stringify(runLine)}`)
     }
 ```
 
@@ -4805,16 +4787,25 @@ keeps a month-to-date total of what its own reviews cost and stops starting new 
   reaches its slot. Refused requests are not replayed. `status` and `help` keep working, and
   `status` shows `Bedrock spend this month: cap reached · resets …`.
 - **Raising the cap.** Set a higher `BEDROCK_MONTHLY_CAP_USD` and restart. Reviews resume at once.
-- **The ledger.** `spend.json` sits beside the cursor file: `~/.local/state/slack-review-bot/spend.json`
-  under launchd, `/var/lib/slack-review-bot/state/spend.json` (the `orchestrator-state` volume) in
-  the container runtime. Each new month renames it to `spend-YYYY-MM.json`.
-- **Unreadable ledger.** If `spend.json` cannot be read or parsed, the bot logs `spend.unreadable`,
-  keeps the bad file as `spend.json.corrupt-<timestamp>`, and treats the month as capped, so a lost
-  ledger never reopens spending. Raising the cap does not clear this. To recover, stop the bot
+- **The ledger.** One append-only file per UTC month, `spend-YYYY-MM.jsonl`, beside the cursor
+  file: `~/.local/state/slack-review-bot/spend-2026-11.jsonl` under launchd,
+  `/var/lib/slack-review-bot/state/spend-2026-11.jsonl` (the `orchestrator-state` volume) in the
+  container runtime. Each line is one JSON record: a priced engine run (`"type":"run"`), a threshold
+  alert (`"type":"alert"`) or the cap-reached message (`"type":"cap"`, with the cap it was sent for).
+  The bot never rewrites, renames or deletes these files; a new month is a new file, and old months
+  stay for auditing.
+- **Unreadable ledger.** If a line in this month's file does not parse or has an unknown shape,
+  including a last line with no newline (a crash mid-write), the bot logs `spend.unreadable` with
+  the file and the line number and treats the month as capped, so a lost record never reopens
+  spending. Raising the cap does not clear this. To recover, stop the bot
   (`scripts/install-launcher.sh --uninstall` for the container runtime, `scripts/install-service.sh
-  --uninstall` for launchd), then either repair `spend.json` from the kept copy or delete it (the
-  month then restarts from zero, so only delete it if you accept that), then reinstall with the same
-  script without `--uninstall`. The next UTC month also clears it.
+  --uninstall` for launchd), then fix the named line, or delete it (its spend is then not counted,
+  so only delete a `run` line if you accept that), then reinstall with the same script without
+  `--uninstall`. The next UTC month (a new file) also clears it.
+- **Unwritable ledger.** If the state directory or this month's file cannot be written, the bot logs
+  `spend.write_failed` and treats the month as capped until a write succeeds again
+  (`spend.write_recovered`); it retries on every `status` and every request, so no restart is
+  needed once the storage is fixed.
 - **Prices.** `pricing/bedrock-prices.json` is maintained by the `refresh-bot-runtime` skill. A
   model with no entry stops the daemon at startup with the model and the file named. A per-install
   model override (`CODEX_BEDROCK_MODEL`, `CLAUDE_BEDROCK_MODEL`) needs its own entry in the table
@@ -4902,7 +4893,7 @@ Write `/tmp/srb-commit-msg.txt` with the editor tool:
 feat(smoke): check the compose smoke's usage reaches the spend ledger (refs andrew-barnett/slack-review-bot#76)
 
 The smoke's Codex run is recorded through the spend cap, and the smoke
-reads spend.json back for its entry. The README documents the cap, its
+reads the month's spend journal back for its run line. The README documents the cap, its
 settings and how to recover from an unreadable ledger, and the
 refresh-bot-runtime skill gains the price-table step.
 
@@ -4919,5 +4910,5 @@ Run: `git add src/orchestrator.ts src/orchestrator-main.ts src/orchestrator.test
 
 - **Spec coverage.** Section 3 (scope, active rule): ruling 1, Task 6 `spendCapActive`, Task 7 `openSpendCap` at startup. Section 4 (settings): Task 5, README in Task 9. Section 5 (price table): Task 3 loader, Task 8 table. Section 6 (usage capture): Tasks 1-2. Section 7 (ledger): Task 4, recording in Tasks 6-7. Section 8 (enforcement, messages, alerts): Tasks 6-7. Section 9 (status, refusal, recovery): Tasks 6, 7 and the README in Task 9. Section 11 step 4: Task 9 Step 6. Section 10: untouched.
 - **No invented prices.** Every price in a test is synthetic and labelled so. The only real prices enter in Task 8 Step 3, from the AWS page, by a human or a controller with web access.
-- **Type consistency.** `CodexUsageDetail` (Task 1) → `RunUsage.codex` (Task 2) → `priceCodex` (Task 3) → `createSpendCap` (Task 6) → daemon and smoke (Tasks 7, 9). `LedgerTokens` (Task 3) is the `SpendEntry.tokens` type (Task 4). `SpendStatus` (Task 6) is the fifth `renderStatus` argument. `postChannelMessage(channel, text)` has the same signature in `slack.ts` (Task 7) and `SpendCapDeps` (Task 6).
+- **Type consistency.** `CodexUsageDetail` (Task 1) → `RunUsage.codex` (Task 2) → `priceCodex` (Task 3) → `createSpendCap` (Task 6) → daemon and smoke (Tasks 7, 9). `LedgerTokens` (Task 3) is the `SpendRun.tokens` type (Task 4). `SpendState` (Task 4) is what `spendPercent` and the cap's announce logic read (Task 6). `SpendStatus` (Task 6) is the fifth `renderStatus` argument. `postChannelMessage(channel, text)` has the same signature in `slack.ts` (Task 7) and `SpendCapDeps` (Task 6).
 - **Order.** Each task's tests pass with only the earlier tasks applied. Tasks 5-7 run without the real price table: the cap opens only in `runDaemon` and the SMOKE path, which no unit test runs. Task 8 must land before the image is built for the container cutover (spec section 11 step 1).
