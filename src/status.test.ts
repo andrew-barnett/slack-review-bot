@@ -333,3 +333,39 @@ test('renderStatus shows the engine breakdown when only engineTokens is populate
   t.ok(renderStatus(snap).includes('(Codex 500K)'))
   t.end()
 })
+// Ruling 16: the spend line is the spec text verbatim, right after the *Tokens* line, and only when the
+// daemon passes a spend status. Regression caught: the line missing from the reply, or drifting away
+// from the token figures it relates to.
+test('renderStatus shows the spend line after the token line', t => {
+  const stats = createStats(0)
+  stats.record('pass', 1, 5 * MINUTE, 200_000)
+  const snapshot = stats.snapshot(15 * MINUTE, 0, 0, config)
+  const text = renderStatus(snapshot, undefined, undefined, undefined, { active: true, percent: 41, resetsAt: Date.UTC(2026, 11, 1) })
+  const lines = text.split('\n')
+  const tokens = lines.findIndex(l => l.startsWith('*Tokens*'))
+  t.equal(lines[tokens + 1], 'Bedrock spend this month: 41% of cap · resets Nov 30, 7:00 PM ET')
+  t.notOk(renderStatus(snapshot).includes('Bedrock spend'), 'no spend status, no line (the CLI and the older tests)')
+  t.ok(
+    renderStatus(createStats(0).snapshot(MINUTE, 0, 0, config), undefined, undefined, undefined, { active: false }).includes(
+      'Bedrock spend cap: not active (subscription auth)'
+    ),
+    'shown even before there is a token line'
+  )
+  t.end()
+})
+
+// Spec 1: a whole status reply with the spend line and no Claude usage carries no dollar amount.
+// (Claude's notional figures are a separate, pre-existing display: ruling 13.) Also asserts the line is
+// present, so the test fails without the feature instead of passing vacuously.
+test('a status reply with the spend line shows no dollar amount', t => {
+  const stats = createStats(0)
+  stats.record('pass', 1, 5 * MINUTE, 200_000)
+  const text = renderStatus(stats.snapshot(15 * MINUTE, 0, 0, config), undefined, undefined, undefined, {
+    active: true,
+    percent: 100,
+    resetsAt: Date.UTC(2026, 11, 1),
+  })
+  t.ok(text.includes('cap reached'), text)
+  t.notOk(/\$\s*\d/.test(text), text)
+  t.end()
+})

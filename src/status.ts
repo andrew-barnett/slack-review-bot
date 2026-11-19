@@ -7,6 +7,7 @@ import type { CatchUpRecord, ConnectionState } from './catchup'
 import type { EngineName } from './config'
 import type { JobOutcome } from './job'
 import type { ActivitySnapshot } from './progress'
+import { renderSpendStatusLine, type SpendStatus } from './spend-messages'
 import { formatTokensCompact, type RunUsage } from './usage'
 
 /** Dual mode: one engine's spend for this process's life. Claude's cost is notional. */
@@ -287,7 +288,8 @@ export function renderStatus(
   snapshot: StatusSnapshot,
   catchUp?: CatchUpStatus,
   connection?: ConnectionState,
-  activity?: ActivitySnapshot
+  activity?: ActivitySnapshot,
+  spend?: SpendStatus
 ): string {
   const { counts, config, lastReview } = snapshot
   // Dual mode's `approved` is single mode's `pass` (spec 5.9); the dual-only outcomes are listed after.
@@ -314,6 +316,8 @@ export function renderStatus(
     const last = tokens.last !== undefined ? ` · ${formatTokensCompact(tokens.last)} last` : ''
     lines.push(`*Tokens* ${formatTokensCompact(tokens.total)} total${last} · ${formatTokensCompact(avg)} avg${engineTotals(snapshot.engineTokens)}`)
   }
+  // Right after the token figures it relates to (ruling 16). Percent only, never dollars (spec section 1).
+  if (spend) lines.push(renderSpendStatusLine(spend))
   if (connection) lines.push(renderConnection(connection, snapshot.now))
   if (catchUp) lines.push(renderCatchUp(catchUp, snapshot.now))
   if (lastReview) {
