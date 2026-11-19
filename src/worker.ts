@@ -146,8 +146,8 @@ export async function runWorker(deps: WorkerDeps): Promise<WorkerExit> {
     try {
       const status = await deps.client.heartbeat(job)
       onStatus(status)
-      // Only a 200 proves the orchestrator is there; a proxy answering 5xx forever is not.
-      if (status !== 200) throw new Error(`heartbeat answered HTTP ${status}`)
+      // Only a 200 (or a 409 cancel) proves the orchestrator is there; a proxy answering 5xx forever is not.
+      if (status !== 200 && status !== 409) throw new Error(`heartbeat answered HTTP ${status}`)
       heartbeatFailures = 0
     } catch (error) {
       heartbeatFailures += 1

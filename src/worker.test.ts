@@ -391,3 +391,17 @@ test('worker counts non-200 heartbeats as failures', async t => {
   t.end()
 })
 
+// A 409 is the orchestrator cancelling, which proves it is alive: repeated 409s while a child shuts
+// down must not turn a cancelled run into 'lost' (which skips posting the result).
+test('worker does not count 409 heartbeats as failures', async t => {
+  const h = harness()
+  h.heartbeat.status = 409
+  h.deps.runCodex = async () => {
+    for (let i = 0; i < HEARTBEAT_FAILURE_LIMIT + 2; i += 1) await h.timers[0]()
+    return { result: clean, rawFinalMessage: 'raw', tokensUsed: 3, activeMs: 4 }
+  }
+  t.equal(await runWorker(h.deps), 'cancelled')
+  t.equal(h.calls.results.length, 1)
+  t.end()
+})
+
