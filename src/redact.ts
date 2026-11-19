@@ -120,6 +120,21 @@ export function redactSecrets(text: string, env: NodeJS.ProcessEnv = process.env
 }
 
 /**
+ * A copy of `value` with {@link redactSecrets} applied to every string inside it (object values and
+ * array items, at any depth). Keys and non-string values are kept as they are.
+ */
+export function redactDeep<T>(value: T, env: NodeJS.ProcessEnv = process.env): T {
+  if (typeof value === 'string') return redactSecrets(value, env) as T
+  if (Array.isArray(value)) return value.map(item => redactDeep(item, env)) as T
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [key, item] of Object.entries(value)) out[key] = redactDeep(item, env)
+    return out as T
+  }
+  return value
+}
+
+/**
  * Cap on the streaming redactor's hold buffer. Output is normally published at each line boundary;
  * this only forces progress when a single line (or a suppressed key body) grows past it, so a run
  * that never emits a newline cannot grow the buffer without limit.

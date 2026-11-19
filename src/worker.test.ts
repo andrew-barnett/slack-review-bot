@@ -13,9 +13,11 @@ import {
   RESULT_ATTEMPTS,
   renderWorkerNpmrc,
   runWorker,
+  workerExitCode,
   workerWorktreeRoot,
   type WorkerDeps,
 } from './worker'
+import { registerHeldSecret } from './redact'
 
 const config = loadReviewConfig({
   HOME: '/home/bot',
@@ -405,3 +407,65 @@ test('worker does not count 409 heartbeats as failures', async t => {
   t.end()
 })
 
+
+// Final review, Important 2: the launcher can only back off from a worker that fails at once if the
+// exit code says so. Regression caught: `rejected` (an expired or spent ticket, e.g. a VM clock behind
+// the host) exiting 0 like `idle`, so the launcher re-mints credentials every few seconds forever.
+test('workerExitCode is non-zero only for a rejected ticket', t => {
+  t.equal(workerExitCode('done'), 0)
+  t.equal(workerExitCode('cancelled'), 0)
+  t.equal(workerExitCode('idle'), 0)
+  t.equal(workerExitCode('lost'), 0)
+  t.notEqual(workerExitCode('rejected'), 0)
+  t.end()
+})
+
+// Final review (T7 minor): a 4xx on the result is final and means the result was dropped (dead token,
+// duplicate result). Regression caught: logging it as `result_posted`, which hides a lost review.
+test('worker logs a 4xx result reply as rejected, not posted', async t => {
+  const h = harness()
+  h.deps.client.result = async () => 403
+  const events: [string, Record<string, unknown>][] = []
+  h.deps.log = (event, fields = {}) => void events.push([event, fields])
+  await runWorker(h.deps)
+  const names = events.map(([e]) => e).filter(e => e.startsWith('worker.result'))
+  t.deepEqual(names, ['worker.result_rejected'], 'one attempt, logged as rejected')
+  t.equal(events.find(([e]) => e === 'worker.result_rejected')?.[1].status, 403)
+  t.end()
+})
+
+// Controller ruling: the worker holds the values of its engine credentials (registered with
+// registerHeldSecret); the orchestrator never sees them and can only redact by token shape. So the
+// worker redacts every string of the outcome before posting. Regression caught: a finding body that
+// quotes NPM_TOKEN or the engine token leaving the worker and reaching Slack.
+test('worker redacts held secret values from every string of the posted result', async t => {
+  const held = 'held-placeholder-value-0042'
+  registerHeldSecret(held)
+  const h = harness()
+  h.deps.runCodex = async () => ({
+    result: {
+      results: [
+        {
+          ...clean.results[0],
+          verdict: 'findings' as const,
+          summary: `summary mentions ${held}`,
+          findings: [{ severity: 'blocking' as const, file: 'a.ts', line: 1, body: `leaked ${held} here` }],
+        },
+      ],
+    },
+    rawFinalMessage: held,
+    tokensUsed: 3,
+    activeMs: 4,
+  })
+  await runWorker(h.deps)
+  const posted = JSON.stringify(h.calls.results[0])
+  t.notOk(posted.includes(held), 'no held value in the outcome')
+  t.ok(posted.includes('leaked') && posted.includes('a.ts'), 'the rest of the finding survives')
+  const g = harness()
+  g.deps.runCodex = async () => {
+    throw new CodexOutputError(`could not parse ${held}`, undefined, 0)
+  }
+  await runWorker(g.deps)
+  t.notOk(JSON.stringify(g.calls.results[0]).includes(held), 'no held value in an error result')
+  t.end()
+})

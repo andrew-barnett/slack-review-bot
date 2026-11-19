@@ -12,7 +12,7 @@ import { makeJobClient } from './jobs/client'
 import { jsonLog } from './json-log'
 import { redactSecrets, registerHeldSecret } from './redact'
 import { readSecretBundle, WORKER_BUNDLE } from './secret-bundle'
-import { assertWorkerConfig, readFrom, runWorker, WORKER_NPMRC, writeWorkerNpmrc } from './worker'
+import { assertWorkerConfig, readFrom, runWorker, WORKER_NPMRC, workerExitCode, writeWorkerNpmrc } from './worker'
 
 const log = jsonLog
 
@@ -62,10 +62,13 @@ async function main(): Promise<void> {
     },
     readFrom,
   })
-  log('worker.exit', { exit })
-  process.exit(0)
+  // Non-zero only for a refused ticket, so the launcher backs off instead of re-minting at once.
+  const code = workerExitCode(exit)
+  log('worker.exit', { exit, code })
+  process.exit(code)
 }
 
+// A start-up failure (bad bundle, bad config) exits 1, which the launcher counts toward its backoff.
 main().catch(error => {
   log('worker.fatal', { error: redactSecrets(String(error)) })
   process.exit(1)

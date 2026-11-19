@@ -12,7 +12,7 @@ import type { EngineName, ReviewConfig } from './config'
 import type { JobClient } from './jobs/client'
 import { serializeRunError } from './jobs/errors'
 import { HEARTBEAT_MS, LOG_CHUNK_LIMIT, type ClaimReply, type ProgressBody, type ResultBody } from './jobs/protocol'
-import { redactSecrets } from './redact'
+import { redactDeep, redactSecrets } from './redact'
 
 export const CLAIM_RETRY_MS = 2_000
 export const LOG_POLL_MS = 2_000
@@ -43,6 +43,17 @@ export interface WorkerDeps {
 }
 
 export type WorkerExit = 'done' | 'cancelled' | 'idle' | 'rejected' | 'lost'
+
+/** The process exit code for a refused ticket; distinct from 1, a fatal start-up error. */
+export const WORKER_REJECTED_EXIT_CODE = 3
+
+/**
+ * A refused ticket can never get a job, so the launcher must treat it as a failure and back off; every
+ * other outcome is a normal end of a one-shot worker.
+ */
+export function workerExitCode(exit: WorkerExit): number {
+  return exit === 'rejected' ? WORKER_REJECTED_EXIT_CODE : 0
+}
 
 /** Spec 3.4: only a container worker with launcher-minted static Bedrock credentials may run. */
 export function assertWorkerConfig(config: ReviewConfig): void {
@@ -255,13 +266,17 @@ export async function runWorker(deps: WorkerDeps): Promise<WorkerExit> {
     deps.log('worker.lost', { jobId: job.jobId })
     return 'lost'
   }
+  // The worker holds its credential values (registerHeldSecret) and the orchestrator does not, so only
+  // here can a finding or error text that quotes one be masked before it leaves the container.
+  body = redactDeep(body)
   let posted = false
   for (let attempt = 1; attempt <= RESULT_ATTEMPTS && !posted; attempt += 1) {
     try {
       const status = await deps.client.result(job, body)
       // A 5xx may be transient; anything else is final (200, or a 4xx a retry cannot change).
       if (status >= 500) throw new Error(`result answered HTTP ${status}`)
-      deps.log('worker.result_posted', { jobId: job.jobId, status, ok: body.ok })
+      // A 4xx means the orchestrator dropped the result (dead token, duplicate): say so distinctly.
+      deps.log(status >= 400 ? 'worker.result_rejected' : 'worker.result_posted', { jobId: job.jobId, status, ok: body.ok })
       posted = true
     } catch (error) {
       deps.log('worker.result_failed', { attempt, error: redactSecrets(String(error)) })
