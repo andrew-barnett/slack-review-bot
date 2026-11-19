@@ -2,8 +2,11 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   TEMPLATE: scripts/install-launcher.sh substitutes __LABEL__, __LAUNCHER__, __DIR__, __LOG_DIR__,
-  __CONF__ and __PATH_PREFIX__. The conf file holds NON-SECRET settings only (the installer refuses
-  one naming a secret variable); every secret comes from Secrets Manager at start.
+  __CONF__, __PATH_PREFIX__ and __EXIT_TIMEOUT__. The installer computes __EXIT_TIMEOUT__ (seconds)
+  from the conf's SHUTDOWN_DRAIN_MS (default 5000): drain + 10 s run grace + 30 s hard bound + 30 s
+  worker stop grace, rounded up, plus a 75 s margin that also covers the launcher's two bounded
+  waits after SIGKILL (KILL_WAIT_MS, 15 s each). The conf file holds NON-SECRET settings only (the
+  installer refuses one naming a secret variable); every secret comes from Secrets Manager at start.
 -->
 <plist version="1.0">
 <dict>

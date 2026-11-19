@@ -25,6 +25,13 @@ export const SECRET_IDS: Record<(typeof SECRET_NAMES)[number], string> = {
 const CODEARTIFACT = { domain: 'trade-platform', owner: '153538148884', region: 'us-east-2' }
 /** The reader session only lives long enough to fetch four secrets. */
 const READER_SESSION_SECONDS = 900
+/**
+ * A worker that exits sooner than this after its start never got as far as a full long-poll, so it
+ * counts as a failure for the backoff even with exit code 0.
+ */
+export const WORKER_FAST_EXIT_MS = 10_000
+/** How long to wait for a container to be reported gone after SIGKILL before moving on. */
+export const KILL_WAIT_MS = 15_000
 
 export interface LauncherSettings {
   awsProfile: string
@@ -40,6 +47,10 @@ export interface LauncherSettings {
   /** How long workers get after SIGTERM, once the orchestrator is gone. */
   workerStopGraceMs: number
   workerRestartMs: number
+  /** See WORKER_FAST_EXIT_MS. */
+  workerFastExitMs: number
+  /** See KILL_WAIT_MS. */
+  killWaitMs: number
   backoffBaseMs: number
   backoffMaxMs: number
   composeFile: string
@@ -66,6 +77,8 @@ export function loadLauncherSettings(env: NodeJS.ProcessEnv): LauncherSettings {
     hardBoundSlackMs: 30_000,
     workerStopGraceMs: 30_000,
     workerRestartMs: 1_000,
+    workerFastExitMs: WORKER_FAST_EXIT_MS,
+    killWaitMs: KILL_WAIT_MS,
     backoffBaseMs: 1_000,
     backoffMaxMs: 5 * 60_000,
     composeFile: env.LAUNCHER_COMPOSE_FILE || path.join(__dirname, '..', 'compose.yaml'),
@@ -154,11 +167,15 @@ export function composeRunArgs(settings: LauncherSettings, service: 'orchestrato
   return ['compose', '-f', settings.composeFile, '-p', settings.project, 'run', '--rm', '-T', '--name', name, service, ...args]
 }
 
+/** True for the docker CLI's "No such container" error, the normal case for kill and rm -f. */
+const noSuchContainer = (error: unknown) => /No such container/i.test(String((error as { stderr?: unknown }).stderr ?? ''))
+
 export function makeDockerOps(
   settings: LauncherSettings,
   env: NodeJS.ProcessEnv,
   spawnImpl: typeof spawn = spawn,
-  exec: LauncherExec = defaultExec
+  exec: LauncherExec = defaultExec,
+  log: (event: string, fields?: Record<string, unknown>) => void = () => {}
 ): DockerOps {
   const cliEnv = dockerEnv(env)
   return {
@@ -177,11 +194,15 @@ export function makeDockerOps(
       return { name, exited }
     },
     async signal(name, signal) {
-      await exec('docker', ['kill', '--signal', signal, name], cliEnv).catch(() => undefined)
+      // The caller's exit wait is bounded, so a failed kill is logged and never thrown.
+      await exec('docker', ['kill', '--signal', signal, name], cliEnv).catch(error => {
+        if (!noSuchContainer(error)) log('launcher.docker_kill_failed', { name, signal, error: reason(error, 'docker kill') })
+      })
     },
     async removeForce(name) {
-      // "No such container" is the normal case; anything else surfaces when `run --name` fails.
-      await exec('docker', ['rm', '-f', name], cliEnv).catch(() => undefined)
+      await exec('docker', ['rm', '-f', name], cliEnv).catch(error => {
+        if (!noSuchContainer(error)) log('launcher.docker_rm_failed', { name, error: reason(error, 'docker rm') })
+      })
     },
     async listByPrefix(prefix) {
       const { stdout } = await exec('docker', ['ps', '-a', '--format', '{{.Names}}', '--filter', `name=^${prefix}`], cliEnv)
@@ -237,13 +258,20 @@ export function createLauncher(deps: LauncherDeps): { start(): Promise<number>; 
   const running = new Map<number, RunningContainer>()
   const pause = (ms: number) => Promise.race([sleep(ms), stopSignal])
 
+  /** Stop the loops; also wakes any loop sleeping in a backoff, whichever way the stack is ending. */
+  const halt = () => {
+    stopping = true
+    signalStop()
+  }
+
   async function workerLoop(slot: number, key: Buffer, engineToken: string): Promise<void> {
+    const name = `${WORKER_PREFIX}${slot}`
+    // Mint failures and failed worker runs share one counter; only a healthy run resets it.
     let failures = 0
     while (!stopping) {
       let bundle: string
       try {
         bundle = await workerBundle(deps, engineToken, slot, mintTicket(key, deps.now()))
-        failures = 0
       } catch (error) {
         failures += 1
         const waitMs = backoffMs(failures, settings.backoffBaseMs, settings.backoffMaxMs)
@@ -252,23 +280,46 @@ export function createLauncher(deps: LauncherDeps): { start(): Promise<number>; 
         continue
       }
       if (stopping) break
-      const worker = docker.run('worker', `${WORKER_PREFIX}${slot}`, bundle)
+      // A container left under this name (its `compose run` client died) would fail `run --name`.
+      try {
+        await docker.removeForce(name)
+      } catch (error) {
+        log('launcher.worker_remove_failed', { slot, error: errorLine(error) })
+      }
+      if (stopping) break
+      const startedAt = deps.now()
+      const worker = docker.run('worker', name, bundle)
       running.set(slot, worker)
       const code = await worker.exited
       running.delete(slot)
-      log('launcher.worker_exited', { slot, code })
-      await pause(settings.workerRestartMs)
+      const ranMs = deps.now() - startedAt
+      log('launcher.worker_exited', { slot, code, ranMs })
+      if (stopping) break
+      if (code !== 0 || ranMs < settings.workerFastExitMs) {
+        failures += 1
+        const waitMs = backoffMs(failures, settings.backoffBaseMs, settings.backoffMaxMs)
+        log('launcher.worker_failed_fast', { slot, code, ranMs, failures, waitMs })
+        await pause(waitMs)
+      } else {
+        failures = 0
+        await pause(settings.workerRestartMs)
+      }
     }
   }
 
-  /** Only ever called once the orchestrator has exited. */
-  async function stopWorkers(): Promise<void> {
+  /**
+   * Only ever called once the orchestrator has exited. Resolves false when some worker's exit was never
+   * reported; its loop is then still waiting on it and must not be awaited.
+   */
+  async function stopWorkers(): Promise<boolean> {
     const workers = [...running.values()]
     await Promise.all(workers.map(w => docker.signal(w.name, 'SIGTERM')))
     const allExited = Promise.all(workers.map(w => w.exited))
     await Promise.race([allExited, sleep(settings.workerStopGraceMs)])
     for (const w of [...running.values()]) await docker.signal(w.name, 'SIGKILL')
-    await allExited
+    const exitedAfterKill = await Promise.race([allExited.then(() => true), sleep(settings.killWaitMs).then(() => false)])
+    if (!exitedAfterKill) log('launcher.workers_exit_unconfirmed', { waitMs: settings.killWaitMs, names: [...running.values()].map(w => w.name) })
+    return exitedAfterKill
   }
 
   return {
@@ -294,6 +345,11 @@ export function createLauncher(deps: LauncherDeps): { start(): Promise<number>; 
         log('launcher.tokens_identical', { hint: 'APPROVER_GH_TOKEN and ENGINE_GH_TOKEN must be different tokens' })
         return 1
       }
+      if (stopRequested) {
+        // Starting now would connect to Slack and begin reviews only to kill them with no drain.
+        log('launcher.stopped_before_start', {})
+        return 0
+      }
       const key = deps.randomKey()
       if (key.length !== LAUNCH_KEY_BYTES) throw new Error('LAUNCH_KEY must be 32 bytes')
 
@@ -315,26 +371,29 @@ export function createLauncher(deps: LauncherDeps): { start(): Promise<number>; 
       const loops = Array.from({ length: settings.workerSlots }, (_, slot) => workerLoop(slot, key, secrets.ENGINE_GH_TOKEN))
 
       const first = await Promise.race([orchestrator.exited.then(code => ({ kind: 'exited' as const, code })), stopSignal.then(() => ({ kind: 'stop' as const }))])
-      stopping = true
+      halt()
       if (first.kind === 'exited') {
         // Ruling 11: nothing is left to drain for; stop the workers and let launchd restart us.
         log('launcher.orchestrator_exited', { code: first.code })
-        await stopWorkers()
-        await Promise.all(loops)
+        if (await stopWorkers()) await Promise.all(loops)
         return 1
       }
       // Spec 3.6 step 3: drain first. Only the orchestrator is signalled, once.
       await docker.signal(ORCHESTRATOR_NAME, 'SIGTERM')
       const bound = settings.shutdownDrainMs + settings.shutdownGraceMs + settings.hardBoundSlackMs
       const exitedInTime = await Promise.race([orchestrator.exited.then(() => true), sleep(bound).then(() => false)])
+      let exited = exitedInTime
       if (!exitedInTime) {
         log('launcher.orchestrator_kill', { boundMs: bound })
         await docker.signal(ORCHESTRATOR_NAME, 'SIGKILL')
+        // Bounded so a docker CLI that never reports the exit cannot hold us until launchd's
+        // ExitTimeOut. The orchestrator has been SIGKILLed, so it can no longer drain a worker's job.
+        exited = await Promise.race([orchestrator.exited.then(() => true), sleep(settings.killWaitMs).then(() => false)])
+        if (!exited) log('launcher.orchestrator_exit_unconfirmed', { waitMs: settings.killWaitMs })
       }
-      const code = await orchestrator.exited
+      const code = exited ? await orchestrator.exited : undefined
       log('launcher.orchestrator_stopped', { code })
-      await stopWorkers()
-      await Promise.all(loops)
+      if (await stopWorkers()) await Promise.all(loops)
       return 0
     },
   }

@@ -11,7 +11,7 @@ async function main(): Promise<number> {
   const deps: LauncherDeps = {
     settings,
     aws: makeAwsOps(settings),
-    docker: makeDockerOps(settings, process.env),
+    docker: makeDockerOps(settings, process.env, undefined, undefined, log),
     log,
     now: Date.now,
     randomKey: defaultRandomKey,

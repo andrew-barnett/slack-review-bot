@@ -1,3 +1,4 @@
+import { EventEmitter } from 'events'
 import test from 'tape'
 import { engineSessionSeconds } from './bedrock-auth'
 import { verifyTicket } from './jobs/ticket'
@@ -8,7 +9,9 @@ import {
   dockerEnv,
   loadLauncherSettings,
   makeAwsOps,
+  makeDockerOps,
   ORCHESTRATOR_NAME,
+  WORKER_FAST_EXIT_MS,
   type AwsOps,
   type DockerOps,
   type LauncherDeps,
@@ -25,6 +28,7 @@ const fast: LauncherSettings = {
   workerRestartMs: 1,
   backoffBaseMs: 1,
   backoffMaxMs: 4,
+  killWaitMs: 30,
 }
 const until = async (cond: () => boolean, ms = 2000) => {
   const end = Date.now() + ms
@@ -52,16 +56,30 @@ function fakeAws(over: Partial<AwsOps> = {}): AwsOps {
 
 /**
  * Containers that live until signalled. The orchestrator exits `orchTermMs` after SIGTERM (null:
- * it ignores SIGTERM); workers exit on SIGTERM when `workersObeyTerm`. SIGKILL always works.
+ * it ignores SIGTERM); workers exit on SIGTERM when `workersObeyTerm`. SIGKILL works unless
+ * `orchIgnoresKill` / `workersIgnoreKill` (a docker CLI that never reports the exit). `workerExit`
+ * makes the nth run (from 1) of a worker exit at once with the returned code (undefined: stay up).
  */
-function fakeDocker(opts: { orchTermMs?: number | null; workersObeyTerm?: boolean } = {}) {
+function fakeDocker(
+  opts: {
+    orchTermMs?: number | null
+    workersObeyTerm?: boolean
+    orchIgnoresKill?: boolean
+    workersIgnoreKill?: boolean
+    workerExit?: (name: string, n: number) => number | undefined
+    rmFails?: boolean
+  } = {}
+) {
   const events: string[] = []
   const bundles = new Map<string, string>()
   const live = new Map<string, (code: number) => void>()
+  const runs = new Map<string, number>()
   const docker: DockerOps = {
     run(_service, name, bundle) {
       events.push(`run ${name}`)
       bundles.set(name, bundle)
+      const n = (runs.get(name) ?? 0) + 1
+      runs.set(name, n)
       let done = false
       const exited = new Promise<number>(resolve => {
         live.set(name, code => {
@@ -72,13 +90,18 @@ function fakeDocker(opts: { orchTermMs?: number | null; workersObeyTerm?: boolea
           resolve(code)
         })
       })
+      const code = name === ORCHESTRATOR_NAME ? undefined : opts.workerExit?.(name, n)
+      if (code !== undefined) live.get(name)!(code)
       return { name, exited }
     },
     async signal(name, signal) {
       events.push(`${signal} ${name}`)
       const exit = live.get(name)
       if (!exit) return
-      if (signal === 'SIGKILL') return exit(137)
+      if (signal === 'SIGKILL') {
+        if (name === ORCHESTRATOR_NAME ? opts.orchIgnoresKill : opts.workersIgnoreKill) return
+        return exit(137)
+      }
       if (name === ORCHESTRATOR_NAME) {
         const ms = opts.orchTermMs === undefined ? 10 : opts.orchTermMs
         if (ms !== null) setTimeout(() => exit(0), ms)
@@ -88,6 +111,8 @@ function fakeDocker(opts: { orchTermMs?: number | null; workersObeyTerm?: boolea
     },
     async removeForce(name) {
       events.push(`rm ${name}`)
+      // Only the per-slot removal is made to fail; the start-up cleanup is not under test here.
+      if (opts.rmFails && name === 'slack-review-bot-worker-0') throw new Error('Error response from daemon: removal of container is already in progress')
     },
     async listByPrefix() {
       events.push('ps workers')
@@ -161,7 +186,8 @@ test('launcher sends each container exactly its own bundle', async t => {
 // "worker lost" and settled as an error, so it never replays.
 test('launcher never stops a worker while the orchestrator is alive', async t => {
   const f = fakeDocker({ orchTermMs: 25 })
-  const launcher = createLauncher(deps(f.docker))
+  // A hard bound far above the orchestrator's 25 ms exit, so a loaded machine cannot reach it.
+  const launcher = createLauncher(deps(f.docker, { settings: { ...fast, shutdownDrainMs: 5_000 } }))
   const done = launcher.start()
   await until(() => f.events.includes('run slack-review-bot-worker-1'))
   launcher.requestStop()
@@ -177,7 +203,7 @@ test('launcher never stops a worker while the orchestrator is alive', async t =>
 // A repeated SIGTERM to the launcher is ignored: it must not escalate or signal anything new.
 test('launcher ignores a repeated stop request', async t => {
   const f = fakeDocker({ orchTermMs: 20 })
-  const d = deps(f.docker)
+  const d = deps(f.docker, { settings: { ...fast, shutdownDrainMs: 5_000 } })
   const launcher = createLauncher(d)
   const done = launcher.start()
   await until(() => f.events.includes('run slack-review-bot-worker-1'))
@@ -311,5 +337,161 @@ test('launcher mints both roles from the operator profile with the right ARNs an
     t.equal(c.env?.AWS_ACCESS_KEY_ID, undefined, 'no session credentials in the environment (no chaining)')
     t.equal(c.env?.AWS_SESSION_TOKEN, undefined)
   }
+  t.end()
+})
+
+/** The `waitMs` of every `launcher.worker_failed_fast` log for one slot, in order. */
+const fastWaits = (logs: [string, Record<string, unknown>][], slot: number) =>
+  logs.filter(([event, fields]) => event === 'launcher.worker_failed_fast' && fields.slot === slot).map(([, fields]) => fields.waitMs)
+
+// Final review, Important 2: a worker that exits at once (bad config, an expired ticket from a VM clock
+// behind the host, a name conflict) must not be restarted every second. Regression caught: each slot
+// assuming the engine role, minting a CodeArtifact token and starting a container every 2-5 s forever.
+test('launcher backs off a worker that exits non-zero, growing to the cap', async t => {
+  const f = fakeDocker({ workerExit: () => 3 })
+  const d = deps(f.docker, { settings: { ...fast, workerSlots: 1 } })
+  const launcher = createLauncher(d)
+  const done = launcher.start()
+  await until(() => fastWaits(d.logs, 0).length >= 4)
+  launcher.requestStop()
+  t.equal(await done, 0)
+  t.deepEqual(fastWaits(d.logs, 0).slice(0, 4), [1, 2, 4, 4], 'backoffMs schedule, capped at backoffMaxMs')
+  t.equal(d.logs.find(([event]) => event === 'launcher.worker_failed_fast')?.[1].code, 3)
+  t.end()
+})
+
+// An exit 0 can still be a failure when it comes within the fast-exit window (a worker that cannot
+// even long-poll); a run that lasted past the window is healthy and resets the backoff.
+test('launcher counts a quick exit 0 as a failure and resets the backoff after a healthy run', async t => {
+  t.equal(WORKER_FAST_EXIT_MS, 10_000)
+  let clock = 1_800_000_000_000
+  const f = fakeDocker({
+    workerExit: (_name, n) => {
+      if (n === 3) clock += WORKER_FAST_EXIT_MS // the third run lasts past the window
+      return n === 4 ? 1 : n <= 5 ? 0 : undefined
+    },
+  })
+  const d = deps(f.docker, { settings: { ...fast, workerSlots: 1 }, now: () => clock })
+  const launcher = createLauncher(d)
+  const done = launcher.start()
+  await until(() => f.events.filter(e => e === 'run slack-review-bot-worker-0').length >= 6)
+  launcher.requestStop()
+  await done
+  t.deepEqual(fastWaits(d.logs, 0), [1, 2, 1, 2], 'runs 1-2 back off; run 3 resets; runs 4-5 back off from the base')
+  t.end()
+})
+
+// A container left behind under the slot's name (its `compose run` client died) would make every
+// `run --name` fail. The slot's name is force-removed before each run, and a failing removal is logged,
+// never thrown, so the slot keeps going.
+test('launcher force-removes the slot name before each worker run and logs a failed removal', async t => {
+  const f = fakeDocker({ workerExit: (_name, n) => (n === 1 ? 0 : undefined), rmFails: true })
+  const d = deps(f.docker, { settings: { ...fast, workerSlots: 1 } })
+  const launcher = createLauncher(d)
+  const done = launcher.start()
+  await until(() => f.events.filter(e => e === 'run slack-review-bot-worker-0').length >= 2)
+  launcher.requestStop()
+  await done
+  const slot = f.events.filter(e => e.endsWith(' slack-review-bot-worker-0') && /^(rm|run) /.test(e))
+  t.deepEqual(slot.slice(0, 4), ['rm slack-review-bot-worker-0', 'run slack-review-bot-worker-0', 'rm slack-review-bot-worker-0', 'run slack-review-bot-worker-0'])
+  const failure = d.logs.find(([event]) => event === 'launcher.worker_remove_failed')
+  t.ok(failure, 'the failed removal is logged')
+  t.match(String(failure?.[1].error), /already in progress/)
+  t.end()
+})
+
+// Final review, Minor 1: a stop requested while the secrets are being fetched must not start the
+// orchestrator, which would connect to Slack and begin reviews only to be killed with no drain.
+test('launcher starts nothing when a stop arrives during the secret fetch', async t => {
+  const f = fakeDocker()
+  let release!: () => void
+  const gate = new Promise<void>(resolve => (release = resolve))
+  let fetching = false
+  const slow = fakeAws({
+    getSecret: async (_c, id) => {
+      fetching = true
+      await gate
+      return secrets[id]
+    },
+  })
+  const d = deps(f.docker, { aws: slow })
+  const launcher = createLauncher(d)
+  const done = launcher.start()
+  await until(() => fetching)
+  launcher.requestStop()
+  release()
+  t.equal(await done, 0, 'a clean exit')
+  t.notOk(f.events.some(e => e.startsWith('run ')), 'no container started')
+  t.ok(d.logs.some(([event]) => event === 'launcher.stopped_before_start'))
+  t.end()
+})
+
+// Final review (T13): a docker CLI that never reports the exit after SIGKILL must not hold the launcher
+// past launchd's ExitTimeOut. Both waits are bounded and the overrun is logged.
+test('launcher bounds the exit waits after SIGKILL and logs the overrun', async t => {
+  const f = fakeDocker({ orchTermMs: null, orchIgnoresKill: true, workersObeyTerm: false, workersIgnoreKill: true })
+  const d = deps(f.docker)
+  const launcher = createLauncher(d)
+  const done = launcher.start()
+  await until(() => f.events.includes('run slack-review-bot-worker-1'))
+  launcher.requestStop()
+  t.equal(await done, 0)
+  t.ok(d.logs.some(([event]) => event === 'launcher.orchestrator_exit_unconfirmed'))
+  t.ok(d.logs.some(([event]) => event === 'launcher.workers_exit_unconfirmed'))
+  t.ok(f.events.indexOf(`SIGKILL ${ORCHESTRATOR_NAME}`) < f.events.indexOf('SIGTERM slack-review-bot-worker-0'), 'workers still only after the orchestrator kill')
+  t.end()
+})
+
+/** A spawn stand-in that records its call and the bytes written to stdin, and never exits. */
+function recordingSpawn() {
+  const calls: { file: string; args: string[]; options: { env?: NodeJS.ProcessEnv; stdio?: unknown } }[] = []
+  const stdin: string[] = []
+  const spawnImpl = ((file: string, args: string[], options: { env?: NodeJS.ProcessEnv }) => {
+    calls.push({ file, args, options })
+    const child = new EventEmitter() as EventEmitter & { stdin: { on(): void; end(data: string): void } }
+    child.stdin = { on: () => {}, end: data => void stdin.push(data) }
+    return child
+  }) as unknown as Parameters<typeof makeDockerOps>[2]
+  return { calls, stdin, spawnImpl }
+}
+
+// Final review (T13): the one secret path no test pinned end to end. The bundle must reach the
+// container through stdin only: not in the docker argument vector, and the docker CLI's environment
+// carries no credential variable. Regression caught: a refactor passing values with `-e NAME=value`
+// (visible in `ps` and `docker inspect`) or inheriting the launcher's AWS session.
+test('makeDockerOps passes the bundle on stdin only, with a credential-free CLI environment', t => {
+  const env = { PATH: '/usr/bin', HOME: '/Users/op', AWS_PROFILE: 'staging', AWS_SESSION_TOKEN: 'aws-placeholder', NPM_TOKEN: 'npm-placeholder', GH_TOKEN: 'gh-placeholder', LAUNCH_KEY: 'key-placeholder' }
+  const r = recordingSpawn()
+  const docker = makeDockerOps(fast, env, r.spawnImpl)
+  const bundle = JSON.stringify({ ENGINE_GH_TOKEN: 'bundle-placeholder-value' })
+  docker.run('worker', 'slack-review-bot-worker-0', bundle)
+  t.equal(r.calls.length, 1)
+  t.equal(r.calls[0].file, 'docker')
+  t.deepEqual(r.calls[0].args, ['compose', '-f', fast.composeFile, '-p', 'slack-review-bot', 'run', '--rm', '-T', '--name', 'slack-review-bot-worker-0', 'worker'])
+  const cliEnv = r.calls[0].options.env ?? {}
+  t.deepEqual(Object.keys(cliEnv).sort(), ['HOME', 'PATH'], 'no AWS_*, *_TOKEN or LAUNCH_KEY variable reaches the CLI')
+  t.notOk(JSON.stringify(r.calls[0]).includes('bundle-placeholder-value'), 'no bundle value in the arguments or environment')
+  t.deepEqual(r.stdin, [bundle], 'the bundle is written to stdin, once')
+  t.end()
+})
+
+// Final review (T13): `docker kill` / `rm -f` failures were swallowed, hiding why a stop or a restart
+// stalled. "No such container" is the normal case and stays quiet; anything else is logged.
+test('makeDockerOps logs docker kill and rm failures other than a missing container', async t => {
+  const logs: [string, Record<string, unknown>][] = []
+  let stderr = 'Error response from daemon: No such container: x'
+  const exec = async () => {
+    throw Object.assign(new Error('failed'), { stderr })
+  }
+  const docker = makeDockerOps(fast, { PATH: '/usr/bin' }, recordingSpawn().spawnImpl, exec, (event, fields = {}) => void logs.push([event, fields]))
+  await docker.signal('slack-review-bot-worker-0', 'SIGTERM')
+  await docker.removeForce('slack-review-bot-worker-0')
+  t.deepEqual(logs, [], 'a missing container is not worth a log line')
+  stderr = 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock'
+  await docker.signal('slack-review-bot-worker-0', 'SIGKILL')
+  await docker.removeForce('slack-review-bot-worker-0')
+  t.deepEqual(logs.map(([event]) => event), ['launcher.docker_kill_failed', 'launcher.docker_rm_failed'])
+  t.equal(logs[0][1].signal, 'SIGKILL')
+  t.match(String(logs[0][1].error), /Cannot connect/)
   t.end()
 })

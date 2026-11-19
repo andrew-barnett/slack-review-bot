@@ -135,3 +135,18 @@ test('compose.yaml passes every config setting to a service or excludes it on pu
   }
   t.end()
 })
+
+// Final review (T13): each plist template's header comment is the operator's map of what the installer
+// substitutes. Regression caught: a placeholder (such as __EXIT_TIMEOUT__) added to the body but left
+// out of the header, so a hand install leaves it unsubstituted and launchd rejects the plist.
+test('every launchd template header names each placeholder its body uses', t => {
+  for (const file of ['launchd/com.abarnett.slack-review-bot-launcher.plist.template', 'launchd/com.abarnett.slack-review-bot.plist.template']) {
+    const text = read(file)
+    const header = /<!--([\s\S]*?)-->/.exec(text)?.[1] ?? ''
+    const body = text.slice(text.indexOf('<plist'))
+    for (const placeholder of new Set(body.match(/__[A-Z_]+__/g) ?? [])) {
+      t.ok(header.includes(placeholder), `${file} header names ${placeholder}`)
+    }
+  }
+  t.end()
+})
