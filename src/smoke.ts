@@ -94,9 +94,23 @@ async function main(): Promise<void> {
     if (!reply.lines.some(line => line.includes('stub-codex: reviewing'))) throw new Error("the stub's progress line never arrived")
     const log = inOrchestrator(`process.stdout.write(require('fs').readFileSync('/var/lib/slack-review-bot/runs/${reply.runId}.log', 'utf8'))`)
     if (!log.includes('stub-codex: reviewing')) throw new Error('the run log was not shipped to the orchestrator')
+    // Spec 6/7: the stub's --json usage crossed the worker wire and was priced into the month's journal.
+    // Every spend-YYYY-MM.jsonl is read, so a smoke that straddles 00:00 UTC on the 1st still finds it.
+    const journal = inOrchestrator(
+      "const fs = require('fs'); const dir = '/var/lib/slack-review-bot/state'; " +
+        "for (const name of fs.readdirSync(dir).filter(n => /^spend-\\d{4}-\\d{2}\\.jsonl$/.test(n))) process.stdout.write(fs.readFileSync(dir + '/' + name, 'utf8'))"
+    )
+    const runLine = journal
+      .split('\n')
+      .filter(line => line.trim() !== '')
+      .map(line => JSON.parse(line) as { type?: string; runId?: string; engine?: string; noUsage?: boolean; tokens?: { input?: number } })
+      .find(line => line.type === 'run' && line.runId === reply.runId)
+    if (!runLine || runLine.engine !== 'codex' || runLine.noUsage || !(Number(runLine.tokens?.input) > 0)) {
+      throw new Error(`the smoke's Codex usage never reached the spend journal: ${JSON.stringify(runLine)}`)
+    }
     const workerCode = await worker.exited
     if (workerCode !== 0) throw new Error(`the worker exited ${workerCode}`)
-    process.stdout.write('compose smoke passed: result, status lines and run log all arrived\n')
+    process.stdout.write('compose smoke passed: result, status lines, run log and spend ledger entry all arrived\n')
   } finally {
     try {
       docker(['kill', '--signal', 'SIGTERM', ORCH])

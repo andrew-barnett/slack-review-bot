@@ -5,7 +5,7 @@ description: Use when updating what the slack-review-bot image runs - bumping th
 
 # Refresh the bot's runtime
 
-The container image is fixed at build time. Four things in it go stale and are refreshed here:
+The container image is fixed at build time. Five things in it go stale and are refreshed here:
 
 | What | Pinned in | Consumed by |
 |---|---|---|
@@ -13,6 +13,7 @@ The container image is fixed at build time. Four things in it go stale and are r
 | Bedrock model IDs | defaults in `src/config.ts` (`codexBedrockModel`, `claudeBedrockModel`); overridable per install via `CODEX_BEDROCK_MODEL` / `CODEX_BEDROCK_PROJECT` / `CLAUDE_BEDROCK_MODEL` / `CODEX_BEDROCK_CONTEXT_WINDOW` in `launcher.conf` | `src/bedrock-auth.ts` (`ANTHROPIC_MODEL` for Claude; `-c model=...` for Codex) |
 | CLI versions | `Dockerfile` `ARG GH_VERSION`, `AWSCLI_VERSION`, `CODEX_VERSION`, `CLAUDE_CODE_VERSION` | the image |
 | Base image | `Dockerfile` `FROM node:22-bookworm-slim` (both stages) | the image |
+| Bedrock prices | `pricing/bedrock-prices.json` (USD per million tokens, keyed by model ID, with the source URL and date checked) | `src/pricing.ts` → the monthly spend cap (`src/spend-cap.ts`) |
 
 Do only the sections the request needs, but always finish with **Verify** and **Ship**.
 
@@ -73,6 +74,15 @@ The engine role (`SlackReviewBotEngineRole`, policy `iam/policies/SlackReviewBot
 4. Apply the choice. Either:
    - **Per install, no code change:** set `CODEX_BEDROCK_MODEL` / `CLAUDE_BEDROCK_MODEL` (and `CODEX_BEDROCK_CONTEXT_WINDOW`) in `~/.config/slack-review-bot/launcher.conf` and restart the launcher; or
    - **New default (preferred when it should apply everywhere):** change the defaults in `src/config.ts` `loadBedrockConfig`, then `grep -rn '<old-id>' --exclude-dir=node_modules --exclude-dir=dist .` and update every hit: tests (`src/config.test.ts`, `src/bedrock-auth.test.ts`, `src/codex.test.ts`, `src/claude.test.ts`, `src/worker.test.ts` at the time of writing), `README.md`, and both Codex profiles (`codex/review-bot.config.toml.template`, `codex/review-bot.config.container.toml`, whose `model =` is the subscription-path model name and changes only if the OpenAI model family changed). Leave dated specs/plans under `docs/superpowers/` alone — they are history.
+
+5. **Update the price table** whenever a model ID changes (a new default or a per-install override), and at least whenever this section runs. The daemon refuses to start in Bedrock mode if a configured model has no price.
+   1. Open https://aws.amazon.com/bedrock/pricing/, on-demand, region US East (Ohio) (`us-east-2`). Prices come from that page only; if you cannot open it, stop and ask the user.
+   2. In `pricing/bedrock-prices.json`, add or update the entry keyed by the exact model ID: `input`, `cachedInput` (cache read; the `input` price if none is listed), `cacheWrite` (the 5-minute write price; `0` if none is listed), `output`, all in USD per **million** tokens. Remove entries for models no longer configured anywhere.
+   3. Set `source` to `https://aws.amazon.com/bedrock/pricing/ (on-demand, us-east-2), checked YYYY-MM-DD` with today's date.
+   4. Keep `codexTokenSemantics` as it is unless Bedrock's or OpenAI's documentation now states how `cached_input_tokens` and `reasoning_output_tokens` relate to input and output; quote the sentence and URL in the PR if you change a flag.
+   5. Check: `node -e "const t=require('./pricing/bedrock-prices.json');console.log(t.source);console.table(t.models)"` matches the page value for value, and `npx ts-node --compiler-options '{"module":"commonjs"}' --transpile-only src/pricing-file.test.ts` passes.
+   6. A per-install override (`CODEX_BEDROCK_MODEL` / `CLAUDE_BEDROCK_MODEL` in `launcher.conf`) needs its entry in this table too, and the container runtime needs an image rebuild (section 4) before the override takes effect.
+6. **Keep the AWS Budget in step with the cap.** Once the Budget backstop from the spend-cap spec (section 10) exists, its limit is 1.10 × `BEDROCK_MONTHLY_CAP_USD`. Whenever the cap changes, change the Budget limit in the same change set. Until section 10 ships there is no Budget to update; say so in the PR.
 
 ## 3. CLI versions and base image
 

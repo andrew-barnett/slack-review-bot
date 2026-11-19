@@ -681,6 +681,11 @@ All optional except the two tokens.
 | `ENGINE_ROLE_ARN` | *(none)* | Bedrock mode: the IAM role the daemon assumes, once per engine attempt, to mint engine credentials. Must be `arn:aws:iam::<12 digits>:role/<name>`. When empty, static `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (and optionally `AWS_SESSION_TOKEN`) must be in the daemon environment instead. |
 | `ENGINE_AWS_PROFILE` | *(none)* | Bedrock mode: the AWS profile the daemon runs `aws sts assume-role` with. Empty uses the AWS CLI's default credential chain. |
 | `CODEX_BEDROCK_CONTEXT_WINDOW` | *(none)* | Bedrock mode, optional: a positive integer passed to Codex as `model_context_window`, overriding the fallback metadata Codex uses for Bedrock model IDs. |
+| `BEDROCK_MONTHLY_CAP_USD` | `1000` | The bot's monthly Bedrock spend cap in US dollars (a positive number). Applies under `ENGINE_AUTH=bedrock` and always in the container runtime. See [Bedrock spend cap](#bedrock-spend-cap). Never shown in Slack. |
+| `SPEND_ALERT_PERCENTS` | `25,50,75,90` | Percentages of the cap that post a one-time alert in the alert channel each month. Integers 1-99, strictly ascending. |
+| `SPEND_ALERT_HERE_PERCENTS` | `75,90` | Which of those alerts carry `@here`. Each must be in `SPEND_ALERT_PERCENTS`; unset means whichever of 75 and 90 are; empty means none. The cap-reached alert always carries `@here`. |
+| `SPEND_ALERT_CHANNEL` | first `SLACK_CHANNEL_IDS` entry | The channel ID (`C…`) the spend alerts go to. With no channel at all, alerts are only logged (`spend.alert_skipped`). |
+| `BEDROCK_PRICES_FILE` | `pricing/bedrock-prices.json` in the repo (`/app/pricing/bedrock-prices.json` in the image) | The on-demand price table spend is computed from. Must price `CODEX_BEDROCK_MODEL` and `CLAUDE_BEDROCK_MODEL`, or the daemon will not start. |
 
 > **Dual mode is not available yet. Do not provision `APPROVER_GH_TOKEN` or `ENGINE_GH_TOKEN` until [slack-review-bot#64](https://github.com/andrew-barnett/slack-review-bot/issues/64) is resolved.** Review children run as the same OS user as the daemon, so they can read the daemon's env file and the operator's `gh` login; withholding the variables from the child's environment is not enough.
 
@@ -815,6 +820,52 @@ and `AWS_SHARED_CREDENTIALS_FILE` set to `/dev/null`. In role mode the returned 
 `:assumed-role/<role name>/`. In static mode the ARN is reported. The credentials are never
 printed.
 
+### Bedrock spend cap
+
+When the bot runs on Bedrock (`ENGINE_AUTH=bedrock`, and always in the container runtime) it
+keeps a month-to-date total of what its own reviews cost and stops starting new reviews at
+`BEDROCK_MONTHLY_CAP_USD`. Under subscription auth the cap is off, and `status` says
+`Bedrock spend cap: not active (subscription auth)`.
+
+- **What counts.** Every engine run of every review, failures included, priced from its token
+  counts at the on-demand prices in `BEDROCK_PRICES_FILE`. Claude's own `$… notional` figure is
+  not used. Months are UTC calendar months. `npm run review` (the CLI) is not counted.
+- **Alerts.** The first time spend crosses each `SPEND_ALERT_PERCENTS` threshold in a month, one
+  message goes to `SPEND_ALERT_CHANNEL`, for example `<!here> This bot has used 76% of its monthly
+  Bedrock spend cap. New reviews stop at 100%.` Reaching the cap posts `<!here> This bot has reached
+  its monthly Bedrock spend cap. New review requests will be declined until Nov 30 at 7:00 PM ET.`
+  A failed post is logged (`spend.alert_failed`) and not retried. Slack text never shows a dollar
+  amount.
+- **At the cap.** Reviews already running finish. A new request gets the error reaction and a
+  thread reply saying when reviews resume; a request already queued gets the same answer when it
+  reaches its slot. Refused requests are not replayed. `status` and `help` keep working, and
+  `status` shows `Bedrock spend this month: cap reached · resets …`.
+- **Raising the cap.** Set a higher `BEDROCK_MONTHLY_CAP_USD` and restart. Reviews resume at once.
+- **The ledger.** One append-only file per UTC month, `spend-YYYY-MM.jsonl`, beside the cursor
+  file: `~/.local/state/slack-review-bot/spend-2026-11.jsonl` under launchd,
+  `/var/lib/slack-review-bot/state/spend-2026-11.jsonl` (the `orchestrator-state` volume) in the
+  container runtime. Each line is one JSON record: a priced engine run (`"type":"run"`), a threshold
+  alert (`"type":"alert"`) or the cap-reached message (`"type":"cap"`, with the cap it was sent for).
+  The bot never rewrites, renames or deletes these files; a new month is a new file, and old months
+  stay for auditing.
+- **Unreadable ledger.** If a line in this month's file does not parse or has an unknown shape,
+  including a last line with no newline (a crash mid-write), the bot logs `spend.unreadable` with
+  the file and the line number and treats the month as capped, so a lost record never reopens
+  spending. A locked month posts no alerts (it logs `spend.locked`) but still refuses reviews.
+  Raising the cap does not clear this. To recover, stop the bot
+  (`scripts/install-launcher.sh --uninstall` for the container runtime, `scripts/install-service.sh
+  --uninstall` for launchd), then fix the named line, or delete it (its spend is then not counted,
+  so only delete a `run` line if you accept that), then reinstall with the same script without
+  `--uninstall`. The next UTC month (a new file) also clears it.
+- **Unwritable ledger.** If the state directory or this month's file cannot be written, the bot logs
+  `spend.write_failed` and treats the month as capped until a write succeeds again
+  (`spend.write_recovered`); it retries on every `status` and every request, so no restart is
+  needed once the storage is fixed. Like an unreadable ledger, it posts no alerts meanwhile.
+- **Prices.** `pricing/bedrock-prices.json` is maintained by the `refresh-bot-runtime` skill. A
+  model with no entry stops the daemon at startup with the model and the file named. A per-install
+  model override (`CODEX_BEDROCK_MODEL`, `CLAUDE_BEDROCK_MODEL`) needs its own entry in the table
+  and, in the container runtime, an image rebuild.
+
 ## Container runtime (`RUNTIME=container`)
 
 The container runtime splits the bot in two (https://github.com/andrew-barnett/slack-review-bot/issues/70):
@@ -845,6 +896,7 @@ Non-secret settings live in `~/.config/slack-review-bot/launcher.conf` (override
 | `LAUNCHER_READER_ROLE_ARN` | `arn:aws:iam::153538148884:role/SlackReviewBotSecretsReaderRole` | Reads `/slack-review-bot/*`. |
 | `LAUNCHER_ENGINE_ROLE_ARN` | `arn:aws:iam::153538148884:role/SlackReviewBotEngineRole` | Invokes Bedrock models only. |
 | `SHUTDOWN_DRAIN_MS` | `5000` | The orchestrator's drain deadline; the launcher's hard bound is this plus `SHUTDOWN_GRACE_MS` (10 s) plus 30 s. |
+| `BEDROCK_MONTHLY_CAP_USD`, `SPEND_ALERT_PERCENTS`, `SPEND_ALERT_HERE_PERCENTS`, `SPEND_ALERT_CHANNEL`, `BEDROCK_PRICES_FILE` | as in [Configuration](#configuration) | The [Bedrock spend cap](#bedrock-spend-cap). The cap is always active in the container runtime. |
 | `SRB_IMAGE` | `slack-review-bot:local` | Image tag for build and run. |
 
 Example `launcher.conf`:

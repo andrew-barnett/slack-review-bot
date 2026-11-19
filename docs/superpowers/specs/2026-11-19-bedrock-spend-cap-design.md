@@ -39,7 +39,7 @@ These are read in `loadConfig` (src/config.ts, orchestrator/daemon only). Each o
 |---|---|---|
 | `BEDROCK_MONTHLY_CAP_USD` | `1000` | Positive finite number, otherwise startup fails. |
 | `SPEND_ALERT_PERCENTS` | `25,50,75,90` | Integers 1-99, strictly ascending, no duplicates. |
-| `SPEND_ALERT_HERE_PERCENTS` | `75,90` | Each must appear in `SPEND_ALERT_PERCENTS`. |
+| `SPEND_ALERT_HERE_PERCENTS` | whichever of `75,90` are in `SPEND_ALERT_PERCENTS` | Unset takes that default. An empty value means no `@here`. Explicit entries must each appear in `SPEND_ALERT_PERCENTS`. |
 | `SPEND_ALERT_CHANNEL` | the first `SLACK_CHANNEL_IDS` entry | A Slack channel ID. |
 | `BEDROCK_PRICES_FILE` | `<repo>/pricing/bedrock-prices.json` (in the image: `/app/pricing/bedrock-prices.json`) | Must parse. Must hold a complete entry for the configured `CODEX_BEDROCK_MODEL` and `CLAUDE_BEDROCK_MODEL`. |
 
@@ -108,7 +108,9 @@ Percent is `floor(spentUsd / cap × 100)`.
   - Thresholds in `SPEND_ALERT_PERCENTS` that are now reached and not yet in `alerted` produce **one** channel message, for the highest of them. All of them are then added to `alerted` and persisted before posting, so a crash never re-sends.
   - Message: `<!here> This bot has used 76% of its monthly Bedrock spend cap. New reviews stop at 100%.` The `<!here>` appears only if the highest crossed threshold is in `SPEND_ALERT_HERE_PERCENTS`.
   - When the percent reaches 100 and the cap is not yet announced for the configured cap, an `<!here>` message is always sent: `<!here> This bot has reached its monthly Bedrock spend cap. New review requests will be declined until <Mon D> at <h:mm a> ET.` A `cap` line recording the configured cap is appended before posting.
+  - A record that reaches the cap sends only the cap-reached message, not a threshold message as well.
   - **Raising the cap mid-month:** thresholds already alerted stay alerted. The cap message is sent again when spend reaches the new cap, because the `cap` line on file is for a lower cap.
+- **Locked month:** a month locked by an unreadable line or failed writes posts no alerts and logs `spend.locked`, but still refuses reviews.
 - **Channel post:** `makeSlackEffects` gains `postChannelMessage(channel, text)`, a `chat.postMessage` with no `thread_ts`. Alert failures are logged (`spend.alert_failed`) and never retried in a loop. The threshold stays marked, because a missed alert is better than a repeated one.
 - **Status** (src/status.ts `renderStatus` input gains a `spend` summary): `Bedrock spend this month: 41% of cap · resets Nov 30, 7:00 PM ET` (00:00 UTC on Dec 1). When capped: `Bedrock spend this month: cap reached · resets …`. When not active: see section 3.
 

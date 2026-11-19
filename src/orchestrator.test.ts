@@ -1,6 +1,7 @@
 import test from 'tape'
 import { CLAIMED_LINE } from './jobs/remote'
 import { orchestratorConfig, smokeJob } from './orchestrator'
+import type { RunUsage } from './usage'
 
 const key = Buffer.alloc(32, 9).toString('base64url')
 const bundle = { SLACK_BOT_TOKEN: 'bot-placeholder', SLACK_APP_TOKEN: 'app-placeholder', APPROVER_GH_TOKEN: 'approver-placeholder', LAUNCH_KEY: key }
@@ -64,5 +65,26 @@ test('smokeJob submits one codex job and reports results and status lines', asyn
   t.match(String(seen[0].runId), /^smoke-\d+$/)
   t.deepEqual(reply.results, [])
   t.deepEqual(reply.lines, [CLAIMED_LINE, 'stub-codex: reviewing\n'])
+  t.end()
+})
+
+// Spec 6/7: the smoke's one Codex run is recorded through the spend cap as one Codex engine run, under
+// the smoke's runId and with the worker's usage, so the compose smoke can prove usage reaches the
+// ledger. Regression caught: the smoke passing while --json usage is lost on the worker wire.
+test('smokeJob records its Codex run with the spend cap', async t => {
+  const { config } = orchestratorConfig(bundle, { HOME: '/home/bot' })
+  const codexUsage = { inputTokens: 1200, cachedInputTokens: 200, cacheWriteTokens: 0, outputTokens: 300, reasoningTokens: 40 }
+  const runners = {
+    runCodex: async () => ({ result: { results: [] }, rawFinalMessage: '', activeMs: 5, tokensUsed: 1740, codexUsage }),
+    runClaude: async () => {
+      throw new Error('not used')
+    },
+  }
+  const recorded: Array<{ usage: RunUsage; runId: string }> = []
+  const spend = { record: async (usage: RunUsage, runId: string) => void recorded.push({ usage, runId }) }
+  const reply = await smokeJob(config, spend)(runners as never)()
+  t.equal(recorded.length, 1)
+  t.equal(recorded[0].runId, reply.runId)
+  t.deepEqual(recorded[0].usage.engines?.map(e => [e.engine, e.usage.codex]), [['codex', codexUsage]])
   t.end()
 })
