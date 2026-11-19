@@ -25,7 +25,7 @@ Put a hard monthly cap on this bot's AWS Bedrock spend. The cap applies to this 
 | D4 | **Reviews already running when the cap is reached finish.** New requests are refused at admission, and queued ones are refused when they reach a slot. Refused requests are settled and never replayed. |
 | D5 | **Months are UTC calendar months,** matching AWS billing. Messages give reset times in America/New_York. |
 | D6 | **Alerts** go to one channel, once per threshold per month, with `@here` on the configured thresholds. **Percent only.** |
-| D7 | **Config** is set in `launcher.conf`, and a restart applies a change. The **ledger** is `spend.json` on the orchestrator state volume. The **price table** is a repo file maintained by the `refresh-bot-runtime` skill. **Status** shows percent only. |
+| D7 | **Config** is set in `launcher.conf`, and a restart applies a change. The **ledger** is an append-only `spend-YYYY-MM.jsonl` journal per UTC month on the orchestrator state volume. The **price table** is a repo file maintained by the `refresh-bot-runtime` skill. **Status** shows percent only. |
 
 ## 3. When the cap is active
 
@@ -76,26 +76,21 @@ These are read in `loadConfig` (src/config.ts, orchestrator/daemon only). Each o
 
 ## 7. Ledger
 
-- **File:** `spend.json` beside `CURSOR_FILE`. In the container that is `/var/lib/slack-review-bot/state/spend.json` on the `orchestrator-state` volume. Under launchd it is `~/.local/state/slack-review-bot/spend.json`.
-- **Writes** use a shared `writeJsonAtomic(file, value)`: write `file.tmp`, then rename. It is extracted from `openCursorStore`'s `persist`, and the cursor store uses it too.
+- **Files:** one append-only JSON Lines journal per UTC month, `spend-YYYY-MM.jsonl` in the directory of `CURSOR_FILE`. In the container that is `/var/lib/slack-review-bot/state/spend-2026-11.jsonl` on the `orchestrator-state` volume. Under launchd it is `~/.local/state/slack-review-bot/spend-2026-11.jsonl`.
+- **Never rewritten.** The bot only appends (`fs.appendFileSync`, one append per record call, creating the directory first). It never renames, archives, rewrites or deletes a journal. A new month is a new file name; old months stay for auditing and are never read again.
+- **Lines:** each is one JSON object with a `type`:
 
 ```json
-{
-  "version": 1,
-  "month": "2026-11",
-  "spentUsd": 412.3,
-  "alerted": [25],
-  "capAnnounced": false,
-  "entries": [
-    { "at": "2026-11-20T14:03:11Z", "runId": "…", "engine": "codex", "model": "us.openai.gpt-5.5",
-      "tokens": { "input": 0, "cachedInput": 0, "cacheWrite": 0, "output": 0, "reasoning": 0 }, "costUsd": 0.0 }
-  ]
-}
+{"type":"run","at":"2026-11-20T14:03:11Z","runId":"…","engine":"codex","model":"us.openai.gpt-5.5","tokens":{"input":0,"cachedInput":0,"cacheWrite":0,"output":0,"reasoning":0},"costUsd":0.0}
+{"type":"alert","at":"2026-11-20T14:03:11Z","percent":25}
+{"type":"cap","at":"2026-11-28T09:12:40Z","capUsd":1000}
 ```
 
+- **State** is derived from the current month's file: spend is the sum of `run.costUsd`, the alerted thresholds are the `alert` percents, and the cap counts as announced when a `cap` line has `capUsd` at or above the configured cap. Raising the cap therefore re-arms the announcement with no extra state.
 - **Recording:** each engine run in `usage.engines` is priced and appended through the daemon's existing `recordUsage` hook (src/daemon.ts), which fires once per request, failures included. An engine run with no usage at all (e.g. the worker was lost) is recorded with zero tokens and a `noUsage: true` flag, so the gap shows up in the audit.
-- **Rollover:** on the first record or read in a new UTC month, the old file is renamed to `spend-YYYY-MM.json` and a fresh ledger starts. Old months are kept for auditing and are never read again.
-- **Unreadable file:** the bot logs `spend.unreadable`, keeps the bad file as `spend.json.corrupt-<ts>`, and starts the month at **100% (capped)** rather than 0. A lost ledger must never reopen spending silently. An operator clears the cap by fixing or deleting the file and restarting; the README covers this.
+- **New month:** on the first record or read in a new UTC month, the bot switches to that month's file (normally empty). Nothing is renamed.
+- **Unreadable line:** a line that does not parse, has an unknown `type` or has invalid fields, or a partial last line (no trailing newline, as a crash mid-append leaves), makes the month **locked**: it reads as **100% (capped)**, and `spend.unreadable` is logged with the line number. It stays locked while the line exists. An operator clears it by fixing or removing the line and restarting; the README covers this. The next append after a partial line starts on a new line, so removing the partial line loses nothing else.
+- **Unwritable storage:** on open the bot probes the directory (write access plus a zero-byte append). If the probe or any append fails, the month reads as locked until a later probe or append succeeds; every read retries the probe. A run whose append failed still counts in the process's in-memory total. If storage has recovered by the next restart, that one run's cost is lost: at most the reviews running at that moment, which the section 10 backstop covers.
 - **`spentUsd`** is held internally only. No user-facing text shows it.
 
 ## 8. Enforcement and messages
@@ -112,8 +107,8 @@ Percent is `floor(spentUsd / cap × 100)`.
 - **Alerts** are checked after each ledger record:
   - Thresholds in `SPEND_ALERT_PERCENTS` that are now reached and not yet in `alerted` produce **one** channel message, for the highest of them. All of them are then added to `alerted` and persisted before posting, so a crash never re-sends.
   - Message: `<!here> This bot has used 76% of its monthly Bedrock spend cap. New reviews stop at 100%.` The `<!here>` appears only if the highest crossed threshold is in `SPEND_ALERT_HERE_PERCENTS`.
-  - When the percent first reaches 100, an `<!here>` message is always sent: `<!here> This bot has reached its monthly Bedrock spend cap. New review requests will be declined until <Mon D> at <h:mm a> ET.` This sets `capAnnounced`.
-  - **Raising the cap mid-month:** thresholds already alerted stay alerted. `capAnnounced` resets if the percent drops below 100.
+  - When the percent reaches 100 and the cap is not yet announced for the configured cap, an `<!here>` message is always sent: `<!here> This bot has reached its monthly Bedrock spend cap. New review requests will be declined until <Mon D> at <h:mm a> ET.` A `cap` line recording the configured cap is appended before posting.
+  - **Raising the cap mid-month:** thresholds already alerted stay alerted. The cap message is sent again when spend reaches the new cap, because the `cap` line on file is for a lower cap.
 - **Channel post:** `makeSlackEffects` gains `postChannelMessage(channel, text)`, a `chat.postMessage` with no `thread_ts`. Alert failures are logged (`spend.alert_failed`) and never retried in a loop. The threshold stays marked, because a missed alert is better than a repeated one.
 - **Status** (src/status.ts `renderStatus` input gains a `spend` summary): `Bedrock spend this month: 41% of cap · resets Nov 30, 7:00 PM ET` (00:00 UTC on Dec 1). When capped: `Bedrock spend this month: cap reached · resets …`. When not active: see section 3.
 
@@ -123,17 +118,17 @@ Unit tests, each pinning a failure mode:
 
 - Price loading rejects a missing model, a zero price and bad JSON.
 - The conservative Codex reading overcounts and the confirmed reading does not.
-- Ledger rollover at a UTC boundary that is still the previous month in ET.
-- The unreadable ledger starts capped.
-- The atomic write leaves the old file intact if the write fails.
-- Threshold crossing: one message for the highest threshold, `@here` only on the configured percents, no repeat after a restart, cap raised mid-month.
+- A run at a UTC month boundary that is still the previous month in ET lands in the new month's file, and the old file is untouched.
+- A bad or partial journal line locks the month until it is removed; unwritable storage locks it until a write succeeds.
+- A failed run append still counts in memory and locks the process.
+- Threshold crossing: one message for the highest threshold, `@here` only on the configured percents, no repeat after a restart, cap raised mid-month, including a first record after the raise that crosses the new cap.
 - Admission refusal records the cursor and returns false, and `status` still answers while capped.
 - A request queued below the cap, which gets its slot after spend has reached 100%, is refused at slot time: no engine runs, the cursor is settled, and the slot is released.
 - No user-facing string contains a `$` amount. A test renders every spend message and status line and asserts there is no `$` followed by a digit.
 - Codex `--json` parsing: summing across turns, usage on stall, timeout and output errors, and progress lines extracted from events.
 - The wire round-trip of `codexUsage`.
 
-The compose smoke stub emits `--json` events, and the smoke checks that the orchestrator's ledger recorded a Codex entry.
+The compose smoke stub emits `--json` events, and the smoke checks that the orchestrator's journal gained a Codex `run` line.
 
 ## 10. AWS backstop (trade-platform/pulumi)
 
