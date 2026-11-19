@@ -22,7 +22,7 @@ Put a hard monthly cap on this bot's AWS Bedrock spend. The cap applies to this 
 | D1 | **The bot is the primary cap, with an AWS Budget backstop.** The bot keeps a month-to-date ledger and enforces everything users see. An AWS Budget, filtered to this bot by a cost-allocation tag, denies Bedrock invocation to the engine role at 110% of the bot's cap. The Budget lags 8-24 h. |
 | D2 | **Spend = tokens × a price table in the repo.** Claude's `ClaudeUsageDetail` already has a breakdown. Codex gets one from `codex exec --json`: the spike on andrew-barnett/slack-review-bot#76 confirmed that `turn.completed.usage` has `input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens` and `reasoning_output_tokens` in codex-cli 0.169.0. Claude's `costUsd` is not used: it is a notional figure, not a Bedrock charge. |
 | D3 | **Attribution in AWS: tagged application inference profiles.** The bot invokes profile ARNs, and the Budget filters on the tag. The staging account is its own payer (it is not in an Organization), so we can activate the tag ourselves. |
-| D4 | **Reviews already running when the cap is reached finish.** New requests are refused before they take a review slot. Refused requests are settled and never replayed. |
+| D4 | **Reviews already running when the cap is reached finish.** New requests are refused at admission, and queued ones are refused when they reach a slot. Refused requests are settled and never replayed. |
 | D5 | **Months are UTC calendar months,** matching AWS billing. Messages give reset times in America/New_York. |
 | D6 | **Alerts** go to one channel, once per threshold per month, with `@here` on the configured thresholds. **Percent only.** |
 | D7 | **Config** is set in `launcher.conf`, and a restart applies a change. The **ledger** is `spend.json` on the orchestrator state volume. The **price table** is a repo file maintained by the `refresh-bot-runtime` skill. **Status** shows percent only. |
@@ -107,7 +107,8 @@ Percent is `floor(spentUsd / cap × 100)`.
   2. Reply in the thread: `This bot's monthly Bedrock spend cap has been reached, so it isn't starting new reviews. Reviews resume on <Mon D> at <h:mm a> ET (the start of the next UTC month), or sooner if the cap is raised.`
   3. Record the cursor (`cursors.record`), so the request is never replayed.
   4. Return `false`.
-- **In-flight reviews** finish (D4). Overshoot is bounded by `CONCURRENCY` × the cost of one review.
+- **Queued requests are re-checked when they get a slot.** A request admitted below the cap can wait in the queue while other reviews push spend past 100%. So the cap is checked again at the start of the `queue.run` callback (src/daemon.ts), before `runJob`. If the request is now capped, it gets the same refusal: the hourglass/ack reaction is replaced by `ERROR_EMOJI`, the same thread reply is posted, the cursor is settled, and the slot is released without running an engine.
+- **Reviews already running** finish (D4). Because of the re-check, overshoot is bounded by `CONCURRENCY` × the cost of one review, not by the length of the backlog.
 - **Alerts** are checked after each ledger record:
   - Thresholds in `SPEND_ALERT_PERCENTS` that are now reached and not yet in `alerted` produce **one** channel message, for the highest of them. All of them are then added to `alerted` and persisted before posting, so a crash never re-sends.
   - Message: `<!here> This bot has used 76% of its monthly Bedrock spend cap. New reviews stop at 100%.` The `<!here>` appears only if the highest crossed threshold is in `SPEND_ALERT_HERE_PERCENTS`.
@@ -127,6 +128,7 @@ Unit tests, each pinning a failure mode:
 - The atomic write leaves the old file intact if the write fails.
 - Threshold crossing: one message for the highest threshold, `@here` only on the configured percents, no repeat after a restart, cap raised mid-month.
 - Admission refusal records the cursor and returns false, and `status` still answers while capped.
+- A request queued below the cap, which gets its slot after spend has reached 100%, is refused at slot time: no engine runs, the cursor is settled, and the slot is released.
 - No user-facing string contains a `$` amount. A test renders every spend message and status line and asserts there is no `$` followed by a digit.
 - Codex `--json` parsing: summing across turns, usage on stall, timeout and output errors, and progress lines extracted from events.
 - The wire round-trip of `codexUsage`.
