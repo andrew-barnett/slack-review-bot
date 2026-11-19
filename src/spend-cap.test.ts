@@ -82,6 +82,8 @@ test('each threshold posts once, with the current percent, and @here only where 
 })
 
 // Spec 8: one record crossing several thresholds below 100 posts one message, for the highest.
+// Regression caught: one post per crossed threshold (a burst of 25/50/75 messages for one run), or the
+// lowest crossed threshold reported instead of the highest.
 test('a record crossing several thresholds posts one alert for the highest', async t => {
   const h = harness()
   await h.cap.record(codexRun(80), 'C1-1', NOW)
@@ -123,6 +125,8 @@ test('a restart does not repeat an alert', async t => {
 
 // Spec 8: raising the cap mid-month (a restart with a higher BEDROCK_MONTHLY_CAP_USD) lifts the refusal,
 // re-arms the cap message, and does not repeat thresholds already announced this month.
+// Regression caught: a raised cap still refusing (the old cap compared against), thresholds re-announced
+// after the restart, or the cap message never re-armed for the new cap.
 test('raising the cap mid-month lifts the refusal and re-arms the cap message', async t => {
   const first = harness()
   await first.cap.record(codexRun(100), 'C1-1', NOW)
@@ -158,6 +162,8 @@ test('after a cap raise, the first record that crosses the new cap announces it'
 })
 
 // Spec 8: a failed post is logged, never retried, and the threshold stays marked.
+// Regression caught: retrying the post on the next record, or un-marking the threshold after a failure so
+// it re-alerts (a Slack outage would then post a burst when it clears).
 test('a failed alert is logged, not retried, and stays marked', async t => {
   const h = harness()
   h.failPosts()
@@ -170,6 +176,8 @@ test('a failed alert is logged, not retried, and stays marked', async t => {
 })
 
 // Ruling 7: with no alert channel, alerts are logged and skipped, and the cap is still enforced.
+// Regression caught: a crash or throw when no channel is configured, or enforcement dropped along with
+// the alert.
 test('with no alert channel the alert is skipped and the cap still applies', async t => {
   const h = harness({ alertChannel: '' })
   await h.cap.record(codexRun(100), 'C1-1', NOW)
@@ -243,15 +251,23 @@ test('record never throws; a failure is logged', async t => {
 })
 
 // Ruling 8: a locked month (a bad journal line) reads as at least 100%, so it refuses and says so.
+// Regression caught: a corrupt journal failing open (admitting reviews with unknown spend) or the status
+// line showing a low percent for a month the bot cannot read.
 test('a locked ledger refuses and reports the cap reached', t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spend-cap-'))
   fs.writeFileSync(spendFileFor(dir, '2026-11'), 'not json\n')
   const h = harness({}, dir)
   t.ok(h.cap.capped(NOW))
-  t.equal(spendPercent({ spentUsd: 0, locked: true }, 100), 100)
-  t.equal(spendPercent({ spentUsd: 41.9, locked: false }, 100), 41, 'percent is floored')
   t.equal(renderSpendStatusLine(h.cap.status(NOW)), 'Bedrock spend this month: cap reached · resets Nov 30, 7:00 PM ET')
   fs.rmSync(dir, { recursive: true, force: true })
+  t.end()
+})
+
+// Spec section 5: percent is floor(spent / cap x 100); a locked month is at least 100.
+// Regression caught: rounding 41.9 up to 42 (a cap that trips early), or a locked month reading below 100.
+test('spendPercent floors the percent and reads a locked month as 100', t => {
+  t.equal(spendPercent({ spentUsd: 0, locked: true }, 100), 100)
+  t.equal(spendPercent({ spentUsd: 41.9, locked: false }, 100), 41, 'percent is floored')
   t.end()
 })
 
