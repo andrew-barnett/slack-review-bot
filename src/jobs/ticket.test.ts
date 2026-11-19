@@ -12,7 +12,7 @@ test('a minted ticket verifies and yields its nonce', t => {
   const ticket = mintTicket(key, T0)
   t.match(ticket, /^\d{13}-[0-9a-f]{32}\.[A-Za-z0-9_-]{43}$/, 'nonce = ms timestamp + 16 random bytes; HMAC is base64url')
   const check = verifyTicket(key, ticket, T0 + 1000, TEN_MIN + 60_000)
-  t.deepEqual(check, { ok: true, nonce: ticket.split('.')[0] })
+  t.deepEqual(check, { ok: true, nonce: ticket.split('.')[0], issuedAt: T0 })
   t.end()
 })
 

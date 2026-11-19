@@ -25,7 +25,7 @@ export function mintTicket(key: Buffer, nowMs: number, random: (n: number) => Bu
   return `${nonce}.${mac(key, nonce).toString('base64url')}`
 }
 
-export type TicketCheck = { ok: true; nonce: string } | { ok: false; reason: 'malformed' | 'signature' | 'expired' }
+export type TicketCheck = { ok: true; nonce: string; issuedAt: number } | { ok: false; reason: 'malformed' | 'signature' | 'expired' }
 
 export function verifyTicket(key: Buffer, ticket: string, nowMs: number, maxAgeMs: number): TicketCheck {
   const dot = ticket.lastIndexOf('.')
@@ -38,7 +38,7 @@ export function verifyTicket(key: Buffer, ticket: string, nowMs: number, maxAgeM
   if (given.length !== expected.length || !timingSafeEqual(given, expected)) return { ok: false, reason: 'signature' }
   const issuedAt = Number(parts[1])
   if (nowMs - issuedAt > maxAgeMs || issuedAt - nowMs > TICKET_FUTURE_SKEW_MS) return { ok: false, reason: 'expired' }
-  return { ok: true, nonce }
+  return { ok: true, nonce, issuedAt }
 }
 
 export interface SpentNonces {

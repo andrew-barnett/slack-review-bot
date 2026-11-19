@@ -242,6 +242,55 @@ test('broker sweep after a freeze does not fail claimed jobs as worker lost', as
   t.end()
 })
 
+// Final review, Important 1: a worker parked in a long-poll keeps its nonce across a laptop sleep, but
+// its engine credentials were minted with its ticket and have expired by the time the overnight
+// backlog arrives. Regression caught: the first job after a wake going to that waiter, failing on
+// Bedrock with a non-retried output error, and its cursor settling so the review never replays.
+test('broker never assigns a job to a waiter whose ticket outlived ticketMaxAgeMs', async t => {
+  const { broker, clock, ticket } = make({ claimWaitMs: 60_000 })
+  const parked = broker.claim(ticket())
+  clock.now += 661_000
+  const out = settle(broker.submit('codex-report-only', opts))
+  const reply = await parked
+  t.equal(reply.status, 403, 'the stale waiter is rejected, so it exits and the launcher mints a fresh worker')
+  t.deepEqual(reply.body, { error: 'expired' })
+  t.equal(broker.inFlight(), 1, 'the job is still in flight')
+  t.equal((await claimed(broker, ticket())).kind, 'codex-report-only', 'a fresh worker claims the queued job')
+  broker.abandonAll()
+  await out
+  t.end()
+})
+
+// A waiter whose ticket is still young is served as before; the age check must not reject it.
+test('broker still assigns a job to a waiter whose ticket is within ticketMaxAgeMs', async t => {
+  const { broker, clock, ticket } = make({ claimWaitMs: 60_000 })
+  const parked = broker.claim(ticket())
+  clock.now += 600_000
+  const out = settle(broker.submit('codex-report-only', opts))
+  t.equal((await parked).status, 200)
+  broker.abandonAll()
+  await out
+  t.end()
+})
+
+// After a detected freeze every parked waiter is suspect (its credentials aged by the sleep), so the
+// sweep flushes them all with 403; their workers exit and are replaced with fresh credentials.
+test('broker sweep flushes every waiter after a freeze', async t => {
+  const { broker, clock, ticket } = make({ claimWaitMs: 600_000 })
+  broker.sweep()
+  const a = broker.claim(ticket())
+  const b = broker.claim(ticket())
+  clock.now += 5 * 60_000
+  broker.sweep()
+  t.deepEqual([(await a).status, (await b).status], [403, 403])
+  const out = settle(broker.submit('codex-report-only', opts))
+  t.equal(broker.inFlight(), 1, 'a job submitted after the flush waits in the queue')
+  t.equal((await claimed(broker, ticket())).kind, 'codex-report-only')
+  broker.abandonAll()
+  await out
+  t.end()
+})
+
 // Ruling F4: heartbeats alone cannot bound a job. A worker that keeps heartbeating (a wedged engine,
 // or PR code holding the job token) must still lose its slot once timeoutMs + the margin has passed.
 // Regression caught: a claimed job that pins a CONCURRENCY slot forever.

@@ -109,6 +109,8 @@ interface Job {
 
 interface Waiter {
   nonce: string
+  /** The ticket's mint time; the worker's engine credentials were minted with it. */
+  issuedAt: number
   reply(reply: BrokerReply): void
 }
 
@@ -118,6 +120,7 @@ function outputError(kind: JobKind, message: string): Error {
 }
 
 const FORBIDDEN: BrokerReply = { status: 403, body: { error: 'token not valid for this job' } }
+const EXPIRED: BrokerReply = { status: 403, body: { error: 'expired' } }
 
 export function createJobBroker(o: JobBrokerOptions): JobBroker {
   const now = o.now ?? Date.now
@@ -171,6 +174,13 @@ export function createJobBroker(o: JobBrokerOptions): JobBroker {
   const offer = (job: Job) => {
     while (waiters.length) {
       const waiter = waiters.shift()!
+      // A waiter parked across a sleep still holds its nonce, but the credentials minted with its
+      // ticket may have expired: refuse it so the worker exits and the launcher mints a fresh one.
+      if (now() - waiter.issuedAt > o.ticketMaxAgeMs) {
+        log('jobs.claim_rejected', { reason: 'expired', stage: 'assign' })
+        waiter.reply(EXPIRED)
+        continue
+      }
       const reply = assign(job, waiter.nonce)
       if (reply) {
         waiter.reply({ status: 200, body: reply })
@@ -239,6 +249,7 @@ export function createJobBroker(o: JobBrokerOptions): JobBroker {
         let done = false
         const waiter: Waiter = {
           nonce: check.nonce,
+          issuedAt: check.issuedAt,
           reply: reply => {
             if (done) return
             done = true
@@ -358,6 +369,11 @@ export function createJobBroker(o: JobBrokerOptions): JobBroker {
       const frozenForMs = frozen ? t - (lastSweepAt as number) : 0
       if (frozen) log('jobs.freeze', { frozenForMs })
       lastSweepAt = t
+      if (frozen && waiters.length) {
+        // Every parked worker's credentials aged through the sleep; replace them all with fresh ones.
+        log('jobs.waiters_flushed', { count: waiters.length })
+        for (const waiter of waiters.splice(0)) waiter.reply(EXPIRED)
+      }
       for (const job of [...jobs.values()]) {
         if (job.state === 'claimed') {
           if (frozen) {
