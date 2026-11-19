@@ -2329,6 +2329,42 @@ test('a failed run append is counted in memory and locks until storage recovers'
   t.end()
 })
 
+// A write can fail after appending part of a line (a full disk, an I/O error). Regression caught: the next
+// successful record joined the damaged prefix, so the restart locked the month and deleting the bad line
+// also deleted a real charge.
+test('a record after a part-written failed append starts on its own line', t => {
+  const { base, dir, nov } = scratch()
+  let failNext = false
+  const appendFile = (file: string, text: string): void => {
+    if (failNext && text !== '') {
+      failNext = false
+      fs.appendFileSync(file, text.slice(0, 10))
+      throw new Error('ENOSPC: no space left on device')
+    }
+    fs.appendFileSync(file, text)
+  }
+  const ledger = openSpendLedger(dir, logger().log, NOV_20, appendFile)
+  ledger.recordRuns([run(4, 'C1-1')], NOV_20)
+  failNext = true
+  ledger.recordRuns([run(6, 'C1-2')], NOV_20)
+  ledger.recordRuns([run(5, 'C1-3')], NOV_20)
+  t.equal(
+    fs.readFileSync(nov, 'utf8'),
+    `${runLine(4).replace('C1-11', 'C1-1')}\n${JSON.stringify({ type: 'run', ...run(6, 'C1-2') }).slice(0, 10)}\n${JSON.stringify({ type: 'run', ...run(5, 'C1-3') })}\n`,
+    'the record after the failure is on its own line'
+  )
+  t.equal(openSpendLedger(dir, logger().log, NOV_20).state(NOV_20).locked, true, 'the damaged line still locks the month')
+  const lines = fs.readFileSync(nov, 'utf8').split('\n')
+  fs.writeFileSync(nov, [lines[0], lines[2], ''].join('\n'))
+  t.deepEqual(
+    openSpendLedger(dir, logger().log, NOV_20).state(NOV_20).entries.map(e => e.runId),
+    ['C1-1', 'C1-3'],
+    'removing the damaged line keeps the run recorded after it'
+  )
+  fs.rmSync(base, { recursive: true, force: true })
+  t.end()
+})
+
 // Spec 8: alert and cap decisions are journaled before posting, so a restart never re-sends them. The cap
 // line records the cap it was sent for; a higher configured cap is not covered by it, which is how a cap
 // raise re-arms the message with no extra state. Regression caught: a boolean "announced" flag that a cap
@@ -2576,7 +2612,15 @@ function readMonth(dir: string, month: string, log: Log): Month {
  * Open the journal for the current UTC month in `dir` (Task 5's `spendDir`). Reading never throws: an
  * untrustworthy journal, or storage that cannot be written, makes the month read as capped instead.
  */
-export function openSpendLedger(dir: string, log: Log, nowMs: number = Date.now()): SpendLedger {
+/** How a journal is appended to. Tests substitute one that fails part-way through a write. */
+export type AppendFile = (file: string, text: string) => void
+
+export function openSpendLedger(
+  dir: string,
+  log: Log,
+  nowMs: number = Date.now(),
+  appendFile: AppendFile = fs.appendFileSync
+): SpendLedger {
   // True while the last append or probe failed. The month reads as capped until one succeeds, and every
   // state() retries the probe, so the lock clears on its own once storage recovers.
   let writeFailing = false
@@ -2593,7 +2637,7 @@ export function openSpendLedger(dir: string, log: Log, nowMs: number = Date.now(
     try {
       fs.mkdirSync(dir, { recursive: true })
       fs.accessSync(dir, fs.constants.W_OK)
-      fs.appendFileSync(m.file, '')
+      appendFile(m.file, '')
       succeeded(m.file)
     } catch (error) {
       failed(m.file, error)
@@ -2604,10 +2648,13 @@ export function openSpendLedger(dir: string, log: Log, nowMs: number = Date.now(
     const text = `${m.partialTail ? '\n' : ''}${records.map(record => `${JSON.stringify(record)}\n`).join('')}`
     try {
       fs.mkdirSync(dir, { recursive: true })
-      fs.appendFileSync(m.file, text)
+      appendFile(m.file, text)
       m.partialTail = false
       succeeded(m.file)
     } catch (error) {
+      // A failed append may still have written a prefix with no newline. Start the next record on a
+      // fresh line so it never joins the damaged one (a blank line is ignored on read).
+      m.partialTail = true
       failed(m.file, error)
     }
   }
@@ -2664,7 +2711,7 @@ export function openSpendLedger(dir: string, log: Log, nowMs: number = Date.now(
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `npx ts-node --compiler-options '{"module":"commonjs"}' --transpile-only src/spend-ledger.test.ts`
-Expected: PASS (all ten tests). Run as root, the two permission tests are skipped.
+Expected: PASS (all eleven tests). Run as root, the two permission tests are skipped.
 
 Run: `npm test 2>&1 | tail -4 && npm run typecheck`
 Expected: `# ok`, then `tsc` exits 0.
