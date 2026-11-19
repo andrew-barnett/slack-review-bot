@@ -14,8 +14,8 @@ const TEMPLATES = {
 }
 
 /**
- * True inside a Docker or Podman container. `root` is a test seam (CONTAINER_PROBE_ROOT). The single
- * implementation for JS and TS (src/container.ts re-exports it); its bash twin is in_container in
+ * True inside a Docker or Podman container. `root` is a test seam (CONTAINER_PROBE_ROOT). Twins:
+ * inContainer in src/container.ts (src/container.test.ts pins parity) and in_container in
  * scripts/install-codex-profile.sh.
  */
 function inContainer(root = process.env.CONTAINER_PROBE_ROOT || '/') {
