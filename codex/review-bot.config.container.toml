@@ -1,0 +1,18 @@
+# Codex config profile for the review bot's WORKER CONTAINER. Installed by
+# `scripts/install-codex-profile.sh --container` inside the image only; the host check rejects it.
+#
+# The container is the sandbox boundary (spec D4): bubblewrap cannot create namespaces in an
+# unprivileged container, so Codex runs with full access inside it. The worker holds only a
+# read-only GitHub token, a short-lived Bedrock-only AWS session and an npm read token.
+
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+# Model-generated shell commands inherit the environment (gh, git, npm need it), except the AWS
+# session, which only Codex itself needs to reach Bedrock.
+[shell_environment_policy]
+inherit = "all"
+exclude = ["AWS_*"]
+
+model = "gpt-5.5"
+model_reasoning_effort = "high"

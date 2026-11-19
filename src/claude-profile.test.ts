@@ -294,3 +294,93 @@ test('check-claude-profile still rejects an unknown extra file next to runtime s
   t.match(out.stderr, /extra\.txt is present/)
   t.end()
 })
+
+// --- Container profile (spec D4, ruling 14) ---
+
+/** A fake filesystem root for the container probe: with or without /.dockerenv. */
+function probeRoot(inside: boolean): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'probe-root-'))
+  fs.mkdirSync(path.join(root, 'proc', '1'), { recursive: true })
+  fs.writeFileSync(path.join(root, 'proc', '1', 'cgroup'), '0::/\n')
+  if (inside) fs.writeFileSync(path.join(root, '.dockerenv'), '')
+  return root
+}
+
+/** The installer with the container flags and a chosen probe root. */
+function containerRun(home: string, dir: string, extra: string[], inside: boolean) {
+  const skill = path.join(home, 'skills-src', 'review-pr')
+  const hook = path.join(home, 'hooks-src', 'block-secret-reads.py')
+  const args = [
+    '--dir', dir,
+    '--workspace-root', path.join(home, 'src'),
+    '--worktree-root', path.join(home, 'wt'),
+    '--skill-src', skill,
+    '--hook-src', hook,
+    '--env-file', path.join(home, 'daemon-config', 'env'),
+    '--gh-config-dir', path.join(home, 'gh-config'),
+    '--container',
+    ...extra,
+  ]
+  return spawnSync(SCRIPT, args, {
+    encoding: 'utf8',
+    env: { PATH: process.env.PATH, HOME: home, CONTAINER_PROBE_ROOT: probeRoot(inside) },
+  })
+}
+
+// The container is the sandbox boundary (spec D4): sandbox off, but both read-deny layers stay, and
+// the worker's npmrc is denied too. Regression caught: a container profile that drops the deny rules
+// along with the sandbox.
+test('install-claude-profile --container writes sandbox off with every deny rule kept', t => {
+  const { home, dir } = sandboxHome()
+  const out = containerRun(home, dir, [], true)
+  t.equal(out.status, 0, out.stderr)
+  const s = JSON.parse(fs.readFileSync(path.join(dir, 'settings.json'), 'utf8'))
+  t.deepEqual(s.sandbox, { enabled: false })
+  t.equal(s.permissions.defaultMode, 'dontAsk')
+  const npmrc = path.join(home, '.npmrc-worker')
+  for (const d of [path.join(home, 'gh-config'), npmrc, path.join(home, '.aws')]) {
+    t.ok(s.permissions.deny.includes(`Read(/${d}/**)`), `Read denied on ${d}`)
+  }
+  t.ok(s.permissions.deny.includes(`Edit(/${dir}/**)`), 'the profile dir stays unwritable')
+  t.equal(s.hooks.PreToolUse[0].hooks[0].command, `python3 "${dir}/hooks/block-secret-reads.py"`)
+  t.match(out.stdout, /looks correct/)
+  t.end()
+})
+
+// A sandbox-off profile must never be installed on the laptop, where it would run PR code with the
+// operator's whole filesystem in reach. Regression caught: the container profile passing --check
+// on the host.
+test('check-claude-profile --container fails outside a container unless --build', t => {
+  const { home, dir } = sandboxHome()
+  t.equal(containerRun(home, dir, [], true).status, 0)
+  const outside = containerRun(home, dir, ['--check'], false)
+  t.equal(outside.status, 1)
+  t.match(outside.stderr, /only be installed inside a container/)
+  t.equal(containerRun(home, dir, ['--check', '--build'], false).status, 0, 'docker build has no /.dockerenv')
+  t.end()
+})
+
+// The host check must reject a container rendering: sandbox off is only safe inside the container.
+test('check-claude-profile (host) rejects a container profile', t => {
+  const { home, dir, run } = sandboxHome()
+  t.equal(containerRun(home, dir, [], true).status, 0)
+  const out = run(['--check'])
+  t.equal(out.status, 1)
+  t.match(out.stderr, /sandbox\.enabled is not true/)
+  t.end()
+})
+
+// The container check is by value too: a sandbox block other than exactly {enabled:false} (for
+// example one re-enabling network rules nobody enforces) is rejected.
+test('check-claude-profile --container rejects any other sandbox block', t => {
+  const { home, dir } = sandboxHome()
+  t.equal(containerRun(home, dir, [], true).status, 0)
+  const file = path.join(dir, 'settings.json')
+  const s = JSON.parse(fs.readFileSync(file, 'utf8'))
+  s.sandbox = { enabled: false, excludedCommands: ['curl'] }
+  fs.writeFileSync(file, JSON.stringify(s))
+  const out = containerRun(home, dir, ['--check'], true)
+  t.equal(out.status, 1)
+  t.match(out.stderr, /sandbox must be exactly/)
+  t.end()
+})

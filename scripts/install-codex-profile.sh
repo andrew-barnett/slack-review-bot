@@ -6,7 +6,10 @@
 # network on, caches writable. It is layered ON TOP of the user's base config by
 # `codex exec --profile <name>`, so installing it does not change any interactive run.
 #
-# Usage: scripts/install-codex-profile.sh [--name review-bot] [--check]
+# Usage: scripts/install-codex-profile.sh [--name review-bot] [--check] [--container [--build]]
+#
+# --container installs the worker-container profile (danger-full-access, AWS_* excluded from model
+# shell commands) and refuses to verify outside a container; --build skips only that probe.
 
 set -euo pipefail
 
@@ -14,6 +17,8 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." > /dev/null 2>&1 && pwd)"
 CODEX_HOME="${CODEX_HOME:-${HOME}/.codex}"
 NAME="review-bot"
 CHECK_ONLY=0
+CONTAINER=0
+BUILD=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -25,8 +30,16 @@ while [ $# -gt 0 ]; do
             CHECK_ONLY=1
             shift
             ;;
+        --container)
+            CONTAINER=1
+            shift
+            ;;
+        --build)
+            BUILD=1
+            shift
+            ;;
         -h | --help)
-            sed -n '2,9p' "$0"
+            sed -n '2,12p' "$0"
             exit 0
             ;;
         *)
@@ -37,7 +50,17 @@ while [ $# -gt 0 ]; do
 done
 
 TEMPLATE="${DIR}/codex/review-bot.config.toml.template"
+if [ "${CONTAINER}" -eq 1 ]; then
+    TEMPLATE="${DIR}/codex/review-bot.config.container.toml"
+fi
 TARGET="${CODEX_HOME}/${NAME}.config.toml"
+
+# Same probe as scripts/claude-profile-lib.js; CONTAINER_PROBE_ROOT is a test seam.
+in_container() {
+    local root="${CONTAINER_PROBE_ROOT:-/}"
+    [ -e "${root%/}/.dockerenv" ] || [ -e "${root%/}/run/.containerenv" ] ||
+        grep -qE 'docker|containerd|kubepods|libpod' "${root%/}/proc/1/cgroup" 2> /dev/null
+}
 
 if [ ! -f "${TEMPLATE}" ]; then
     echo "ERROR: template not found at ${TEMPLATE}" >&2
@@ -70,9 +93,36 @@ if ! grep -qE '^\s*approval_policy\s*=\s*"never"' "${TARGET}"; then
     fail=1
 fi
 
-if ! grep -qE '^\s*network_access\s*=\s*true' "${TARGET}"; then
-    echo "ERROR: ${TARGET} does not set network_access = true" >&2
-    fail=1
+if [ "${CONTAINER}" -eq 1 ]; then
+    if ! grep -qE '^\s*sandbox_mode\s*=\s*"danger-full-access"' "${TARGET}"; then
+        echo "ERROR: ${TARGET} does not set sandbox_mode = \"danger-full-access\" (the container is the boundary)" >&2
+        fail=1
+    fi
+    if ! grep -qE '^\s*inherit\s*=\s*"all"' "${TARGET}"; then
+        echo "ERROR: ${TARGET} does not set shell_environment_policy.inherit = \"all\"" >&2
+        fail=1
+    fi
+    if ! grep -qE '^\s*exclude\s*=\s*\[\s*"AWS_\*"\s*\]' "${TARGET}"; then
+        echo "ERROR: ${TARGET} does not exclude AWS_* from model shell commands" >&2
+        fail=1
+    fi
+    if grep -qE '^\s*writable_roots' "${TARGET}"; then
+        echo "ERROR: ${TARGET} sets writable_roots, which has no meaning under full access" >&2
+        fail=1
+    fi
+    if [ "${BUILD}" -eq 0 ] && ! in_container; then
+        echo "ERROR: the container profile is full access, so it may only be installed inside a container" >&2
+        fail=1
+    fi
+else
+    if ! grep -qE '^\s*network_access\s*=\s*true' "${TARGET}"; then
+        echo "ERROR: ${TARGET} does not set network_access = true" >&2
+        fail=1
+    fi
+    if grep -qE 'danger-full-access' "${TARGET}"; then
+        echo "ERROR: ${TARGET} sets danger-full-access; the laptop profile must stay sandboxed" >&2
+        fail=1
+    fi
 fi
 
 if grep -q '__HOME__' "${TARGET}"; then
@@ -84,4 +134,8 @@ if [ "${fail}" -ne 0 ]; then
     exit 1
 fi
 
-echo "profile '${NAME}' looks correct (approvals off, sandbox network on)"
+if [ "${CONTAINER}" -eq 1 ]; then
+    echo "profile '${NAME}' looks correct (container: approvals off, full access inside the container, AWS_* excluded)"
+else
+    echo "profile '${NAME}' looks correct (approvals off, sandbox network on)"
+fi
