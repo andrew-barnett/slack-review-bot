@@ -680,7 +680,7 @@ All optional except the two tokens.
 | `CLAUDE_BEDROCK_MODEL` | `us.anthropic.claude-opus-5-5` | Bedrock mode: Claude Code's model ID. Letters, digits and `. _ : -` only. |
 | `ENGINE_ROLE_ARN` | *(none)* | Bedrock mode: the IAM role the daemon assumes, once per engine attempt, to mint engine credentials. Must be `arn:aws:iam::<12 digits>:role/<name>`. When empty, static `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (and optionally `AWS_SESSION_TOKEN`) must be in the daemon environment instead. |
 | `ENGINE_AWS_PROFILE` | *(none)* | Bedrock mode: the AWS profile the daemon runs `aws sts assume-role` with. Empty uses the AWS CLI's default credential chain. |
-| `CODEX_BEDROCK_CONTEXT_WINDOW` | *(none)* | Bedrock mode, optional: a positive integer passed to Codex as `model_context_window`, overriding the fallback metadata Codex uses for Bedrock model IDs. |
+| `CODEX_BEDROCK_CONTEXT_WINDOW` | `272000` | Bedrock mode: a positive integer passed to Codex as `model_context_window`, overriding the fallback metadata Codex uses for Bedrock model IDs. The default keeps every request at or below 272K input tokens, where OpenAI's short-context rates apply; the spend cap prices Codex at those rates only, so don't raise it without pricing long-context requests too. |
 | `BEDROCK_MONTHLY_CAP_USD` | `1000` | The bot's monthly Bedrock spend cap in US dollars (a positive number). Applies under `ENGINE_AUTH=bedrock` and always in the container runtime. See [Bedrock spend cap](#bedrock-spend-cap). Never shown in Slack. |
 | `SPEND_ALERT_PERCENTS` | `25,50,75,90` | Percentages of the cap that post a one-time alert in the alert channel each month. Integers 1-99, strictly ascending. |
 | `SPEND_ALERT_HERE_PERCENTS` | `75,90` | Which of those alerts carry `@here`. Each must be in `SPEND_ALERT_PERCENTS`; unset means whichever of 75 and 90 are; empty means none. The cap-reached alert always carries `@here`. |
@@ -785,7 +785,7 @@ after `--profile` and take precedence over it:
 -c model_providers.amazon-bedrock.aws.region="<BEDROCK_REGION>"
 -c model_providers.amazon-bedrock.http_headers={"OpenAI-Project"="<CODEX_BEDROCK_PROJECT>"}
 -c shell_environment_policy.exclude=["AWS_*"]
-[-c model_context_window=<CODEX_BEDROCK_CONTEXT_WINDOW>]
+-c model_context_window=<CODEX_BEDROCK_CONTEXT_WINDOW>
 ```
 
 The `amazon-bedrock` provider is the Bedrock Mantle endpoint
@@ -800,7 +800,7 @@ The `shell_environment_policy.exclude` override is the security-relevant one. Th
 variables and signs its Bedrock calls with them, but every shell command the model runs, and
 any PR test code it starts, gets an environment with no `AWS_*` variables. Codex prints
 "Model metadata for `openai.gpt-5.5` not found. Defaulting to fallback metadata"; that
-warning is expected, and `CODEX_BEDROCK_CONTEXT_WINDOW` overrides the fallback context window.
+warning is expected, and `CODEX_BEDROCK_CONTEXT_WINDOW` (default `272000`) overrides the fallback context window.
 
 **Claude Code.** The child gets `CLAUDE_CODE_USE_BEDROCK=1`, `AWS_REGION`,
 `ANTHROPIC_MODEL=<CLAUDE_BEDROCK_MODEL>` and the three AWS credential variables.

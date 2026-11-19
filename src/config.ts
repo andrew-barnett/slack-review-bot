@@ -175,8 +175,9 @@ export interface ReviewConfig {
   /** Bedrock mode: the model ID Claude Code uses (a cross-region inference profile). */
   claudeBedrockModel: string
   /**
-   * Bedrock mode, optional: Codex's context window for the Bedrock model, in tokens. Codex has no
-   * metadata for Bedrock model IDs and falls back to defaults; this overrides that fallback.
+   * Bedrock mode: Codex's context window for the Bedrock model, in tokens. Codex has no metadata for
+   * Bedrock model IDs and falls back to defaults; this overrides that fallback. Defaults to
+   * {@link DEFAULT_CODEX_BEDROCK_CONTEXT_WINDOW} in bedrock mode; unset in subscription mode.
    */
   codexBedrockContextWindow?: number
   /**
@@ -526,6 +527,14 @@ export function parseEngineAuth(raw: string | undefined): EngineAuth {
 }
 
 /**
+ * Codex's context window in bedrock mode when CODEX_BEDROCK_CONTEXT_WINDOW is unset. OpenAI models on
+ * Bedrock bill a whole request at long-context rates once its input exceeds 272K tokens, and the
+ * spend price table holds only the short-context rates, so capping Codex here keeps the cap's
+ * arithmetic exact. Raising it means also pricing long-context requests.
+ */
+export const DEFAULT_CODEX_BEDROCK_CONTEXT_WINDOW = 272000
+
+/**
  * Parse CODEX_BEDROCK_CONTEXT_WINDOW: absent when unset, otherwise a positive integer. A bad value
  * is an error rather than a silent default, because it is spliced into a Codex `-c` override.
  */
@@ -596,8 +605,8 @@ function loadBedrockConfig(env: NodeJS.ProcessEnv): BedrockConfig {
   if (!BEDROCK_PROJECT_ID.test(out.codexBedrockProject)) {
     throw new Error(`CODEX_BEDROCK_PROJECT must look like proj_<lowercase letters and digits> (got "${out.codexBedrockProject}")`)
   }
-  const window = parseContextWindow(env.CODEX_BEDROCK_CONTEXT_WINDOW)
-  if (window !== undefined) out.codexBedrockContextWindow = window
+  out.codexBedrockContextWindow =
+    parseContextWindow(env.CODEX_BEDROCK_CONTEXT_WINDOW) ?? DEFAULT_CODEX_BEDROCK_CONTEXT_WINDOW
   if (out.engineRoleArn) {
     // The value is not echoed: a malformed one may be a secret pasted into the wrong variable.
     if (!ROLE_ARN.test(out.engineRoleArn)) {

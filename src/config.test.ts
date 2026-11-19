@@ -396,6 +396,15 @@ test('loadReviewConfig defaults to subscription auth and captures nothing', t =>
   t.end()
 })
 
+// Bedrock mode with no CODEX_BEDROCK_CONTEXT_WINDOW must still cap Codex at 272K input tokens. The
+// spend price table holds only short-context rates, so an uncapped window would let requests bill
+// at long-context rates (up to 2x) while the cap counted them at the short rate.
+test('loadReviewConfig defaults the Codex context window to 272000 in bedrock mode', t => {
+  const c = loadReviewConfig({ ENGINE_AUTH: 'bedrock', ...STATIC_KEYS })
+  t.equal(c.codexBedrockContextWindow, 272000)
+  t.end()
+})
+
 // A typo such as ENGINE_AUTH=bedrok must stop startup and say what is allowed, not silently fall
 // back to the subscription the operator meant to move off.
 test('loadReviewConfig rejects an unknown ENGINE_AUTH naming the allowed values', t => {
