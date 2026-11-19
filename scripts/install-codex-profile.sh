@@ -67,6 +67,13 @@ if [ ! -f "${TEMPLATE}" ]; then
     exit 1
 fi
 
+# Refuse before writing anything: a full-access profile written on the host would replace the
+# sandboxed laptop profile of the same name even though the check below then fails.
+if [ "${CONTAINER}" -eq 1 ] && [ "${BUILD}" -eq 0 ] && ! in_container; then
+    echo "ERROR: the container profile is full access, so it may only be installed inside a container" >&2
+    exit 1
+fi
+
 if [ "${CHECK_ONLY}" -eq 0 ]; then
     mkdir -p "${CODEX_HOME}"
     # Codex config.toml has no variable expansion, so absolute paths are baked in here.
@@ -119,7 +126,8 @@ else
         echo "ERROR: ${TARGET} does not set network_access = true" >&2
         fail=1
     fi
-    if grep -qE 'danger-full-access' "${TARGET}"; then
+    # Match the setting, not the template's comment explaining why it is not used.
+    if grep -qE '^\s*sandbox_mode\s*=\s*"danger-full-access"' "${TARGET}"; then
         echo "ERROR: ${TARGET} sets danger-full-access; the laptop profile must stay sandboxed" >&2
         fail=1
     fi

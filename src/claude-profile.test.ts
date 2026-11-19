@@ -384,3 +384,18 @@ test('check-claude-profile --container rejects any other sandbox block', t => {
   t.match(out.stderr, /sandbox must be exactly/)
   t.end()
 })
+
+// A mistaken --container install on the laptop must leave the host profile exactly as it was: the
+// probe runs before anything is written. Regression caught: the installer overwriting settings.json
+// with sandbox off and only then failing its check, so the next host review runs unsandboxed.
+test('install-claude-profile --container on the host refuses before writing', t => {
+  const { home, dir, run } = sandboxHome()
+  t.equal(run([]).status, 0, 'the host profile is installed')
+  const before = fs.readFileSync(path.join(dir, 'settings.json'), 'utf8')
+  const out = containerRun(home, dir, [], false)
+  t.equal(out.status, 1)
+  t.match(out.stderr, /only be installed inside a container/)
+  t.equal(fs.readFileSync(path.join(dir, 'settings.json'), 'utf8'), before, 'the host settings are untouched')
+  t.end()
+})
+

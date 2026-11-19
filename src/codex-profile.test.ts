@@ -58,3 +58,17 @@ test('install-codex-profile host check rejects danger-full-access', t => {
   t.ok(fs.existsSync(file))
   t.end()
 })
+
+// A mistaken --container install on the laptop must not replace the sandboxed host profile of the
+// same name. Regression caught: writing danger-full-access first and failing the check afterwards.
+test('install-codex-profile --container on the host refuses before writing', t => {
+  const { file, run } = setup(false)
+  t.equal(run([]).status, 0, 'the host profile is installed')
+  const before = fs.readFileSync(file, 'utf8')
+  const out = run(['--container'])
+  t.equal(out.status, 1)
+  t.match(out.stderr, /only be installed inside a container/)
+  t.equal(fs.readFileSync(file, 'utf8'), before, 'the host profile is untouched')
+  t.end()
+})
+

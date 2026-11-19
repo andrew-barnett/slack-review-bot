@@ -139,6 +139,14 @@ if [ "${BUILD}" -eq 1 ]; then
     CHECK_ARGS+=(--build)
 fi
 
+# Refuse before writing anything: a sandbox-off settings file written on the host would replace the
+# laptop profile's settings even though the checker below then fails.
+if [ "${CONTAINER}" -eq 1 ] && [ "${BUILD}" -eq 0 ] &&
+    ! node -e 'process.exit(require(process.argv[1]).inContainer() ? 0 : 1)' "${REPO}/scripts/claude-profile-lib.js"; then
+    echo "ERROR: the container profile turns the sandbox off, so it may only be installed inside a container" >&2
+    exit 1
+fi
+
 if [ "${CHECK_ONLY}" -eq 0 ]; then
     if [ ! -f "${SKILL_SRC}/SKILL.md" ]; then
         echo "ERROR: no review-pr skill at ${SKILL_SRC} (pass --skill-src)" >&2
