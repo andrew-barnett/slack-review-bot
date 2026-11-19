@@ -2294,25 +2294,43 @@ test('a new ledger starts the month at zero and round-trips through a restart', 
   t.end()
 })
 
-// PR review finding (andrew-barnett/slack-review-bot#78): a failed write must not let spend escape the cap.
-// While writes fail, disk holds a lower total than memory, so a restart would reopen a reached cap; the
-// month therefore reads as locked (refusing new reviews) until a retry writes the full total.
-// Regression caught: swallowing the write error and carrying on with an in-memory total only.
-test('a failed write locks the month until a retry persists the full total', t => {
+// PR review findings (andrew-barnett/slack-review-bot#78): a failed snapshot write must not let spend
+// escape the cap, in this process or after a restart. The temp file is blocked by a directory, so the
+// write-then-rename fails while appends still work. Regression caught: keeping the lost charge only in
+// memory, so a restart reopened a reached cap at the snapshot's lower total.
+test('a failed write keeps the charge across a restart and locks until the snapshot is written', t => {
   const { dir, file } = scratch()
   const ledger = openSpendLedger(file, logger().log, NOV_20)
   ledger.append([entry(90)], NOV_20)
-  fs.chmodSync(dir, 0o500)
+  fs.mkdirSync(`${file}.tmp`)
+  ledger.append([entry(20)], NOV_20)
+  t.equal(ledger.state(NOV_20).locked, true, 'reads as capped while the write is failing')
+  const restarted = openSpendLedger(file, logger().log, NOV_20)
+  t.equal(restarted.state(NOV_20).spentUsd, 110, 'a restart while still failing keeps the full total')
+  t.equal(restarted.state(NOV_20).locked, true, 'and stays capped')
+  fs.rmdirSync(`${file}.tmp`)
+  t.notOk(restarted.state(NOV_20).locked, 'the retry wrote the snapshot, so the month reopens on its own figures')
+  t.notOk(fs.existsSync(`${file}.pending`), 'the pending entries were folded in and removed')
+  t.equal(openSpendLedger(file, logger().log, NOV_20).state(NOV_20).spentUsd, 110, 'a later restart sees the full total once')
+  fs.rmSync(dir, { recursive: true, force: true })
+  t.end()
+})
+
+// When nothing in the state directory can be written, opening the ledger must already read as capped:
+// the probe write on open fails. Regression caught: a restart onto read-only storage admitting reviews
+// whose spend could never be recorded.
+test('opening the ledger on unwritable storage starts capped', t => {
+  const { dir, file } = scratch()
+  openSpendLedger(file, logger().log, NOV_20).append([entry(5)], NOV_20)
+  const stateDir = path.dirname(file)
+  fs.chmodSync(stateDir, 0o500)
   try {
-    ledger.append([entry(20)], NOV_20)
-    t.equal(ledger.state(NOV_20).locked, true, 'reads as capped while the write is failing')
-    t.equal(ledger.state(NOV_20).spentUsd, 110, 'memory keeps the full total')
+    const ledger = openSpendLedger(file, logger().log, NOV_20)
+    t.equal(ledger.state(NOV_20).spentUsd, 5)
+    t.equal(ledger.state(NOV_20).locked, true)
   } finally {
-    fs.chmodSync(dir, 0o700)
+    fs.chmodSync(stateDir, 0o700)
   }
-  const recovered = ledger.state(NOV_20)
-  t.notOk(recovered.locked, 'the retry succeeded and the month reopens on its own figures')
-  t.equal(openSpendLedger(file, logger().log, NOV_20).state(NOV_20).spentUsd, 110, 'a restart sees the full total')
   fs.rmSync(dir, { recursive: true, force: true })
   t.end()
 })
@@ -2544,19 +2562,34 @@ function parseLedger(raw: string): SpendFile | string {
 }
 
 export function openSpendLedger(file: string, log: Log, nowMs: number = Date.now()): SpendLedger {
-  // True while the last write failed. The file on disk then holds a lower total than memory, and a
-  // restart would reopen spending at that lower total, so the month reads as capped (no new review
-  // starts) until a write of the full in-memory state succeeds. Every read retries the write.
+  // Entries whose snapshot write failed are appended here, one JSON line each. An append goes through a
+  // different path from the snapshot's write-then-rename, so it usually survives what broke the snapshot
+  // (a blocked temp file, a full rename target). Opening the ledger merges these entries back in, so a
+  // restart never reopens spending at the snapshot's lower total. A crash between a successful snapshot
+  // and deleting this file counts those entries twice: an overcount, the safe direction for a cap.
+  const pendingFile = `${file}.pending`
+  // True while the last snapshot write failed: the month reads as capped (no new review starts) until a
+  // write of the full in-memory state succeeds. Every read retries the write.
   let writeFailing = false
   const persist = (state: SpendFile): void => {
     try {
       writeJsonAtomic(file, state)
+      fs.rmSync(pendingFile, { force: true })
       if (writeFailing) log('spend.write_recovered', { file })
       writeFailing = false
     } catch (error) {
       // Never throw: a ledger that cannot be written must not take a review down.
       writeFailing = true
       log('spend.write_failed', { file, error: String(error), hint: 'new reviews are refused until spend.json can be written' })
+    }
+  }
+  const keepPending = (entries: SpendEntry[]): void => {
+    try {
+      fs.appendFileSync(pendingFile, entries.map(e => `${JSON.stringify(e)}\n`).join(''))
+    } catch (error) {
+      // Nothing on disk can be written. This process still refuses new reviews; the unrecorded spend is
+      // at most the reviews already running, and the AWS Budget backstop covers it.
+      log('spend.pending_failed', { file: pendingFile, error: String(error) })
     }
   }
 
@@ -2611,6 +2644,36 @@ export function openSpendLedger(file: string, log: Log, nowMs: number = Date.now
   }
   roll(nowMs)
 
+  // Merge entries a failed snapshot left behind (see pendingFile). A line that does not parse makes the
+  // month untrustworthy, so it starts locked, as for an unreadable spend.json.
+  let pendingRaw: string | undefined
+  try {
+    pendingRaw = fs.readFileSync(pendingFile, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log('spend.unreadable', { file: pendingFile, reason: `unreadable: ${String(error)}`, hint: 'starting this month capped' })
+      current = { ...current, locked: true }
+    }
+  }
+  if (pendingRaw !== undefined) {
+    const lines = pendingRaw.split('\n').filter(line => line.trim() !== '')
+    for (const line of lines) {
+      try {
+        const e = JSON.parse(line) as SpendEntry
+        if (typeof e.costUsd !== 'number' || !Number.isFinite(e.costUsd) || e.costUsd < 0) throw new Error('bad costUsd')
+        current.entries.push(e)
+        current.spentUsd += e.costUsd
+      } catch (error) {
+        log('spend.unreadable', { file: pendingFile, reason: String(error), hint: 'starting this month capped' })
+        current = { ...current, locked: true }
+      }
+    }
+    log('spend.pending_merged', { file: pendingFile, entries: lines.length })
+  }
+  // Always write once on open: it folds merged entries into spend.json, and it probes the storage. If the
+  // write still fails, the month reads as capped from the first request, not only after a later failure.
+  persist(current)
+
   return {
     state(now) {
       roll(now)
@@ -2624,6 +2687,7 @@ export function openSpendLedger(file: string, log: Log, nowMs: number = Date.now
       current.entries.push(...entries)
       current.spentUsd += entries.reduce((sum, e) => sum + e.costUsd, 0)
       persist(current)
+      if (writeFailing) keepPending(entries)
     },
     update(change, now) {
       roll(now)
@@ -2638,7 +2702,7 @@ export function openSpendLedger(file: string, log: Log, nowMs: number = Date.now
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `npx ts-node --compiler-options '{"module":"commonjs"}' --transpile-only src/spend-ledger.test.ts`
-Expected: PASS (all ten tests).
+Expected: PASS (all eleven tests).
 
 Run: `npm test 2>&1 | tail -4 && npm run typecheck`
 Expected: `# ok`, then `tsc` exits 0.
