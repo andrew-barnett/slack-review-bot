@@ -2294,6 +2294,29 @@ test('a new ledger starts the month at zero and round-trips through a restart', 
   t.end()
 })
 
+// PR review finding (andrew-barnett/slack-review-bot#78): a failed write must not let spend escape the cap.
+// While writes fail, disk holds a lower total than memory, so a restart would reopen a reached cap; the
+// month therefore reads as locked (refusing new reviews) until a retry writes the full total.
+// Regression caught: swallowing the write error and carrying on with an in-memory total only.
+test('a failed write locks the month until a retry persists the full total', t => {
+  const { dir, file } = scratch()
+  const ledger = openSpendLedger(file, logger().log, NOV_20)
+  ledger.append([entry(90)], NOV_20)
+  fs.chmodSync(dir, 0o500)
+  try {
+    ledger.append([entry(20)], NOV_20)
+    t.equal(ledger.state(NOV_20).locked, true, 'reads as capped while the write is failing')
+    t.equal(ledger.state(NOV_20).spentUsd, 110, 'memory keeps the full total')
+  } finally {
+    fs.chmodSync(dir, 0o700)
+  }
+  const recovered = ledger.state(NOV_20)
+  t.notOk(recovered.locked, 'the retry succeeded and the month reopens on its own figures')
+  t.equal(openSpendLedger(file, logger().log, NOV_20).state(NOV_20).spentUsd, 110, 'a restart sees the full total')
+  fs.rmSync(dir, { recursive: true, force: true })
+  t.end()
+})
+
 // Spec 9: rollover at a UTC boundary that is still the previous month in ET. The old month is archived as
 // spend-YYYY-MM.json and the new one starts at zero. Regression caught: rolling over on the ET calendar,
 // which would carry five hours of December spend into November's cap.
@@ -2521,13 +2544,19 @@ function parseLedger(raw: string): SpendFile | string {
 }
 
 export function openSpendLedger(file: string, log: Log, nowMs: number = Date.now()): SpendLedger {
+  // True while the last write failed. The file on disk then holds a lower total than memory, and a
+  // restart would reopen spending at that lower total, so the month reads as capped (no new review
+  // starts) until a write of the full in-memory state succeeds. Every read retries the write.
+  let writeFailing = false
   const persist = (state: SpendFile): void => {
     try {
       writeJsonAtomic(file, state)
+      if (writeFailing) log('spend.write_recovered', { file })
+      writeFailing = false
     } catch (error) {
-      // The in-memory month stays right and the next write tries again. A ledger that cannot be
-      // written must not take a review down.
-      log('spend.write_failed', { file, error: String(error) })
+      // Never throw: a ledger that cannot be written must not take a review down.
+      writeFailing = true
+      log('spend.write_failed', { file, error: String(error), hint: 'new reviews are refused until spend.json can be written' })
     }
   }
 
@@ -2585,7 +2614,10 @@ export function openSpendLedger(file: string, log: Log, nowMs: number = Date.now
   return {
     state(now) {
       roll(now)
-      return current
+      if (writeFailing) persist(current)
+      // A failing write is reported as a locked month (read as at least 100%) without persisting the flag:
+      // once the write succeeds, the full total is on disk and the month reopens on its own figures.
+      return writeFailing && !current.locked ? { ...current, locked: true } : current
     },
     append(entries, now) {
       roll(now)
@@ -2606,7 +2638,7 @@ export function openSpendLedger(file: string, log: Log, nowMs: number = Date.now
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `npx ts-node --compiler-options '{"module":"commonjs"}' --transpile-only src/spend-ledger.test.ts`
-Expected: PASS (all nine tests).
+Expected: PASS (all ten tests).
 
 Run: `npm test 2>&1 | tail -4 && npm run typecheck`
 Expected: `# ok`, then `tsc` exits 0.
@@ -3760,8 +3792,8 @@ Run: `git add src/spend-messages.ts src/spend-messages.test.ts src/spend-cap.ts 
 
 **Files:**
 - Create: `src/spend-gate.ts`
-- Modify: `src/slack.ts`, `src/daemon.ts`
-- Test: `src/spend-gate.test.ts` (create), `src/slack.test.ts` (append)
+- Modify: `src/slack.ts`, `src/daemon.ts`, `src/job.ts` (record usage on the shutdown returns)
+- Test: `src/spend-gate.test.ts` (create), `src/slack.test.ts` (append), `src/job.test.ts` (modify one assertion, add one test)
 
 **Interfaces:**
 - Consumes: Task 6 `SpendCap`, `openSpendCap`, `renderCapRefusal`; Task 4 `nextMonthStart`; `runIdFor` (src/review.ts); `TaskQueue` (src/queue.ts).
@@ -4226,9 +4258,96 @@ with:
       )
 ```
 
+- [ ] **Step 5b: Record usage on the shutdown returns too**
+
+`runJob` (src/job.ts) returns early on both shutdown paths, before `reportUsage` calls `deps.recordUsage`. If a deploy reaches its drain deadline, usage the runner already salvaged (completed Codex turns, Claude's figures) would never reach the ledger, and the replay would spend again against an unchanged total. Record the usage on those paths, still posting nothing and leaving the cursor unsettled.
+
+In `src/job.ts`, replace:
+
+```ts
+    if (deps.isShuttingDown?.()) {
+      deps.log('review.aborted.shutdown', { prs: reviewUrls })
+      return 'skipped'
+    }
+    deps.log('review.failed', { prs: reviewUrls, error: String(error) })
+```
+
+with:
+
+```ts
+    if (deps.isShuttingDown?.()) {
+      deps.log('review.aborted.shutdown', { prs: reviewUrls })
+      // Spend already happened: record it (the ledger must see it before the replay spends again),
+      // but post nothing, so the replay's own thread is the only one.
+      deps.recordUsage?.(usageForError(error))
+      return 'skipped'
+    }
+    deps.log('review.failed', { prs: reviewUrls, error: String(error) })
+```
+
+In `src/job.ts`, replace:
+
+```ts
+    if (deps.isShuttingDown?.()) {
+      deps.log('review.aborted.shutdown', { prs: reviewUrls })
+      return 'skipped'
+    }
+    return finishDual(request, emoji, deps, options, outcome.dual, outcome.usage, gatedAny)
+```
+
+with:
+
+```ts
+    if (deps.isShuttingDown?.()) {
+      deps.log('review.aborted.shutdown', { prs: reviewUrls })
+      // As in the catch above: record the spend, post nothing.
+      deps.recordUsage?.(outcome.usage)
+      return 'skipped'
+    }
+    return finishDual(request, emoji, deps, options, outcome.dual, outcome.usage, gatedAny)
+```
+
+In `src/job.test.ts`, at the end of the test `runJob stays silent when a dual outcome arrives during a shutdown`, replace:
+
+```ts
+  t.deepEqual(rec.threads, [], 'no thread is posted')
+  t.deepEqual(usages, [], 'no usage is reported')
+  t.end()
+})
+```
+
+with:
+
+```ts
+  t.deepEqual(rec.threads, [], 'no thread is posted')
+  // The spend already happened, so the ledger records it; only the Slack effects are suppressed.
+  t.equal(usages.length, 1, 'usage is recorded for the ledger')
+  t.end()
+})
+
+// PR review finding (andrew-barnett/slack-review-bot#78), throw path: a run force-killed by shutdown
+// still reports what it salvaged to recordUsage, so a replay is not spent against an unchanged ledger.
+// Regression caught: returning before reportUsage, which dropped completed-turn usage on every deploy.
+test('runJob records salvaged usage when a shutdown kills the run, and posts nothing', async t => {
+  const usages: RunUsage[] = []
+  const salvaged: RunUsage = { attempts: 1, tokensUsed: 1234 }
+  const rec = recorder(
+    async () => {
+      throw new ReviewFailedError(salvaged, new Error('killed by shutdown'))
+    },
+    { isShuttingDown: () => true, recordUsage: u => { usages.push(u) } }
+  )
+  t.equal(await runJob(request, emoji, rec.deps), 'skipped')
+  t.deepEqual(usages, [salvaged], 'the salvaged usage reaches the ledger')
+  t.deepEqual(rec.threads, [], 'no thread is posted')
+  t.deepEqual(rec.added, ['eyes'], 'no outcome reaction')
+  t.end()
+})
+```
+
 - [ ] **Step 6: Run the tests to verify they pass**
 
-Run: `for f in src/spend-gate.test.ts src/slack.test.ts; do npx ts-node --compiler-options '{"module":"commonjs"}' --transpile-only "$f" 2>&1 | tail -2; done`
+Run: `for f in src/spend-gate.test.ts src/slack.test.ts src/job.test.ts; do npx ts-node --compiler-options '{"module":"commonjs"}' --transpile-only "$f" 2>&1 | tail -2; done`
 Expected: each ends with `# ok`.
 
 Run: `npm test 2>&1 | tail -4 && npm run typecheck && npm run build`
@@ -4249,7 +4368,7 @@ is priced into the ledger, and status shows the month's percent.
 [cc](https://claude.com/claude-code)
 ```
 
-Run: `git add src/slack.ts src/slack.test.ts src/spend-gate.ts src/spend-gate.test.ts src/daemon.ts && git commit -F /tmp/srb-commit-msg.txt`
+Run: `git add src/slack.ts src/slack.test.ts src/spend-gate.ts src/spend-gate.test.ts src/daemon.ts src/job.ts src/job.test.ts && git commit -F /tmp/srb-commit-msg.txt`
 
 ---
 
