@@ -321,3 +321,22 @@ test('slackClientOptions bounds retries to the five-minute policy', t => {
   )
   t.end()
 })
+
+// --- postChannelMessage: the spend alerts' channel post. ---
+
+// Spec 8: alerts are top-level channel messages (not thread replies), with no link unfurls.
+// Regression caught: an alert posted into a thread, or a link unfurled into a wall of preview.
+test('postChannelMessage posts a top-level message to the channel', async t => {
+  const calls: Array<Record<string, unknown>> = []
+  const client = {
+    chat: {
+      async postMessage(args: Record<string, unknown>) {
+        calls.push(args)
+        return { ok: true }
+      },
+    },
+  } as unknown as WebClient
+  await makeSlackEffects(client).postChannelMessage('C0ALERTS1', 'synthetic alert')
+  t.deepEqual(calls, [{ channel: 'C0ALERTS1', text: 'synthetic alert', unfurl_links: false, unfurl_media: false }])
+  t.end()
+})

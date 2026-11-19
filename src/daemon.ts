@@ -30,11 +30,11 @@ import { createShutdownController } from './shutdown'
 import { openCursorStore, openNullCursorStore } from './cursor'
 import { makeApproverGitHubEffects, makeJobGitHubEffects } from './github'
 import { renderHelp } from './help'
-import { runJob, type JobDeps } from './job'
+import { runJob, type JobDeps, type JobOutcome } from './job'
 import { createActiveReviews } from './progress'
 import { TaskQueue } from './queue'
 import { fetchHistorySince, replayMissed, type ReplaySummary } from './replay'
-import { selectReviewRunner } from './review'
+import { runIdFor, selectReviewRunner } from './review'
 import {
   decideTrigger,
   isHelpRequest,
@@ -43,6 +43,8 @@ import {
   slackClientOptions,
   type SlackMessageEvent,
 } from './slack'
+import { openSpendCap } from './spend-cap'
+import { capCheckedTask, refuseAtAdmission, refuseAtSlot } from './spend-gate'
 import { createStats, renderStatus } from './status'
 import type { RunUsage } from './usage'
 
@@ -127,6 +129,10 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
   // it. A dedicated WebClient on the same bot token can carry a finite timeout and a bounded
   // retry policy, so no Slack call the daemon makes can hang indefinitely.
   const slackClient = new WebClient(config.botToken, slackClientOptions(config.slackRequestTimeoutMs))
+
+  // The monthly Bedrock spend cap (spec section 3). Opened before connecting, so a missing or incomplete
+  // price table stops the daemon here with the file and the model named, before any review can start.
+  const spend = openSpendCap(config, log, (channel, text) => makeSlackEffects(slackClient).postChannelMessage(channel, text))
 
   // Validate the bot token before connecting. Socket Mode only proves the app-level
   // token: a bad or mismatched xoxb- would let the daemon receive messages and start
@@ -273,7 +279,8 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
             runningForMs: catchUps.runningForMs(Date.now()),
           },
           connection,
-          reviews.snapshot(Date.now())
+          reviews.snapshot(Date.now()),
+          spend.status(Date.now())
         )
         log('status.requested', { channel: message.channel })
         try {
@@ -336,6 +343,13 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
       return false
     }
     markHandled(key)
+    // The monthly spend cap has been reached: answer and settle the request now, never queue or replay
+    // it (spec section 9). Status and help are answered above, so they keep working while capped.
+    if (await refuseAtAdmission(spend, request.message, config.errorEmoji, { ...makeSlackEffects(client), log }, Date.now())) {
+      cursors.record(request.message.channel, request.message.ts)
+      log('review.refused.cap', { key, source, at: 'admission' })
+      return false
+    }
     // Held below this message until the job settles, so a restart mid-review replays it
     // instead of leaving a message acknowledged with :eyes: and never answered.
     cursors.begin(request.message.channel, request.message.ts)
@@ -350,6 +364,8 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
       runReview,
       recordUsage: u => {
         usage = u
+        // Priced into the month's ledger; alerts go out from there. Never throws, never awaited.
+        void spend.record(u, runIdFor(request), Date.now())
       },
       isShuttingDown: () => shutdown.forced,
       log,
@@ -393,29 +409,47 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
     // review takes far longer than Slack's ack window. The queue, not the handler,
     // is what serialises the work. The settled promise is tracked so a shutdown can drain it.
     const settled = queue
-      .run(() => {
-        // The slot is taken: promote from waiting to active in the live status. Done here, not
-        // inside the job, so the status shows it running the instant it starts — before the
-        // deleted-message check and the first Codex output.
-        reviews.start(key, reviewAttempts)
-        return runJob(
-          request,
-          {
-            ack: config.ackEmoji,
-            queued: config.queuedEmoji,
-            pass: config.passEmoji,
-            findings: config.findingsEmoji,
-            error: config.errorEmoji,
-            humanReview: config.humanReviewEmoji,
-            approvalPartial: config.approvalPartialEmoji,
-            approvalNotCounted: config.approvalNotCountedEmoji,
-            headMoved: config.headMovedEmoji,
-            removeAckOnComplete: config.removeAckOnComplete,
+      .run(
+        capCheckedTask<JobOutcome>({
+          cap: spend,
+          now: Date.now,
+          // The cap was reached while this request waited: answer it and settle it as skipped (ruling 12).
+          refuse: async () => {
+            log('review.refused.cap', { key, source, at: 'slot' })
+            await refuseAtSlot(
+              request.message,
+              { error: config.errorEmoji, queued: config.queuedEmoji },
+              { ...makeSlackEffects(client), log },
+              queuedReaction,
+              Date.now()
+            )
+            return 'skipped'
           },
-          deps,
-          { queued: queuedReaction, postUsage: config.usageReplyEnabled }
-        )
-      })
+          run: () => {
+            // The slot is taken: promote from waiting to active in the live status. Done here, not
+            // inside the job, so the status shows it running the instant it starts — before the
+            // deleted-message check and the first Codex output.
+            reviews.start(key, reviewAttempts)
+            return runJob(
+              request,
+              {
+                ack: config.ackEmoji,
+                queued: config.queuedEmoji,
+                pass: config.passEmoji,
+                findings: config.findingsEmoji,
+                error: config.errorEmoji,
+                humanReview: config.humanReviewEmoji,
+                approvalPartial: config.approvalPartialEmoji,
+                approvalNotCounted: config.approvalNotCountedEmoji,
+                headMoved: config.headMovedEmoji,
+                removeAckOnComplete: config.removeAckOnComplete,
+              },
+              deps,
+              { queued: queuedReaction, postUsage: config.usageReplyEnabled }
+            )
+          },
+        })
+      )
       .then(outcome => stats.record(outcome, request.prs.length, Date.now(), usage?.tokensUsed, usage?.engines))
       .catch(error => {
         // A crash never reaches runJob's own reporting, so count it as an error outcome

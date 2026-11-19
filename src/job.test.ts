@@ -578,7 +578,29 @@ test('runJob stays silent when a dual outcome arrives during a shutdown', async 
   t.deepEqual(rec.added, ['eyes'], 'no outcome reaction is added')
   t.deepEqual(rec.removed, [], 'the ack is left in place for the replay')
   t.deepEqual(rec.threads, [], 'no thread is posted')
-  t.deepEqual(usages, [], 'no usage is reported')
+  // The spend already happened, so the ledger records it; only the Slack effects are suppressed.
+  t.equal(usages.length, 1, 'usage is recorded for the ledger')
+  // The exact usage the dual outcome carried (dualRecorder's), not a stand-in, reaches the ledger.
+  t.deepEqual(usages, [{ attempts: 1, engines: [] }], 'the outcome usage itself is recorded')
+  t.end()
+})
+
+// PR review finding (andrew-barnett/slack-review-bot#78), throw path: a run force-killed by shutdown
+// still reports what it salvaged to recordUsage, so a replay is not spent against an unchanged ledger.
+// Regression caught: returning before reportUsage, which dropped completed-turn usage on every deploy.
+test('runJob records salvaged usage when a shutdown kills the run, and posts nothing', async t => {
+  const usages: RunUsage[] = []
+  const salvaged: RunUsage = { attempts: 1, tokensUsed: 1234 }
+  const rec = recorder(
+    async () => {
+      throw new ReviewFailedError(salvaged, new Error('killed by shutdown'))
+    },
+    { isShuttingDown: () => true, recordUsage: u => { usages.push(u) } }
+  )
+  t.equal(await runJob(request, emoji, rec.deps), 'skipped')
+  t.deepEqual(usages, [salvaged], 'the salvaged usage reaches the ledger')
+  t.deepEqual(rec.threads, [], 'no thread is posted')
+  t.deepEqual(rec.added, ['eyes'], 'no outcome reaction')
   t.end()
 })
 
