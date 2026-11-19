@@ -15,7 +15,8 @@ import {
   type EngineRunResult,
   type ReviewRunResult,
 } from './schema'
-import { parseTokensUsed } from './usage'
+import { codexProgressFilter, codexReadableTail, createCodexUsageReader } from './codex-events'
+import { codexTotalTokens, type CodexUsageDetail } from './usage'
 import { redactSecrets } from './redact'
 import {
   appendBoundedTail,
@@ -99,10 +100,12 @@ export interface CodexRunOutcome<T = ReviewRunResult> {
   result: T
   /** Raw final message, kept for the run log. */
   rawFinalMessage: string
-  /** Codex's reported "tokens used" total, or undefined when it printed none. */
+  /** The sum of `codexUsage`'s fields, or undefined when no turn completed. */
   tokensUsed?: number
   /** Active time charged to the run, in ms (suspension discounted); 0 for a run too short to tick. */
   activeMs: number
+  /** `--json` usage summed over every completed turn (spec 6); absent when no turn completed. */
+  codexUsage?: CodexUsageDetail
 }
 
 // The redactor's hold-buffer cap lives with the streaming redactor in redact.ts; re-exported here
@@ -207,6 +210,8 @@ export function buildCodexArgs(options: {
     '--add-dir', options.worktreeRoot,
     // The workspace root is a directory of checkouts, not itself a repository.
     '--skip-git-repo-check',
+    // JSONL events on stdout: turn.completed.usage is what the spend ledger prices (spec 6).
+    '--json',
     '--output-schema', options.schemaPath,
     '--output-last-message', options.outputPath,
     options.prompt,
@@ -259,6 +264,9 @@ async function runCodexWith<T>(
   })
 
   fs.mkdirSync(options.worktreeRoot, { recursive: true })
+  // Raw stdout, before redaction and the bounded transcript tail: every turn.completed counts however
+  // long the run's output (Review Focus 3). Only the numbers are kept.
+  const usageReader = createCodexUsageReader()
 
   try {
     const exit = await superviseChild(
@@ -275,30 +283,34 @@ async function runCodexWith<T>(
         runId: options.runId,
         logPrefix: 'codex',
         log: options.log,
-        onProgress: options.onProgress,
+        // Events become human status lines; raw JSON never reaches the status reply (ruling 10).
+        onProgress: options.onProgress ? codexProgressFilter(options.onProgress) : undefined,
+        onStdout: text => usageReader.push(text),
       },
       spawner,
       clock
     )
     const transcript = exit.transcript
+    // Measured before anything can throw: a killed or failed run still cost the turns it completed,
+    // and every error below carries them. A turn cut off mid-way is the one known undercount.
+    usageReader.flush()
+    const codexUsage = usageReader.usage()
+    const tokensUsed = codexUsage ? codexTotalTokens(codexUsage) : undefined
 
     if (exit.timedOut) {
       // Carry the snapshot, not just a message: the run spent this much active time before it
       // was killed, and the caller accounts for it in the usage it reports.
-      throw new CodexTimeoutError(describeTimeout(options.timeoutMs, exit.timedOut), exit.timedOut)
+      throw new CodexTimeoutError(describeTimeout(options.timeoutMs, exit.timedOut), exit.timedOut, codexUsage)
     }
     if (exit.stalled) {
       throw new CodexStalledError(
         describeStall(options.stallTimeoutMs ?? 0, exit.stalled),
         options.stallTimeoutMs ?? 0,
-        exit.stalled
+        exit.stalled,
+        codexUsage
       )
     }
 
-    // Measure usage before anything that can throw on the final message: a run that printed a
-    // token total and spent active time still cost that much even if its output is unusable, so
-    // the bad-output failures below carry the usage rather than dropping it.
-    const tokensUsed = parseTokensUsed(transcript)
     const activeMs = exit.activeMs
 
     // A non-zero exit with a well-formed final message still tells us what happened to
@@ -310,11 +322,13 @@ async function runCodexWith<T>(
       // Redact the whole transcript before slicing: capture already redacted each chunk, but a
       // secret split across two chunks is only whole here, and this tail is posted to the Slack
       // error thread and the daemon log (issue #31).
-      const tail = redactSecrets(transcript).slice(-1500).trim()
+      // Under --json the transcript is JSONL: show readable lines, never raw events (ruling P3).
+      const tail = codexReadableTail(redactSecrets(transcript))
       throw new CodexOutputError(
         `Codex exited with code ${exit.code} and produced no final message` + (tail ? `:\n${tail}` : ''),
         tokensUsed,
-        activeMs
+        activeMs,
+        codexUsage
       )
     }
 
@@ -329,11 +343,12 @@ async function runCodexWith<T>(
       throw new CodexOutputError(
         redactSecrets(error instanceof Error ? error.message : String(error)),
         tokensUsed,
-        activeMs
+        activeMs,
+        codexUsage
       )
     }
 
-    return { result, rawFinalMessage, tokensUsed, activeMs }
+    return { result, rawFinalMessage, tokensUsed, activeMs, ...(codexUsage ? { codexUsage } : {}) }
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true })
   }
@@ -350,7 +365,9 @@ export class CodexStalledError extends Error {
   constructor(
     message: string,
     readonly stallMs: number,
-    readonly snapshot: DeadlineSnapshot
+    readonly snapshot: DeadlineSnapshot,
+    /** Usage of the turns that completed before the kill (spec 6); undefined when none did. */
+    readonly codexUsage?: CodexUsageDetail
   ) {
     super(message)
     this.name = 'CodexStalledError'
@@ -367,7 +384,9 @@ export class CodexStalledError extends Error {
 export class CodexTimeoutError extends Error {
   constructor(
     message: string,
-    readonly snapshot: DeadlineSnapshot
+    readonly snapshot: DeadlineSnapshot,
+    /** Usage of the turns that completed before the kill (spec 6); undefined when none did. */
+    readonly codexUsage?: CodexUsageDetail
   ) {
     super(message)
     this.name = 'CodexTimeoutError'
@@ -386,7 +405,9 @@ export class CodexOutputError extends Error {
   constructor(
     message: string,
     readonly tokensUsed: number | undefined,
-    readonly activeMs: number
+    readonly activeMs: number,
+    /** Usage of the turns the run completed (spec 6); undefined when none did. */
+    readonly codexUsage?: CodexUsageDetail
   ) {
     super(message)
     this.name = 'CodexOutputError'

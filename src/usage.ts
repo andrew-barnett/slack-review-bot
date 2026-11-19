@@ -25,6 +25,40 @@ export interface ClaudeUsageDetail {
 }
 
 /**
+ * What `codex exec --json` reports a run cost: each `turn.completed.usage`, summed over the run's
+ * turns (spec 6; field names from codex-cli 0.169.0). Whether `cachedInputTokens` is inside
+ * `inputTokens`, and `reasoningTokens` inside `outputTokens`, is the price table's to say.
+ */
+export interface CodexUsageDetail {
+  inputTokens: number
+  cachedInputTokens: number
+  cacheWriteTokens: number
+  outputTokens: number
+  reasoningTokens: number
+}
+
+/** A Codex run's token total for the usage line and the status: the sum of every field (spec 6). */
+export function codexTotalTokens(u: CodexUsageDetail): number {
+  return u.inputTokens + u.cachedInputTokens + u.cacheWriteTokens + u.outputTokens + u.reasoningTokens
+}
+
+/** Sum two optional Codex usage breakdowns field by field; unknown only when both are unknown. */
+export function addCodexUsage(
+  a: CodexUsageDetail | undefined,
+  b: CodexUsageDetail | undefined
+): CodexUsageDetail | undefined {
+  if (!a) return b
+  if (!b) return a
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    cachedInputTokens: a.cachedInputTokens + b.cachedInputTokens,
+    cacheWriteTokens: a.cacheWriteTokens + b.cacheWriteTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    reasoningTokens: a.reasoningTokens + b.reasoningTokens,
+  }
+}
+
+/**
  * The cost of a single review request, gathered whether it passed, found things, or failed.
  *
  * `tokensUsed` is optional because a killed run (a timeout or a stall) usually dies before
