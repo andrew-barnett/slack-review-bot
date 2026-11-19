@@ -1,6 +1,6 @@
 import test from 'tape'
 import type { ApproverGitHub } from './approver-github'
-import { defaultRunner, GH_COMMAND_TIMEOUT_MS, makeGitHubEffects, makeJobGitHubEffects } from './github'
+import { defaultRunner, GH_COMMAND_TIMEOUT_MS, makeApproverGitHubEffects, makeGitHubEffects, makeJobGitHubEffects } from './github'
 
 const pr = { owner: 'trade-platform', repo: 'deployments', number: 5, url: 'https://github.com/trade-platform/deployments/pull/5' }
 
@@ -94,5 +94,28 @@ test('makeJobGitHubEffects posts the gate comment as the role account in dual mo
   await makeJobGitHubEffects({ reviewEngines: ['codex'] }, undefined, base).postPrComment!(pr, 'human needed')
   t.deepEqual(calls, ['role-account', 'operator'])
   t.deepEqual(await makeJobGitHubEffects({ reviewEngines: ['codex', 'claude'] }, approver, base).listChangedFiles!(pr), ['values.yaml'])
+  t.end()
+})
+
+// Spec D8: in the container runtime the orchestrator has no gh login, so both the changed-file read
+// and the human-gate comment go through the approver token, injected per call and never into
+// process.env. Regression caught: the gate comment posted with an ambient (operator) login.
+test('container runtime routes the job GitHub effects through the approver token', async t => {
+  const calls: { args: string[]; token?: string }[] = []
+  const run = async (args: string[], opts?: { env?: NodeJS.ProcessEnv }) => {
+    calls.push({ args, token: opts?.env?.GH_TOKEN })
+    return 'src/a.ts\n'
+  }
+  const effects = makeApproverGitHubEffects('approver-placeholder', run)
+  const pr = { owner: 'o', repo: 'r', number: 1, url: 'https://github.com/o/r/pull/1' }
+  t.deepEqual(await effects.listChangedFiles!(pr), ['src/a.ts'])
+  t.equal(calls[0].token, 'approver-placeholder')
+  t.equal(process.env.GH_TOKEN === 'approver-placeholder', false, 'never placed in process.env')
+  const posted: string[] = []
+  const approver = { postIssueComment: async (_pr: unknown, body: string) => void posted.push(body) } as never
+  const job = makeJobGitHubEffects({ reviewEngines: ['claude'], runtime: 'container' }, approver, effects)
+  await job.postPrComment!(pr, 'gate')
+  t.deepEqual(posted, ['gate'])
+  t.throws(() => makeJobGitHubEffects({ reviewEngines: ['claude'], runtime: 'container' }, undefined, effects), /role-account client/)
   t.end()
 })

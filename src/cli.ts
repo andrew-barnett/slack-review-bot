@@ -31,6 +31,12 @@ async function main(): Promise<void> {
 
   const config = loadReviewConfig()
   scrubDaemonSecrets(process.env, config)
+  if (config.runtime === 'container') {
+    // The CLI runs engines locally; the container runtime runs them only in worker containers.
+    process.stderr.write('RUNTIME=container is for the orchestrator; unset RUNTIME to review from the terminal\n')
+    process.exitCode = 2
+    return
+  }
   try {
     assertModeAvailable(config)
   } catch (error) {
