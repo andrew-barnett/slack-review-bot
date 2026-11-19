@@ -199,6 +199,8 @@ export function createJobBroker(o: JobBrokerOptions): JobBroker {
     submit(kind, options, hooks = {}) {
       if (closed) return Promise.reject(outputError(kind, 'the orchestrator is shutting down; the job was not queued'))
       if (!RUN_ID_RE.test(options.runId)) return Promise.reject(new Error('runId is not safe for a log file name'))
+      // The run deadline is computed from timeoutMs; NaN would make it unreachable.
+      if (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) return Promise.reject(new Error('timeoutMs is not a positive number'))
       return new Promise((resolve, reject) => {
         const job: Job = {
           id: newId(),

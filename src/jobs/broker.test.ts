@@ -169,6 +169,17 @@ test('broker refuses a run id that could escape the log dir', async t => {
   t.end()
 })
 
+// The run deadline (ruling F4) is timeoutMs + margin; a NaN or missing timeout would make it unreachable
+// and silently disable the bound, so such a job is refused at submit.
+test('broker refuses a job without a positive finite timeout', async t => {
+  const { broker } = make()
+  for (const timeoutMs of [Number.NaN, 0, -1, Number.POSITIVE_INFINITY]) {
+    const r = await settle(broker.submit('codex-report-only', { ...opts, timeoutMs }))
+    t.ok(!r.ok && /timeoutMs/.test(r.error.message), String(timeoutMs))
+  }
+  t.end()
+})
+
 // Shutdown (issue 32, spec 3.3 cancellation, ruling 6): queued jobs fail at once with the kind's output
 // error; claimed jobs get 409 on their next call but may still report; nothing new may queue.
 test('broker cancelAll fails queued jobs, signals claimed ones, and refuses new submits', async t => {
