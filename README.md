@@ -1093,8 +1093,18 @@ npm test                              # 381 assertions, no Slack or Codex needed
 npm run typecheck                     # src AND the tests — see below
 npm run doctor                        # runtime preflight; needs the tokens in the env
 npm run review -- --dry-run <pr-url>  # print the prompt that would be sent
-npm run review -- <pr-url> [...]      # run a real review, print the would-be thread
+npm run review -- <pr-url> [...]      # run a real review (posts, and can approve), print the would-be thread
+npm run review -- --report-only [--engine codex|claude|codex,claude] <pr-url> [...]
+                                      # review-pr report-only mode at the current head; prints findings, posts nothing
 ```
+
+`--report-only` pins each PR's head with one read (`gh api .../pulls/<n>`), runs every selected engine on every PR in
+review-pr's report-only mode, and prints one pass per engine per PR plus token usage. It never builds the approver client
+and never posts, so it is safe on any PR, and ignores the dual-mode gate. review-pr still checks the base in this mode,
+so a PR whose base has moved on (any merged PR) comes back `blocked` (`stale base`). `--engine` overrides
+`REVIEW_ENGINES` for that run only. Exit code: 0 all clean, 1 findings, 2 an engine could not judge. The engines still run
+with whatever GitHub login they normally get (the operator's in single mode), and report-only mode is what keeps them from
+writing. The `refresh-bot-runtime` skill uses this flag to compare Bedrock models.
 
 **Use `npm run typecheck`, not `npx tsc --noEmit`.** `tsconfig.json` excludes `**/*.test.ts`
 so the build never tries to emit them, and the tests run under `ts-node --transpile-only`,
