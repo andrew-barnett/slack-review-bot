@@ -212,3 +212,20 @@ test('inFlight reports begun-but-unfinished messages', t => {
   t.deepEqual(tracker.inFlight('C-never-seen'), [], 'an unknown channel is empty, not undefined')
   t.end()
 })
+
+// A request refused at the spend cap is recorded (settled) by the dispatcher, which then returns
+// false, and replay answers false with `begin` on the same ts. Regression caught: `begin` re-adding a
+// settled message to `pending`, where nothing ever settles it again, so the watermark sticks below it
+// until a forced skip.
+test('begin after record of the same message leaves nothing pending', t => {
+  const { t: c } = tracker()
+  c.start('C1', '100.000000')
+  c.begin('C1', '101.000000')
+  c.record('C1', '102.000000')
+  c.begin('C1', '102.000000')
+  t.deepEqual(c.inFlight('C1'), ['101.000000'], 'the settled message is not pending again')
+  c.settle('C1', '101.000000')
+  t.equal(c.watermark('C1'), '102.000000', 'the watermark passes it once the older review settles')
+  t.deepEqual(c.inFlight('C1'), [])
+  t.end()
+})
