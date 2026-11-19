@@ -51,6 +51,9 @@ test('parseSecretBundle enforces the exact key set and string values', t => {
   t.deepEqual(parseSecretBundle('{"A_TOKEN":"a1","B_TOKEN":"b1","C_TOKEN":"c1"}', spec), { A_TOKEN: 'a1', B_TOKEN: 'b1', C_TOKEN: 'c1' })
   t.throws(() => parseSecretBundle('{"A_TOKEN":"a1"}', spec), /missing B_TOKEN/)
   t.throws(() => parseSecretBundle('{"A_TOKEN":"a1","B_TOKEN":"b1","LAUNCH_KEY":"k"}', spec), /unexpected key "LAUNCH_KEY"/)
+  // A key that is not a variable name may be a misplaced secret value, so it is never echoed.
+  const misplaced = 'gh' + 'p_' + 'A'.repeat(30)
+  t.throws(() => parseSecretBundle(JSON.stringify({ A_TOKEN: 'a1', B_TOKEN: 'b1', [misplaced]: 'x' }), spec), (e: Error) => /unexpected key$/.test(e.message) && !e.message.includes('AAAA'))
   t.throws(() => parseSecretBundle('{"A_TOKEN":"a1","B_TOKEN":5}', spec), /B_TOKEN is not a non-empty string/)
   t.throws(() => parseSecretBundle('{"A_TOKEN":"a1","B_TOKEN":""}', spec), /B_TOKEN/)
   try {

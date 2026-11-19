@@ -39,8 +39,11 @@ export function parseSecretBundle(line: string, spec: BundleSpec): Record<string
   const allowed = new Set([...spec.required, ...(spec.optional ?? [])])
   const out: Record<string, string> = {}
   for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-    // Key names are the launcher's own constants, never secrets, so naming one is safe.
-    if (!allowed.has(key)) throw new Error(`the secret bundle has an unexpected key ${JSON.stringify(key.slice(0, 64))}`)
+    // Name an unexpected key only when it looks like a variable name: a launcher bug that swapped a key
+    // and its value would otherwise print part of a secret.
+    if (!allowed.has(key)) {
+      throw new Error(`the secret bundle has an unexpected key${/^[A-Z][A-Z0-9_]{0,63}$/.test(key) ? ` ${JSON.stringify(key)}` : ''}`)
+    }
     if (typeof value !== 'string' || !value) throw new Error(`the secret bundle's ${key} is not a non-empty string`)
     out[key] = value
   }
