@@ -16,10 +16,15 @@ export interface ModelPrice {
 
 /**
  * How Codex's usage fields relate (spec section 5, ruling 15). Both false is the conservative reading:
- * cached tokens are not subtracted from input, and reasoning tokens are added to output.
+ * cached tokens are not subtracted from input, and reasoning tokens are added to output. Codex copies
+ * the Responses API usage object, whose `input_tokens_details` and `output_tokens_details` are
+ * breakdowns of `input_tokens` and `output_tokens`, so the shipped table sets both true.
  */
 export interface CodexTokenSemantics {
-  /** True when `cached_input_tokens` is already counted inside `input_tokens`. */
+  /**
+   * True when `cached_input_tokens` and `cache_write_input_tokens` are already counted inside
+   * `input_tokens`; both are then billed at their own rates and only the rest at the input rate.
+   */
   cachedIsSubsetOfInput: boolean
   /** True when `reasoning_output_tokens` is already counted inside `output_tokens`. */
   reasoningInOutput: boolean
@@ -123,7 +128,9 @@ const dollars = (input: number, cachedInput: number, cacheWrite: number, output:
 
 /** Price one Codex engine run. The ledger keeps the raw counts; the flags decide what is billed. */
 export function priceCodex(usage: CodexUsageDetail, price: ModelPrice, semantics: CodexTokenSemantics): PricedRun {
-  const billedInput = semantics.cachedIsSubsetOfInput ? Math.max(0, usage.inputTokens - usage.cachedInputTokens) : usage.inputTokens
+  const billedInput = semantics.cachedIsSubsetOfInput
+    ? Math.max(0, usage.inputTokens - usage.cachedInputTokens - usage.cacheWriteTokens)
+    : usage.inputTokens
   const billedOutput = semantics.reasoningInOutput ? usage.outputTokens : usage.outputTokens + usage.reasoningTokens
   return {
     tokens: {
