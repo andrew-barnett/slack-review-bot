@@ -14,6 +14,15 @@ test('the shipped price table prices both default Bedrock models and records its
   t.end()
 })
 
+// Codex reports the Responses API usage object, whose input/output details are breakdowns of the totals.
+// Regression caught: the shipped table reverting to the conservative reading, which overcounted Codex
+// spend about 4x in the 2026-11-19 model evaluation and would trip the cap at a quarter of real spend.
+test('the shipped price table reads Codex usage as the Responses API reports it', t => {
+  const table = loadPriceTable(defaultPricesFile(), [])
+  t.deepEqual(table.codexTokenSemantics, { cachedIsSubsetOfInput: true, reasoningInOutput: true })
+  t.end()
+})
+
 // The orchestrator reads /app/pricing/bedrock-prices.json. Regression caught: the table in the repo but
 // not in the image, so the container runtime fails at startup with "cannot read BEDROCK_PRICES_FILE".
 test('the image ships the price table', t => {

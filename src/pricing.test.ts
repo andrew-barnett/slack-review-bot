@@ -118,6 +118,18 @@ test('the conservative Codex reading overcounts and the confirmed reading does n
   t.end()
 })
 
+// The Responses API's cache_write_tokens is part of input_tokens' breakdown, like cached_tokens. Under the
+// confirmed reading, written tokens are billed at the cache-write rate only. Regression caught: subtracting
+// cached tokens but not written ones, which bills each written token twice (input rate + write rate).
+test('the confirmed Codex reading bills cache-write tokens once', t => {
+  const price: ModelPrice = { input: 1, cachedInput: 0.25, cacheWrite: 2, output: 8 }
+  const usage = { inputTokens: 1000, cachedInputTokens: 400, cacheWriteTokens: 300, outputTokens: 200, reasoningTokens: 50 }
+  const confirmed = priceCodex(usage, price, { cachedIsSubsetOfInput: true, reasoningInOutput: true })
+  // (300 × 1 + 400 × 0.25 + 300 × 2 + 200 × 8) / 1e6 = 0.0026
+  t.ok(Math.abs(confirmed.costUsd - 0.0026) < 1e-12, String(confirmed.costUsd))
+  t.end()
+})
+
 // Claude's cache reads and writes are separate from its input (spec D2), and its notional costUsd is
 // never used. Regression caught: pricing Claude from costUsd.
 test('priceClaude prices each field and ignores the notional costUsd', t => {
