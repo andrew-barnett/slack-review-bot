@@ -8,7 +8,14 @@ import type { PullRequestRef } from './parse-message'
 
 export type EligibilityVerdict = 'counts' | 'partial' | 'wontCount'
 export interface Eligibility { verdict: EligibilityVerdict; reasons: string[]; missing: string[]; lastPushApproval: boolean; dismissStale: boolean }
-export interface PullRequestRules { requiredApprovals: number; requireCodeOwnerReview: boolean; requireLastPushApproval: boolean; dismissStaleReviews: boolean }
+export interface PullRequestRules {
+  requiredApprovals: number
+  requireCodeOwnerReview: boolean
+  requireLastPushApproval: boolean
+  dismissStaleReviews: boolean
+  /** Ruleset `require_extra_approval_for_unattributed_changes`: one more approval on a Copilot-authored PR. */
+  extraApprovalForCopilot: boolean
+}
 export interface EligibilityFacts {
   botLogin: string
   prAuthor: string
@@ -28,6 +35,7 @@ export const NO_RULES: PullRequestRules = {
   requireCodeOwnerReview: false,
   requireLastPushApproval: false,
   dismissStaleReviews: false,
+  extraApprovalForCopilot: false,
 }
 
 const WRITE_OR_ABOVE: ReadonlySet<string> = new Set(['admin', 'maintain', 'write'])
@@ -40,6 +48,7 @@ export function mergeRules(all: PullRequestRules[]): PullRequestRules {
       requireCodeOwnerReview: acc.requireCodeOwnerReview || r.requireCodeOwnerReview,
       requireLastPushApproval: acc.requireLastPushApproval || r.requireLastPushApproval,
       dismissStaleReviews: acc.dismissStaleReviews || r.dismissStaleReviews,
+      extraApprovalForCopilot: acc.extraApprovalForCopilot || r.extraApprovalForCopilot,
     }),
     NO_RULES
   )
@@ -58,7 +67,20 @@ const KNOWN_PULL_REQUEST_PARAMS: ReadonlySet<string> = new Set([
   'required_review_thread_resolution',
   'allowed_merge_methods',
   'automatic_copilot_code_review_enabled',
+  // Who may dismiss a review; it does not change whether an approval counts.
+  'dismissal_restriction',
+  // "When Copilot opens a pull request without a human collaborator, require one more approving
+  // review if a non-zero approval count is required" (GitHub REST docs); modelled by
+  // extraApprovalForCopilot. GitHub enables it by default on new and existing rulesets.
+  'require_extra_approval_for_unattributed_changes',
 ])
+
+/**
+ * Whether a PR author is Copilot. Conservative: any login containing "copilot" (the coding agent's
+ * account appears as `Copilot` or `copilot-swe-agent[bot]`), since requiring one approval too many
+ * only costs a not-counted approval, while one too few would post an approval that cannot count.
+ */
+export const isCopilotLogin = (login: string): boolean => login.toLowerCase().includes('copilot')
 
 /** A `pull_request` rule carries a parameter this tool does not model; the source is unverifiable. */
 export class UnsupportedRulesetParameter extends Error {
@@ -94,6 +116,7 @@ export function rulesFromRulesets(rules: unknown[]): PullRequestRules {
           requireCodeOwnerReview: bool(p.require_code_owner_review),
           requireLastPushApproval: bool(p.require_last_push_approval),
           dismissStaleReviews: bool(p.dismiss_stale_reviews_on_push),
+          extraApprovalForCopilot: bool(p.require_extra_approval_for_unattributed_changes),
         }
       })
   )
@@ -107,6 +130,7 @@ export function rulesFromClassic(protection: unknown | null): PullRequestRules {
     requireCodeOwnerReview: bool(reviews.require_code_owner_reviews),
     requireLastPushApproval: bool(reviews.require_last_push_approval),
     dismissStaleReviews: bool(reviews.dismiss_stale_reviews),
+    extraApprovalForCopilot: false,
   }
 }
 
@@ -166,7 +190,11 @@ export function evaluateEligibility(f: EligibilityFacts): Eligibility {
   const seenApprovers = new Set<string>()
   const changeRequesters: string[] = []
   const seenRequesters = new Set<string>()
-  const needsReviews = rules.requiredApprovals > 0 || rules.requireCodeOwnerReview
+  // Whether GitHub can tell a Copilot PR had a human collaborator is not readable here, so a
+  // Copilot-authored PR always needs the extra approval when the rule is on.
+  const requiredApprovals =
+    rules.requiredApprovals + (rules.extraApprovalForCopilot && rules.requiredApprovals > 0 && isCopilotLogin(f.prAuthor) ? 1 : 0)
+  const needsReviews = requiredApprovals > 0 || rules.requireCodeOwnerReview
   for (const r of f.reviews ?? []) {
     if (r.state === 'CHANGES_REQUESTED' && needsReviews && !same(r.login, f.botLogin) && !seenRequesters.has(r.login.toLowerCase())) {
       // An outstanding change request blocks merge; only a write-or-higher reviewer's counts.
@@ -209,8 +237,8 @@ export function evaluateEligibility(f: EligibilityFacts): Eligibility {
   if (unreadable.length) return wont([...new Set(unreadable)].map(u => `could not verify: ${u}`))
 
   // Rule 5: remaining requirements with and without the bot.
-  const shortfallWithout = Math.max(0, rules.requiredApprovals - approvals.length)
-  const shortfallWith = Math.max(0, rules.requiredApprovals - approvals.length - 1)
+  const shortfallWithout = Math.max(0, requiredApprovals - approvals.length)
+  const shortfallWith = Math.max(0, requiredApprovals - approvals.length - 1)
   const unsatisfiedWithout = ownerPaths.filter(p => !p.byOthers)
   const unsatisfiedWith = unsatisfiedWithout.filter(p => !p.byBot)
   const lastPushSatisfiedWithout =
