@@ -675,12 +675,12 @@ All optional except the two tokens.
 | `CODEARTIFACT_LOGIN_SCRIPT` | *(vendored `scripts/codeartifact-login.sh`)* | Path to the login script the refresh runs. Defaults to the vendored copy resolved relative to the bot; override to point at a different one. |
 | `ENGINE_AUTH` | `subscription` | How the engines reach their models: `subscription` (Codex's ChatGPT login, Claude's `CLAUDE_CODE_OAUTH_TOKEN`) or `bedrock`. Any other value stops startup. See [Engine auth: Bedrock](#engine-auth-bedrock). |
 | `BEDROCK_REGION` | `us-east-2` | Bedrock mode: the region both engines call Bedrock in. Letters, digits and `. _ : -` only. |
-| `CODEX_BEDROCK_MODEL` | `openai.gpt-5.5` | Bedrock mode: Codex's model ID on the Bedrock Mantle endpoint (no `us.` prefix). Letters, digits and `. _ : -` only. |
+| `CODEX_BEDROCK_MODEL` | `openai.gpt-5.6-terra` | Bedrock mode: Codex's model ID on the Bedrock Mantle endpoint (no `us.` prefix). Letters, digits and `. _ : -` only. |
 | `CODEX_BEDROCK_PROJECT` | *(none)* | Bedrock mode, **required**: the Bedrock Mantle project Codex calls through, sent as the `OpenAI-Project` header. Must match `proj_` followed by lowercase letters and digits. Account-specific, so there is no default. See [Engine auth: Bedrock](#engine-auth-bedrock). |
 | `CLAUDE_BEDROCK_MODEL` | `us.anthropic.claude-opus-5-5` | Bedrock mode: Claude Code's model ID. Letters, digits and `. _ : -` only. |
 | `ENGINE_ROLE_ARN` | *(none)* | Bedrock mode: the IAM role the daemon assumes, once per engine attempt, to mint engine credentials. Must be `arn:aws:iam::<12 digits>:role/<name>`. When empty, static `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (and optionally `AWS_SESSION_TOKEN`) must be in the daemon environment instead. |
 | `ENGINE_AWS_PROFILE` | *(none)* | Bedrock mode: the AWS profile the daemon runs `aws sts assume-role` with. Empty uses the AWS CLI's default credential chain. |
-| `CODEX_BEDROCK_CONTEXT_WINDOW` | `272000` | Bedrock mode: a positive integer passed to Codex as `model_context_window`, overriding the fallback metadata Codex uses for Bedrock model IDs. The default keeps every request at or below 272K input tokens, where OpenAI's short-context rates apply; the spend cap prices Codex at those rates only, so don't raise it without pricing long-context requests too. |
+| `CODEX_BEDROCK_CONTEXT_WINDOW` | `272000` | Bedrock mode: a positive integer passed to Codex as `model_context_window`, overriding the context window in Codex's model catalog. The default keeps every request at or below 272K input tokens, where OpenAI's short-context rates apply; the spend cap prices Codex at those rates only, so don't raise it without pricing long-context requests too. |
 | `BEDROCK_MONTHLY_CAP_USD` | `1000` | The bot's monthly Bedrock spend cap in US dollars (a positive number). Applies under `ENGINE_AUTH=bedrock` and always in the container runtime. See [Bedrock spend cap](#bedrock-spend-cap). Never shown in Slack. |
 | `SPEND_ALERT_PERCENTS` | `25,50,75,90` | Percentages of the cap that post a one-time alert in the alert channel each month. Integers 1-99, strictly ascending. |
 | `SPEND_ALERT_HERE_PERCENTS` | `75,90` | Which of those alerts carry `@here`. Each must be in `SPEND_ALERT_PERCENTS`; unset means whichever of 75 and 90 are; empty means none. The cap-reached alert always carries `@here`. |
@@ -798,9 +798,10 @@ have no `us.` prefix. Claude is unaffected and keeps bedrock-runtime and its `us
 
 The `shell_environment_policy.exclude` override is the security-relevant one. The Codex process still reads the `AWS_*`
 variables and signs its Bedrock calls with them, but every shell command the model runs, and
-any PR test code it starts, gets an environment with no `AWS_*` variables. Codex prints
-"Model metadata for `openai.gpt-5.5` not found. Defaulting to fallback metadata"; that
-warning is expected, and `CODEX_BEDROCK_CONTEXT_WINDOW` (default `272000`) overrides the fallback context window.
+any PR test code it starts, gets an environment with no `AWS_*` variables. Codex's built-in
+Mantle catalog describes the `openai.gpt-*` IDs, and `CODEX_BEDROCK_CONTEXT_WINDOW` (default
+`272000`) still overrides the catalog's context window, keeping requests at OpenAI's
+short-context rates.
 
 **Claude Code.** The child gets `CLAUDE_CODE_USE_BEDROCK=1`, `AWS_REGION`,
 `ANTHROPIC_MODEL=<CLAUDE_BEDROCK_MODEL>` and the three AWS credential variables.
