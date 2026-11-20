@@ -26,7 +26,7 @@ function facts(over: Partial<EligibilityFacts> = {}): EligibilityFacts {
 // Taking only one source would under-state requirements on a repo that uses both.
 test('mergeRules takes the strictest of every source', t => {
   const merged = mergeRules([rules({ requiredApprovals: 1, dismissStaleReviews: true }), rules({ requiredApprovals: 2, requireCodeOwnerReview: true })])
-  t.deepEqual(merged, { requiredApprovals: 2, requireCodeOwnerReview: true, requireLastPushApproval: false, dismissStaleReviews: true })
+  t.deepEqual(merged, { requiredApprovals: 2, requireCodeOwnerReview: true, requireLastPushApproval: false, dismissStaleReviews: true, extraApprovalForCopilot: false })
   t.end()
 })
 
@@ -36,13 +36,57 @@ test('mergeRules takes the strictest of every source', t => {
 test('rule parsers read each source field names', t => {
   t.deepEqual(
     rulesFromRulesets([{ type: 'pull_request', parameters: { required_approving_review_count: 2, require_code_owner_review: true, require_last_push_approval: true, dismiss_stale_reviews_on_push: true } }, { type: 'deletion' }]),
-    { requiredApprovals: 2, requireCodeOwnerReview: true, requireLastPushApproval: true, dismissStaleReviews: true }
+    { requiredApprovals: 2, requireCodeOwnerReview: true, requireLastPushApproval: true, dismissStaleReviews: true, extraApprovalForCopilot: false }
   )
   t.deepEqual(
     rulesFromClassic({ required_pull_request_reviews: { required_approving_review_count: 1, require_code_owner_reviews: true, require_last_push_approval: false, dismiss_stale_reviews: true } }),
-    { requiredApprovals: 1, requireCodeOwnerReview: true, requireLastPushApproval: false, dismissStaleReviews: true }
+    { requiredApprovals: 1, requireCodeOwnerReview: true, requireLastPushApproval: false, dismissStaleReviews: true, extraApprovalForCopilot: false }
   )
   t.deepEqual(rulesFromClassic(null), NO_RULES, 'an unprotected branch has no requirement')
+  t.end()
+})
+
+// The live trade-platform/trade-platform-monorepo ruleset (V1, 2026-11-20) sets dismissal_restriction
+// (a non-empty object even when disabled) and require_extra_approval_for_unattributed_changes, which
+// GitHub enables by default. Both used to be unknown, so every such repo failed closed and the bot's
+// approval was never predicted to count.
+test('rulesFromRulesets accepts the dismissal-restriction and unattributed-changes parameters', t => {
+  const parsed = rulesFromRulesets([
+    { type: 'deletion' },
+    {
+      type: 'pull_request',
+      parameters: {
+        required_approving_review_count: 1,
+        dismiss_stale_reviews_on_push: true,
+        required_reviewers: [],
+        require_code_owner_review: false,
+        dismissal_restriction: { enabled: false, allowed_actors: [] },
+        require_last_push_approval: true,
+        required_review_thread_resolution: false,
+        require_extra_approval_for_unattributed_changes: true,
+        allowed_merge_methods: ['merge', 'squash', 'rebase'],
+      },
+    },
+    { type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true } },
+  ])
+  t.deepEqual(parsed, { requiredApprovals: 1, requireCodeOwnerReview: false, requireLastPushApproval: true, dismissStaleReviews: true, extraApprovalForCopilot: true })
+  t.end()
+})
+
+// The extra-approval rule applies only to Copilot-authored PRs, and only when approvals are
+// required. Regression caught: predicting that the bot's single approval satisfies a one-approval
+// rule on a Copilot PR, when GitHub requires two.
+test('a Copilot-authored PR needs one more approval when the unattributed-changes rule is on', t => {
+  const on = [{ name: 'rulesets', rules: rules({ requiredApprovals: 1, extraApprovalForCopilot: true }) }]
+  t.equal(evaluateEligibility(facts({ ruleSources: on })).verdict, 'counts', 'a human-authored PR is unaffected')
+  const copilot = evaluateEligibility(facts({ ruleSources: on, prAuthor: 'Copilot' }))
+  t.equal(copilot.verdict, 'partial')
+  t.deepEqual(copilot.missing, ['1 more approval'])
+  t.equal(evaluateEligibility(facts({ ruleSources: on, prAuthor: 'copilot-swe-agent[bot]' })).verdict, 'partial')
+  const off = [{ name: 'rulesets', rules: rules({ requiredApprovals: 1 }) }]
+  t.equal(evaluateEligibility(facts({ ruleSources: off, prAuthor: 'Copilot' })).verdict, 'counts', 'rule off: no extra approval')
+  const none = [{ name: 'rulesets', rules: rules({ extraApprovalForCopilot: true }) }]
+  t.equal(evaluateEligibility(facts({ ruleSources: none, prAuthor: 'Copilot' })).verdict, 'counts', 'no approvals required: nothing extra')
   t.end()
 })
 
@@ -464,7 +508,7 @@ test('an unknown non-empty pull_request ruleset parameter makes the rulesets unr
   t.notEqual(empty.ruleSources[0].rules, null, 'empty or falsy unknown parameters are ignored')
 
   const known = await gather({ required_approving_review_count: 2, required_review_thread_resolution: true, allowed_merge_methods: ['merge'], automatic_copilot_code_review_enabled: true })
-  t.deepEqual(known.ruleSources[0].rules, { requiredApprovals: 2, requireCodeOwnerReview: false, requireLastPushApproval: false, dismissStaleReviews: false }, 'known parameters are unaffected')
+  t.deepEqual(known.ruleSources[0].rules, { requiredApprovals: 2, requireCodeOwnerReview: false, requireLastPushApproval: false, dismissStaleReviews: false, extraApprovalForCopilot: false }, 'known parameters are unaffected')
 
   t.throws(() => rulesFromRulesets([{ type: 'pull_request', parameters: { x_new: true } }]), /x_new/)
   t.end()
