@@ -9,7 +9,8 @@
 #
 # Settings come from ~/.config/slack-review-bot/launcher.conf (override with
 # SLACK_REVIEW_BOT_LAUNCHER_CONF): non-secret KEY=value lines such as REVIEW_ENGINES, CONCURRENCY,
-# SLACK_CHANNEL_IDS, ROLE_GH_LOGIN and OPERATOR_GH_LOGIN. A line naming a secret variable is refused.
+# SLACK_CHANNEL_IDS, CODEX_BEDROCK_PROJECT, ROLE_GH_LOGIN and OPERATOR_GH_LOGIN. A line naming a secret
+# variable is refused.
 
 set -euo pipefail
 
@@ -51,6 +52,13 @@ if [ -f "${CONF}" ] && conf_sets_secret "${CONF}"; then
 fi
 if [ -f "${HOME}/Library/LaunchAgents/com.abarnett.slack-review-bot.plist" ]; then
     echo "ERROR: the launchd daemon is still installed; run scripts/install-service.sh --uninstall first." >&2
+    fail=1
+fi
+# Workers always run Codex on Bedrock Mantle (compose.yaml sets ENGINE_AUTH=bedrock), and a worker
+# without its Mantle project fails at startup, so the launcher would only restart it forever.
+PROJECT="$([ -f "${CONF}" ] && conf_value "${CONF}" CODEX_BEDROCK_PROJECT || true)"
+if ! printf '%s' "${PROJECT}" | grep -qE '^proj_[a-z0-9]+$'; then
+    echo "ERROR: ${CONF} must set CODEX_BEDROCK_PROJECT=proj_<lowercase letters and digits> (the bot's Bedrock Mantle project)" >&2
     fail=1
 fi
 for tool in docker node aws; do
