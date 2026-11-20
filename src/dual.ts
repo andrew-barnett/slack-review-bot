@@ -61,8 +61,8 @@ export interface DualDeps {
    */
   isShuttingDown?(): boolean
   /**
-   * False in container single mode (spec D8): the run is report-only, so an approving decision is
-   * posted as a `clean` COMMENT. Defaults to true.
+   * False makes the run report-only: an approving decision is posted as a `clean` COMMENT. Both
+   * runtimes approve (spec D8), so no caller sets it false today. Defaults to true.
    */
   approvals?: boolean
 }

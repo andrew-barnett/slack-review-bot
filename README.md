@@ -876,7 +876,7 @@ The container runtime splits the bot in two (https://github.com/andrew-barnett/s
 
 A **launcher** on the laptop (`scripts/launcher`, run by launchd) is the only process holding the operator's AWS login. It reads the bot's secrets from Secrets Manager (`/slack-review-bot/SLACK_BOT_TOKEN`, `/slack-review-bot/SLACK_APP_TOKEN`, `/slack-review-bot/APPROVER_GH_TOKEN`, `/slack-review-bot/ENGINE_GH_TOKEN`) through `SlackReviewBotSecretsReaderRole`, mints a fresh `SlackReviewBotEngineRole` session and CodeArtifact token per worker, and writes each container's secrets to its stdin. No secret is in the image, `compose.yaml`, `docker inspect`, or any file.
 
-**Behaviour change (spec D8).** In the container runtime every review is report-only, single mode included: the orchestrator posts one COMMENT review per PR as the role account. A clean result reacts with `APPROVAL_NOT_COUNTED_EMOJI` (never the approval stamp) and counts as a pass in `status`. Regression tests are not pushed to the PR branch; they come back as suggested tests in the findings. The launchd runtime is unchanged.
+**Behaviour change (spec D8).** In the container runtime the orchestrator posts every review as the role account, single mode included, through the same gate as dual mode with one engine. A clean result is an APPROVE from the role account (`PASS_EMOJI`). When that approval does not satisfy the branch rules on its own, the result is `APPROVAL_PARTIAL_EMOJI`, or `APPROVAL_NOT_COUNTED_EMOJI` with a comment instead. Findings are a COMMENT review. Because approvals now come from the role account rather than the operator's login, check its pre-flight reads (V1 in [Enabling dual mode](#enabling-dual-mode)) before relying on them. Regression tests are not pushed to the PR branch; they come back as suggested tests in the findings. The launchd runtime is unchanged.
 
 ### Settings
 
@@ -932,7 +932,7 @@ On SIGTERM the launcher stops starting workers and signals the orchestrator only
    `docker compose -f compose.yaml -p slack-review-bot run --rm -T --entrypoint sh orchestrator -c 'cat > /var/lib/slack-review-bot/state/cursors.json' < ~/.local/state/slack-review-bot/cursors.json`
 5. Write `~/.config/slack-review-bot/launcher.conf` with `REVIEW_ENGINES=codex` for the first reviews, then `scripts/install-launcher.sh --check` and `scripts/install-launcher.sh`.
 6. Run `scripts/launcher doctor orchestrator`.
-7. First reviews: request reviews of low-risk PRs. Each must get exactly one COMMENT review from the role account and no APPROVE.
+7. First reviews: request reviews of low-risk PRs. Each must get exactly one review from the role account: an APPROVE when clean (or the partial / not-counted outcome when the role account's approval doesn't satisfy the branch rules), a COMMENT with findings otherwise.
 
 **Rollback:** `scripts/install-launcher.sh --uninstall`, then `docker compose -f compose.yaml -p slack-review-bot down` (keep the volumes). If reviews ran in the container runtime, copy the cursor back first:
 `docker compose -f compose.yaml -p slack-review-bot run --rm -T --entrypoint cat orchestrator /var/lib/slack-review-bot/state/cursors.json > ~/.local/state/slack-review-bot/cursors.json`.

@@ -144,8 +144,9 @@ export function decide(passes: EnginePass[], eligibility: Eligibility, engines: 
 }
 
 /**
- * Approvals off (container single mode, spec D8): anything that would approve, or would note that an
- * approval does not count, is posted as one COMMENT with the outcome `clean`. Everything else stands.
+ * Approvals off (`approvals: false` on the dual runner): anything that would approve, or would note
+ * that an approval does not count, is posted as one COMMENT with the outcome `clean`. Everything else
+ * stands.
  */
 export function reportOnly(decision: GateDecision): GateDecision {
   if (decision.outcome === 'approved' || decision.outcome === 'approvedPartial' || decision.outcome === 'cleanNotCounted') {
