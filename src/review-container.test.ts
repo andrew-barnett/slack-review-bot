@@ -49,15 +49,40 @@ const remote = {
   }),
 }
 
-// Spec D8: container single mode is the dual runner with one engine and approvals off, posting as
-// the role account. Regression caught: the container runtime falling through to the local
-// single-engine runner, which would run Codex inside the orchestrator.
-test('selectReviewRunner sends RUNTIME=container to the report-only remote runner', async t => {
+/** A Claude engine double reporting one PR with the given verdict. */
+function claudeReporting(verdict: 'clean' | 'findings') {
+  const findings =
+    verdict === 'findings' ? [{ severity: 'blocking' as const, file: 'src/a.ts', line: 1, body: 'a defect' }] : []
+  return {
+    ...remote,
+    runClaude: async () => ({
+      ...(await remote.runClaude()),
+      result: { results: [{ url: URL1, reviewedSha: SHA, verdict, findings, summary: '', environmentProblems: [] }] },
+    }),
+  }
+}
+
+// Spec D8 (revised): container single mode is the dual runner with one engine and approvals ON,
+// posting as the role account. Regressions caught: the container runtime falling through to the
+// local single-engine runner (which would run Codex inside the orchestrator), and single mode
+// silently downgrading a clean review to a COMMENT, which was the first version of D8.
+test('selectReviewRunner sends RUNTIME=container single mode to the approving remote runner', async t => {
   const posted: string[] = []
   const runner = selectReviewRunner(config, { gh: fakeGh(posted), engineDeps: remote, listChangedFiles: async () => ['src/a.ts'] })
   const out = await runner(request)
+  t.deepEqual(posted, ['APPROVE'])
+  t.equal(out.dual!.prs[0].outcome, 'approved')
+  t.end()
+})
+
+// Approvals on must not turn findings into an approval: single mode with a blocking finding posts
+// one COMMENT and never APPROVE.
+test('container single mode posts findings as a COMMENT, never an APPROVE', async t => {
+  const posted: string[] = []
+  const runner = selectReviewRunner(config, { gh: fakeGh(posted), engineDeps: claudeReporting('findings'), listChangedFiles: async () => ['src/a.ts'] })
+  const out = await runner(request)
   t.deepEqual(posted, ['COMMENT'])
-  t.equal(out.dual!.prs[0].outcome, 'clean')
+  t.equal(out.dual!.prs[0].outcome, 'findings')
   t.end()
 })
 

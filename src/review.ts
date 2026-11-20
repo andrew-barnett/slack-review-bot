@@ -283,8 +283,9 @@ export function selectReviewRunner(
 
 /**
  * The container runtime's runner (spec 3.2, D8): always the dual runner, whose engines run in worker
- * containers through the remote run functions. Single mode is one engine with approvals off; dual
- * mode stays behind DUAL_MODE_AVAILABLE. The orchestrator holds no engine credential, so engine auth
+ * containers through the remote run functions. Single mode is the same gate with one engine and
+ * approves as the role account, as the launchd runtime approves today; dual mode stays behind
+ * DUAL_MODE_AVAILABLE. The orchestrator holds no engine credential, so engine auth
  * and the CodeArtifact refresh are refused rather than ignored.
  */
 export function makeContainerReviewRunner(
@@ -314,6 +315,6 @@ export function makeContainerReviewRunner(
     log,
     reviews: deps.reviews,
     isShuttingDown: deps.isShuttingDown,
-    approvals: isDualMode(config),
+    approvals: true,
   })
 }
