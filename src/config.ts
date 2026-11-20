@@ -164,7 +164,7 @@ export interface ReviewConfig {
   engineAuth: EngineAuth
   /** Bedrock mode: the AWS region both engines call Bedrock in. */
   bedrockRegion: string
-  /** Bedrock mode: the model ID Codex uses on the Bedrock Mantle endpoint (e.g. `openai.gpt-5.5`). */
+  /** Bedrock mode: the model ID Codex uses on the Bedrock Mantle endpoint (e.g. `openai.gpt-5.6-terra`). */
   codexBedrockModel: string
   /**
    * Bedrock mode: the Mantle project Codex calls through, sent as the `OpenAI-Project` header. The
@@ -584,7 +584,7 @@ function loadBedrockConfig(env: NodeJS.ProcessEnv): BedrockConfig {
   const out: BedrockConfig = {
     engineAuth: parseEngineAuth(env.ENGINE_AUTH),
     bedrockRegion: env.BEDROCK_REGION || 'us-east-2',
-    codexBedrockModel: env.CODEX_BEDROCK_MODEL || 'openai.gpt-5.5',
+    codexBedrockModel: env.CODEX_BEDROCK_MODEL || 'openai.gpt-5.6-terra',
     codexBedrockProject: env.CODEX_BEDROCK_PROJECT ?? '',
     claudeBedrockModel: env.CLAUDE_BEDROCK_MODEL || 'us.anthropic.claude-opus-5-5',
     engineRoleArn: env.ENGINE_ROLE_ARN ?? '',

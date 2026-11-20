@@ -386,7 +386,7 @@ test('loadReviewConfig defaults to subscription auth and captures nothing', t =>
   const c = loadReviewConfig({ ...STATIC_KEYS })
   t.equal(c.engineAuth, 'subscription')
   t.equal(c.bedrockRegion, 'us-east-2')
-  t.equal(c.codexBedrockModel, 'openai.gpt-5.5')
+  t.equal(c.codexBedrockModel, 'openai.gpt-5.6-terra')
   t.equal(c.codexBedrockProject, '', 'no default project: it is account-specific')
   t.equal(c.claudeBedrockModel, 'us.anthropic.claude-opus-5-5')
   t.equal(c.engineRoleArn, '')
