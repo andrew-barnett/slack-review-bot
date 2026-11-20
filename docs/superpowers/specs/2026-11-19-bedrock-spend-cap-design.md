@@ -21,7 +21,7 @@ Put a hard monthly cap on this bot's AWS Bedrock spend. The cap applies to this 
 |---|---|
 | D1 | **The bot is the primary cap, with an AWS Budget backstop.** The bot keeps a month-to-date ledger and enforces everything users see. An AWS Budget, filtered to this bot by a cost-allocation tag, denies Bedrock invocation to the engine role at 110% of the bot's cap. The Budget lags 8-24 h. |
 | D2 | **Spend = tokens × a price table in the repo.** Claude's `ClaudeUsageDetail` already has a breakdown. Codex gets one from `codex exec --json`: the spike on andrew-barnett/slack-review-bot#76 confirmed that `turn.completed.usage` has `input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens` and `reasoning_output_tokens` in codex-cli 0.169.0. Claude's `costUsd` is not used: it is a notional figure, not a Bedrock charge. |
-| D3 | **Attribution in AWS: tagged application inference profiles.** The bot invokes profile ARNs, and the Budget filters on the tag. The staging account is its own payer (it is not in an Organization), so we can activate the tag ourselves. |
+| D3 | **Attribution in AWS: one resource tag, `Project=slack-review-bot`** (amended 2026-11-20, see section 10). Claude invokes a tagged application inference profile ARN. Codex calls Mantle through the bot's Mantle project, which carries the tag. The Budget filters on the tag. The staging account is its own payer (it is not in an Organization), so we can activate the tag ourselves. |
 | D4 | **Reviews already running when the cap is reached finish.** New requests are refused at admission, and queued ones are refused when they reach a slot. Refused requests are settled and never replayed. |
 | D5 | **Months are UTC calendar months,** matching AWS billing. Messages give reset times in America/New_York. |
 | D6 | **Alerts** go to one channel, once per threshold per month, with `@here` on the configured thresholds. **Percent only.** |
@@ -48,7 +48,7 @@ These are read in `loadConfig` (src/config.ts, orchestrator/daemon only). Each o
 
 ## 5. Price table
 
-`pricing/bedrock-prices.json`, keyed by the exact configured model value: a `us.` profile ID today, an application inference profile ARN after section 10.
+`pricing/bedrock-prices.json`, keyed by the exact configured model value: a `us.` profile ID or a Mantle `openai.*` ID today; Claude's becomes an application inference profile ARN after section 10.
 
 ```json
 {
@@ -134,23 +134,30 @@ The compose smoke stub emits `--json` events, and the smoke checks that the orch
 
 ## 10. AWS backstop (trade-platform/pulumi)
 
-This is a separate PR, after the bot-side cap ships. It needs another person to approve the deploy.
+This is a separate PR, after the bot-side cap ships. It needs another person to approve the deploy. Tracking: https://github.com/andrew-barnett/slack-review-bot/issues/84. Plan: `docs/superpowers/plans/2026-11-20-bedrock-spend-backstop.md`.
 
-1. **Application inference profiles**, one per configured model, each copied from its `us.` system profile and tagged `app=slack-review-bot`.
-2. **Engine role policy** (`iam/policies/SlackReviewBotBedrockInvoke.ts`): add `bedrock:InvokeModel*` on `arn:aws:bedrock:us-east-2:153538148884:application-inference-profile/*`, conditioned on the tag.
-3. **Cost-allocation tag:** activate `app` (Pulumi `aws.costexplorer.CostAllocationTag`).
-4. **Budget** (`aws.budgets.Budget`): monthly, cost, filtered to `app$slack-review-bot`, limit = 1.10 × the bot's cap. The limit is a separate Pulumi config value; the `refresh-bot-runtime` skill and the README say to change both together.
-5. **Budget action** (`aws.budgets.BudgetAction`): at 100% of the Budget, apply an IAM policy denying `bedrock:InvokeModel*` to `SlackReviewBotEngineRole`, with automatic approval, plus the execution role Budgets needs.
-   - **Unverified:** whether the deny is reversed automatically at the next budget period or needs a manual reversal. Settle this in the PR, and if it needs a manual reversal, write a runbook step for it.
-6. **Then switch the bot's model settings to the profile ARNs:**
-   - Verify Claude Code and Codex both work against the ARNs, as the engine role.
-   - Widen `TOML_SAFE_ID` (src/config.ts) to accept ARNs (`:` and `/`), keeping the TOML-injection guard for the Codex `-c` override.
-   - Re-key the price table to the ARNs.
-   - If Codex's `amazon-bedrock-runtime` path cannot be attributed through a profile (it signs against `project/default`), the backstop covers Claude only, and the issue records that.
+**Amended 2026-11-20.** Codex no longer calls bedrock-runtime. It calls the Bedrock Mantle endpoint (`bedrock-mantle:CreateInference`) through the bot's Mantle project, `proj_e5ihwmxmoce7neqplby3`. That project was created by hand and has no Pulumi resource. Its resource tags flow into Cost Explorer and Budgets like any other resource's tags (https://docs.aws.amazon.com/bedrock/latest/userguide/cost-mgmt-projects.html). So both engines are attributed by one resource tag, `Project=slack-review-bot`, and not by `app`. The Mantle project already carries `Project=slack-review-bot`, so Codex needs no new tag and no hand-made change.
+
+1. **Claude attribution:** one application inference profile per configured Claude model. Each is copied from its `us.` system profile and tagged `Project=slack-review-bot`. bedrock-runtime bills usage to the inference target. Today that is the `us.anthropic.claude-opus-5-5` system profile, which carries no tag of ours.
+2. **Codex attribution:** the Mantle project's existing `Project=slack-review-bot` tag. Codex keeps its plain model ID (`openai.gpt-*`) and its `OpenAI-Project` header, so there is no Codex profile and no Codex ARN switch. The old item-6 caveat, that Codex signs against `project/default` and could not be attributed, no longer applies.
+3. **Engine role policy** (`iam/policies/SlackReviewBotBedrockInvoke.ts`): add `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` on `arn:aws:bedrock:us-east-2:153538148884:application-inference-profile/*`, conditioned on `aws:ResourceTag/Project` = `slack-review-bot`. The Service Authorization Reference lists `aws:ResourceTag/${TagKey}` for the `application-inference-profile` resource on `InvokeModel`. The existing foundation-model grants still apply.
+4. **Cost-allocation tag:** activate `Project` with Pulumi's `aws.costexplorer.CostAllocationTag`. The key is already listed in the account, inactive. The staging account is its own payer, so we can activate it ourselves. Activation is not retroactive, and the data can take up to 24 h to appear.
+5. **Budget** (`aws.budgets.Budget`): monthly, cost, filtered to `user:Project$slack-review-bot` and nothing else. No service filter, so the Budget catches Mantle spend whatever billing service name it lands under. Credits and refunds are excluded, so a credit balance cannot hide the spend. The limit is 1.10 × the bot's cap ($1100 for the default $1000 cap). It is a separate Pulumi config value, `slack-review-bot:bedrockBudgetLimitUsd`. The `refresh-bot-runtime` skill and the README say to change the cap and the limit together. An email notification fires at 91% of the limit, just above the bot's own cap, which means the bot's ledger has fallen behind AWS.
+6. **Budget action** (`aws.budgets.BudgetAction`): at 100% of actual spend, with automatic approval, attach `SlackReviewBotBedrockDeny` to `SlackReviewBotEngineRole`. That policy denies `bedrock:InvokeModel*` and `bedrock-mantle:*` on `*`.
+   - The Mantle deny is required, because a `bedrock:InvokeModel*` deny does not reach `bedrock-mantle:CreateInference`.
+   - The deny stops every Bedrock call by the role, attributed or not. IAM evaluates the role's policies on each request, so the deny also stops reviews already running.
+   - Budgets runs the action through an execution role. That role trusts `budgets.amazonaws.com`, limited by `aws:SourceAccount` and by `aws:SourceArn` for this budget. It may only attach or detach that one policy (`iam:PolicyARN`), and only on the engine role.
+   - **Reversal (settled):** AWS resets IAM-policy and SCP actions at the start of each budget period, so the deny is detached on the 1st of the next month (UTC) with no operator step: "IAM and SCP action types reset at the beginning of each budgeted period (e.g., monthly)" (https://aws.amazon.com/about-aws/whats-new/2020/10/announcing-aws-budgets-actions/). Lifting it mid-month is manual. Raise the limit first, then reset the action, so that Budgets evaluates it again this period. A "Reversed" action is not evaluated again until the period ends (https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-action-review.html). The plan has the runbook.
+7. **Then switch Claude's model setting to the profile ARN** (a separate bot PR, after the pulumi deploy):
+   - Verify that Claude Code works against the ARN, as the engine role.
+   - Point Claude Code's background (small/fast) model at the same ARN, so that none of its traffic falls back to an untagged system profile.
+   - Widen the `CLAUDE_BEDROCK_MODEL` validation to accept that ARN. Codex's `-c` override, the TOML-injection risk, keeps the strict `TOML_SAFE_ID` check, because Codex stays on plain IDs.
+   - Re-key the Claude price entry to the ARN.
+   - Until the switch, the Budget sees Codex spend only. The deny still stops both engines once it fires.
 
 ## 11. Rollout
 
 1. Implement the bot-side cap (sections 3-9) and merge it **before the container cutover**, which is when Bedrock billing starts.
 2. Fill in the price table from the AWS pricing page; the PR quotes the source line.
-3. Ship the pulumi backstop (section 10), then switch the model ARNs.
+3. Ship the pulumi backstop (section 10), then switch Claude's model setting to its profile ARN.
 4. Add a price-table step to the `refresh-bot-runtime` skill: whenever a model changes, update the price for the new model, and change the Budget limit whenever the cap changes.
