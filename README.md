@@ -892,6 +892,7 @@ Non-secret settings live in `~/.config/slack-review-bot/launcher.conf` (override
 | `WORKER_MEMORY` | `6g` | Worker memory limit. An out-of-memory kill shows up as "worker lost". |
 | `ROLE_GH_LOGIN` | (required for doctor) | The role account's GitHub login; each container's doctor checks its token is this account. |
 | `OPERATOR_GH_LOGIN` | (required for doctor) | Your own GitHub login; each doctor checks its token is not this account. |
+| `CODEX_BEDROCK_PROJECT` | (required) | The Bedrock Mantle project Codex calls through (`proj_…`); see [Engine auth: Bedrock](#engine-auth-bedrock). Workers always use Bedrock, so `scripts/install-launcher.sh` refuses a settings file without it. |
 | `LAUNCHER_AWS_PROFILE` | `staging` | The operator profile the launcher assumes both roles from (an IAM user, never a role, so nothing is chained). |
 | `LAUNCHER_REGION` | `us-east-2` | Region for STS and Secrets Manager. |
 | `LAUNCHER_READER_ROLE_ARN` | `arn:aws:iam::153538148884:role/SlackReviewBotSecretsReaderRole` | Reads `/slack-review-bot/*`. |
@@ -906,6 +907,7 @@ Example `launcher.conf`:
 REVIEW_ENGINES=codex
 SLACK_CHANNEL_IDS=C0123456789
 CONCURRENCY=1
+CODEX_BEDROCK_PROJECT=proj_exampleproject123
 ROLE_GH_LOGIN=example-role-bot
 OPERATOR_GH_LOGIN=example-operator
 ```
@@ -925,9 +927,9 @@ On SIGTERM the launcher stops starting workers and signals the orchestrator only
 
 1. Build the image, then run the worker doctor and the smoke (above).
 2. Wait until `@bot status` in Slack shows no active review.
-3. Copy the cursor file into the orchestrator's volume:
+3. Stop the daemon: `scripts/install-service.sh --uninstall`. Stop it before copying the cursor: a daemon still running could review a request after the copy, and the orchestrator would then replay it.
+4. Copy the cursor file into the orchestrator's volume:
    `docker compose -f compose.yaml -p slack-review-bot run --rm -T --entrypoint sh orchestrator -c 'cat > /var/lib/slack-review-bot/state/cursors.json' < ~/.local/state/slack-review-bot/cursors.json`
-4. Stop the daemon: `scripts/install-service.sh --uninstall`.
 5. Write `~/.config/slack-review-bot/launcher.conf` with `REVIEW_ENGINES=codex` for the first reviews, then `scripts/install-launcher.sh --check` and `scripts/install-launcher.sh`.
 6. Run `scripts/launcher doctor orchestrator`.
 7. First reviews: request reviews of low-risk PRs. Each must get exactly one COMMENT review from the role account and no APPROVE.
