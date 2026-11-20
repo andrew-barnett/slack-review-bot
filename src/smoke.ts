@@ -17,9 +17,15 @@ const WORKER = 'srb-smoke-worker'
 const compose = (args: string[]) => ['compose', '-f', path.join(ROOT, 'compose.yaml'), '-p', PROJECT, ...args]
 const dummy = (name: string) => `smoke-${name}-not-a-credential`
 
-function docker(args: string[]): string {
-  return execFileSync('docker', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] })
+function docker(args: string[], timeoutMs?: number): string {
+  return execFileSync('docker', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'], timeout: timeoutMs })
 }
+
+/**
+ * The submit waits for the worker's result, and the orchestrator holds a job open for a worker that
+ * died, so without a bound a worker that fails at startup hangs the smoke instead of failing it.
+ */
+const SUBMIT_TIMEOUT_MS = 180_000
 
 function start(args: string[], bundle: string): { child: ChildProcess; exited: Promise<number> } {
   const child = spawn('docker', args, { stdio: ['pipe', 'inherit', 'inherit'] })
@@ -28,8 +34,8 @@ function start(args: string[], bundle: string): { child: ChildProcess; exited: P
 }
 
 /** `node -e` inside the orchestrator container, against its own job server. */
-function inOrchestrator(script: string): string {
-  return docker(['exec', ORCH, 'node', '-e', script])
+function inOrchestrator(script: string, timeoutMs?: number): string {
+  return docker(['exec', ORCH, 'node', '-e', script], timeoutMs)
 }
 
 async function waitForHealth(): Promise<void> {
@@ -73,6 +79,8 @@ async function main(): Promise<void> {
         'run', '--rm', '-T', '--name', WORKER,
         '-e', `ORCHESTRATOR_URL=http://${ORCH}:8080`,
         '-e', 'CODEX_BIN=/app/scripts/smoke/stub-codex.js',
+        // Required in bedrock mode, which compose.yaml sets for every worker; the stub never calls Mantle.
+        '-e', 'CODEX_BEDROCK_PROJECT=proj_smoke0',
         '-e', 'WORKER_IDLE_EXIT_MS=60000',
         'worker',
       ]),
@@ -86,7 +94,7 @@ async function main(): Promise<void> {
       })
     )
     const reply = JSON.parse(
-      inOrchestrator("fetch('http://127.0.0.1:8080/v1/smoke/submit', { method: 'POST' }).then(r => r.text()).then(t => process.stdout.write(t))")
+      inOrchestrator("fetch('http://127.0.0.1:8080/v1/smoke/submit', { method: 'POST' }).then(r => r.text()).then(t => process.stdout.write(t))", SUBMIT_TIMEOUT_MS)
     ) as { runId?: string; results?: unknown[]; lines?: string[]; error?: unknown }
     if (!Array.isArray(reply.results) || reply.results.length !== 0) throw new Error(`unexpected smoke reply: ${JSON.stringify(reply)}`)
     if (!reply.lines?.includes(WAITING_LINE)) throw new Error('the waiting status line never arrived')
